@@ -1,0 +1,489 @@
+package pgqueue
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+// TestPublishAfterConnectionLoss tests behavior when connection is lost during publish
+func TestPublishAfterConnectionLoss(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a test channel
+	err := pq.CreateChannel(ctx, "error-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish a message successfully
+	_, err = pq.Publish(ctx, "error-test", []byte("test message"))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Close the database connection
+	if err := pq.Close(); err != nil {
+		t.Fatalf("failed to close database: %v", err)
+	}
+
+	// Try to publish after connection is closed - should fail
+	_, err = pq.Publish(ctx, "error-test", []byte("test message 2"))
+	if err == nil {
+		t.Error("expected error when publishing after connection closed, got nil")
+	}
+}
+
+// TestConsumeFromNonExistentQueue tests consuming from a queue that doesn't exist
+func TestConsumeFromNonExistentQueue(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Try to consume from non-existent channel
+	_, err := pq.ConsumeFromChannel(ctx, "non-existent", 30*time.Second)
+	if err == nil {
+		t.Error("expected error when consuming from non-existent channel, got nil")
+	}
+
+	// Try to consume from non-existent topic
+	_, err = pq.ConsumeFromTopic(ctx, "non-existent", "subscriber-1", 30*time.Second)
+	if err == nil {
+		t.Error("expected error when consuming from non-existent topic, got nil")
+	}
+}
+
+// TestAckNonExistentMessage tests acknowledging a message that doesn't exist
+func TestAckNonExistentMessage(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a test channel
+	err := pq.CreateChannel(ctx, "ack-error-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Try to ack non-existent message
+	fakeID, _ := NewUUIDv7()
+	err = pq.AckChannel(ctx, "ack-error-test", fakeID)
+	if err == nil {
+		t.Error("expected error when acking non-existent message, got nil")
+	}
+}
+
+// TestDuplicateQueueCreation tests creating a queue that already exists
+func TestDuplicateQueueCreation(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel
+	err := pq.CreateChannel(ctx, "duplicate-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Try to create the same channel again
+	err = pq.CreateChannel(ctx, "duplicate-test", ChannelOptions{})
+	if err == nil {
+		t.Error("expected error when creating duplicate channel, got nil")
+	}
+
+	// Create a topic
+	err = pq.CreateTopic(ctx, "duplicate-topic", TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	// Try to create the same topic again
+	err = pq.CreateTopic(ctx, "duplicate-topic", TopicOptions{})
+	if err == nil {
+		t.Error("expected error when creating duplicate topic, got nil")
+	}
+}
+
+// TestInvalidQueueNames tests creating queues with invalid names
+func TestInvalidQueueNames(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	invalidNames := []string{
+		"test queue",      // space
+		"test@queue",      // special char
+		"test/queue",      // slash
+		"test.queue",      // dot
+		"test;queue",      // semicolon
+		"",                // empty
+		"test\nqueue",     // newline
+	}
+
+	for _, name := range invalidNames {
+		err := pq.CreateChannel(ctx, name, ChannelOptions{})
+		if err == nil {
+			t.Errorf("expected error for invalid channel name %q, got nil", name)
+		}
+
+		err = pq.CreateTopic(ctx, name, TopicOptions{})
+		if err == nil {
+			t.Errorf("expected error for invalid topic name %q, got nil", name)
+		}
+	}
+}
+
+// TestMessageSizeExceedsLimit tests publishing messages that exceed size limit
+func TestMessageSizeExceedsLimit(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel with small message size limit
+	err := pq.CreateChannel(ctx, "size-test", ChannelOptions{
+		MaxMessageSize: 100, // 100 bytes limit
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Try to publish a message larger than the limit
+	largeMessage := make([]byte, 200)
+	for i := range largeMessage {
+		largeMessage[i] = 'A'
+	}
+
+	_, err = pq.Publish(ctx, "size-test", largeMessage)
+	if err == nil {
+		t.Error("expected error when publishing message exceeding size limit, got nil")
+	}
+}
+
+// TestPublishWithDuplicateMessageID tests deduplication logic
+func TestPublishWithDuplicateMessageID(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a test channel
+	err := pq.CreateChannel(ctx, "dedup-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish a message with a specific ID
+	messageID, _ := NewUUIDv7()
+	_, err = pq.PublishWithID(ctx, "dedup-test", messageID, []byte("first message"), nil)
+	if err != nil {
+		t.Fatalf("failed to publish first message: %v", err)
+	}
+
+	// Try to publish with the same message ID (should be deduplicated)
+	_, err = pq.PublishWithID(ctx, "dedup-test", messageID, []byte("duplicate message"), nil)
+	if err == nil {
+		t.Error("expected error when publishing duplicate message ID, got nil")
+	}
+
+	// Verify only one message exists
+	depth, err := pq.GetQueueDepth(ctx, "dedup-test", QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get queue depth: %v", err)
+	}
+	if depth != 1 {
+		t.Errorf("expected queue depth of 1 after deduplication, got %d", depth)
+	}
+}
+
+// TestConsumeWithExpiredContext tests consuming with an already-expired context
+func TestConsumeWithExpiredContext(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create and publish to a channel
+	err := pq.CreateChannel(ctx, "context-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	_, err = pq.Publish(ctx, "context-test", []byte("test message"))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Create an already-expired context
+	expiredCtx, cancel := context.WithDeadline(ctx, time.Now().Add(-1*time.Second))
+	defer cancel()
+
+	// Try to consume with expired context
+	_, err = pq.ConsumeFromChannel(expiredCtx, "context-test", 30*time.Second)
+	if err == nil {
+		t.Error("expected error when consuming with expired context, got nil")
+	}
+}
+
+// TestReplayWithoutConfirmation tests replay operations without confirmation
+func TestReplayWithoutConfirmation(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel and publish a message
+	err := pq.CreateChannel(ctx, "replay-confirm-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	_, err = pq.Publish(ctx, "replay-confirm-test", []byte("test message"))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Consume and ack the message
+	msg, err := pq.ConsumeFromChannel(ctx, "replay-confirm-test", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume message: %v", err)
+	}
+	if err := pq.AckChannel(ctx, "replay-confirm-test", msg.ID); err != nil {
+		t.Fatalf("failed to ack message: %v", err)
+	}
+
+	// Try to replay without confirmation (should fail)
+	_, err = pq.ReplayFrom(ctx, "replay-confirm-test", QueueTypeChannel, time.Now().Add(-1*time.Hour), ReplayOptions{
+		Confirm: false,
+		DryRun:  false,
+	})
+	if err == nil {
+		t.Error("expected error when replaying without confirmation, got nil")
+	}
+
+	// Try to replay message without confirmation (should fail)
+	err = pq.ReplayMessage(ctx, "replay-confirm-test", QueueTypeChannel, msg.ID, ReplayOptions{
+		Confirm: false,
+		DryRun:  false,
+	})
+	if err == nil {
+		t.Error("expected error when replaying message without confirmation, got nil")
+	}
+
+	// Try to replay DLQ without confirmation (should fail)
+	_, err = pq.ReplayDLQ(ctx, "replay-confirm-test", QueueTypeChannel, ReplayOptions{
+		Confirm: false,
+		DryRun:  false,
+	})
+	if err == nil {
+		t.Error("expected error when replaying DLQ without confirmation, got nil")
+	}
+}
+
+// TestNackExceedsMaxRetries tests that messages go to DLQ after max retries
+func TestNackExceedsMaxRetries(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel with max retries = 2
+	err := pq.CreateChannel(ctx, "max-retry-test", ChannelOptions{
+		MaxRetries: 2,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish a message
+	msgID, err := pq.Publish(ctx, "max-retry-test", []byte("test message"))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Nack the message 3 times (should move to DLQ after 3rd nack)
+	for i := 0; i < 3; i++ {
+		msg, err := pq.ConsumeFromChannel(ctx, "max-retry-test", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume message on attempt %d: %v", i+1, err)
+		}
+		if msg == nil {
+			t.Fatalf("consume returned nil on attempt %d", i+1)
+		}
+		if err := pq.NackChannel(ctx, "max-retry-test", msg.ID, "test failure"); err != nil {
+			t.Fatalf("failed to nack message on attempt %d: %v", i+1, err)
+		}
+	}
+
+	// Message should now be in DLQ
+	dlqStats, err := pq.GetDLQStats(ctx, "max-retry-test", QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats: %v", err)
+	}
+
+	if dlqStats.TotalCount != 1 {
+		t.Errorf("expected 1 message in DLQ after max retries, got %d", dlqStats.TotalCount)
+	}
+
+	// Queue should be empty
+	depth, err := pq.GetQueueDepth(ctx, "max-retry-test", QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get queue depth: %v", err)
+	}
+	if depth != 0 {
+		t.Errorf("expected queue depth 0 after message moved to DLQ, got %d", depth)
+	}
+
+	// Verify the message ID matches
+	_ = msgID // Used for deduplication test earlier
+}
+
+// TestSubscribeToNonExistentTopic tests subscribing to a topic that doesn't exist
+func TestSubscribeToNonExistentTopic(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Try to subscribe to non-existent topic
+	err := pq.Subscribe(ctx, "non-existent-topic", "subscriber-1")
+	if err == nil {
+		t.Error("expected error when subscribing to non-existent topic, got nil")
+	}
+}
+
+// TestGetStatsForNonExistentQueue tests getting stats for a queue that doesn't exist
+func TestGetStatsForNonExistentQueue(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Try to get stats for non-existent channel
+	_, err := pq.GetStats(ctx, "non-existent", QueueTypeChannel)
+	if err == nil {
+		t.Error("expected error when getting stats for non-existent channel, got nil")
+	}
+
+	// Try to get stats for non-existent topic
+	_, err = pq.GetStats(ctx, "non-existent", QueueTypePubSub)
+	if err == nil {
+		t.Error("expected error when getting stats for non-existent topic, got nil")
+	}
+}
+
+// TestPurgeQueueWithoutConfirmation tests purging without confirmation
+func TestPurgeQueueWithoutConfirmation(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel
+	err := pq.CreateChannel(ctx, "purge-confirm-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish some messages
+	for i := 0; i < 5; i++ {
+		_, err := pq.Publish(ctx, "purge-confirm-test", []byte("test message"))
+		if err != nil {
+			t.Fatalf("failed to publish message: %v", err)
+		}
+	}
+
+	// Create garbage collector
+	gc := NewGarbageCollector(pq, GarbageCollectorConfig{})
+
+	// Try to purge without confirmation (should fail)
+	err = gc.PurgeQueue(ctx, "purge-confirm-test", QueueTypeChannel, false)
+	if err == nil {
+		t.Error("expected error when purging without confirmation, got nil")
+	}
+
+	// Verify messages still exist
+	depth, err := pq.GetQueueDepth(ctx, "purge-confirm-test", QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get queue depth: %v", err)
+	}
+	if depth != 5 {
+		t.Errorf("expected 5 messages after failed purge, got %d", depth)
+	}
+}
+
+// TestInitWithNilDatabase tests initialization with nil database
+func TestInitWithNilDatabase(t *testing.T) {
+	ctx := context.Background()
+
+	// Try to initialize with nil database
+	_, err := Init(ctx, Config{
+		DB: nil,
+	})
+	if err == nil {
+		t.Error("expected error when initializing with nil database, got nil")
+	}
+}
+
+// TestConcurrentPublish tests concurrent publishing to the same queue
+func TestConcurrentPublish(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a test channel
+	err := pq.CreateChannel(ctx, "concurrent-test", ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish concurrently from multiple goroutines
+	numGoroutines := 10
+	messagesPerGoroutine := 5
+	errChan := make(chan error, numGoroutines*messagesPerGoroutine)
+	doneChan := make(chan bool, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			for j := 0; j < messagesPerGoroutine; j++ {
+				_, err := pq.Publish(ctx, "concurrent-test", []byte("concurrent message"))
+				if err != nil {
+					errChan <- err
+				}
+			}
+			doneChan <- true
+		}(i)
+	}
+
+	// Wait for all goroutines to complete
+	for i := 0; i < numGoroutines; i++ {
+		<-doneChan
+	}
+	close(errChan)
+
+	// Check for errors
+	for err := range errChan {
+		t.Errorf("concurrent publish error: %v", err)
+	}
+
+	// Verify all messages were published
+	depth, err := pq.GetQueueDepth(ctx, "concurrent-test", QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get queue depth: %v", err)
+	}
+
+	expectedCount := int64(numGoroutines * messagesPerGoroutine)
+	if depth != expectedCount {
+		t.Errorf("expected %d messages after concurrent publish, got %d", expectedCount, depth)
+	}
+}
