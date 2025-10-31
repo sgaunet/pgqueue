@@ -100,7 +100,7 @@ func (pq *PGQueue) ReplayFrom(ctx context.Context, queueName string, queueType Q
 
 	// Log replay operation
 	if opts.PerformedBy != "" {
-		if err := pq.logReplay(ctx, queueName, queueType, "replay_from", int(rows), opts.PerformedBy, fmt.Sprintf("since: %s", since)); err != nil {
+		if err := pq.logReplay(ctx, queueName, queueType, "timestamp", int(rows), opts.PerformedBy, fmt.Sprintf("since: %s", since)); err != nil {
 			// Log error but don't fail the operation
 			fmt.Printf("failed to log replay operation: %v\n", err)
 		}
@@ -173,7 +173,7 @@ func (pq *PGQueue) ReplayMessage(ctx context.Context, queueName string, queueTyp
 
 	// Log replay operation
 	if opts.PerformedBy != "" {
-		if err := pq.logReplay(ctx, queueName, queueType, "replay_message", 1, opts.PerformedBy, fmt.Sprintf("message_id: %s", messageID)); err != nil {
+		if err := pq.logReplay(ctx, queueName, queueType, "message_id", 1, opts.PerformedBy, fmt.Sprintf("message_id: %s", messageID)); err != nil {
 			fmt.Printf("failed to log replay operation: %v\n", err)
 		}
 	}
@@ -289,7 +289,7 @@ func (pq *PGQueue) ReplayDLQ(ctx context.Context, queueName string, queueType Qu
 
 	// Log replay operation
 	if opts.PerformedBy != "" {
-		if err := pq.logReplay(ctx, queueName, queueType, "replay_dlq", count, opts.PerformedBy, fmt.Sprintf("replayed %d messages from DLQ", count)); err != nil {
+		if err := pq.logReplay(ctx, queueName, queueType, "dlq", count, opts.PerformedBy, fmt.Sprintf("replayed %d messages from DLQ", count)); err != nil {
 			fmt.Printf("failed to log replay operation: %v\n", err)
 		}
 	}

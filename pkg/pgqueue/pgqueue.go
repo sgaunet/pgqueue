@@ -12,6 +12,55 @@ import (
 	"github.com/sgaunet/pgqueue/internal/db"
 )
 
+// baseSchemaSQL contains the DDL for creating the base schema tables required by pgqueue.
+// This includes: pgqueue_metadata, pgqueue_subscribers, and pgqueue_replay_log.
+const baseSchemaSQL = `
+-- Enable UUID extension for UUIDv7 generation
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Metadata table to track all queues (topics and channels)
+CREATE TABLE IF NOT EXISTS pgqueue_metadata (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    queue_type TEXT NOT NULL CHECK (queue_type IN ('pubsub', 'channel')),
+    queue_name TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(queue_type, queue_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pgqueue_metadata_type_name ON pgqueue_metadata(queue_type, queue_name);
+CREATE INDEX IF NOT EXISTS idx_pgqueue_metadata_table_name ON pgqueue_metadata(table_name);
+
+-- Subscribers table for pub/sub topics
+CREATE TABLE IF NOT EXISTS pgqueue_subscribers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    topic_name TEXT NOT NULL,
+    subscriber_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE(topic_name, subscriber_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pgqueue_subscribers_topic ON pgqueue_subscribers(topic_name) WHERE active = TRUE;
+
+-- Replay audit log
+CREATE TABLE IF NOT EXISTS pgqueue_replay_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    queue_type TEXT NOT NULL,
+    queue_name TEXT NOT NULL,
+    replay_type TEXT NOT NULL CHECK (replay_type IN ('timestamp', 'message_id', 'dlq')),
+    replay_params JSONB NOT NULL,
+    message_count INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_queue ON pgqueue_replay_log(queue_type, queue_name);
+CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_log(created_at);
+`
+
 // PGQueue is the main struct for the message queue system
 type PGQueue struct {
 	db      *sql.DB
@@ -23,6 +72,52 @@ var (
 	// queueNameRegex validates queue names (alphanumeric, underscore, dash)
 	queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 )
+
+// InitSchema initializes the base schema tables required by pgqueue.
+// This function must be called once before creating any queues or topics.
+//
+// It creates three tables:
+//   - pgqueue_metadata: Tracks all queues and topics with their configurations
+//   - pgqueue_subscribers: Tracks pub/sub subscriptions for topics
+//   - pgqueue_replay_log: Audit log for message replay operations
+//
+// The function is idempotent and uses CREATE TABLE IF NOT EXISTS, so it can be
+// safely called multiple times without errors.
+//
+// Example usage:
+//
+//	db, err := sql.Open("pgx", "postgres://user:pass@localhost/dbname")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer db.Close()
+//
+//	// Initialize base schema (call once per database)
+//	if err := pgqueue.InitSchema(ctx, db); err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Initialize pgqueue library
+//	pq, err := pgqueue.Init(ctx, pgqueue.Config{
+//	    DB:                db,
+//	    MaxMessageSize:    1024 * 1024,
+//	    DefaultMaxRetries: 3,
+//	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+func InitSchema(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("database connection cannot be nil")
+	}
+
+	_, err := db.ExecContext(ctx, baseSchemaSQL)
+	if err != nil {
+		return fmt.Errorf("failed to initialize base schema: %w", err)
+	}
+
+	return nil
+}
 
 // Init initializes the PGQueue system with the provided configuration
 func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
