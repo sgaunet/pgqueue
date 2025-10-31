@@ -1,0 +1,21 @@
+# https://taskfile.dev
+version: '3'
+
+tasks:
+  default:
+    desc: "List all tasks"
+    cmds:
+      - task -a
+
+  linter:
+    desc: "Run linter"
+    cmds:
+      - go generate ./...
+      - golangci-lint run
+
+  tests:
+    desc: "Run tests"
+    cmds:
+      - go test ./... -v -count=2 -race
+
+    
