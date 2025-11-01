@@ -142,6 +142,74 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
+	pq, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a test channel
+	err := pq.CreateChannel(ctx, "gc-zero-ttl-test", ChannelOptions{
+		MaxRetries: 3,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish and acknowledge a message
+	_, err = pq.Publish(ctx, "gc-zero-ttl-test", []byte("test message"))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	msg, err := pq.ConsumeFromChannel(ctx, "gc-zero-ttl-test", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume message: %v", err)
+	}
+
+	if err := pq.AckChannel(ctx, "gc-zero-ttl-test", msg.ID); err != nil {
+		t.Fatalf("failed to ack message: %v", err)
+	}
+
+	// Wait for processed_at to be set
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify message is completed
+	stats, err := pq.GetStats(ctx, "gc-zero-ttl-test", QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats: %v", err)
+	}
+	if stats.CompletedCount != 1 {
+		t.Errorf("expected 1 completed message, got %d", stats.CompletedCount)
+	}
+
+	// Run garbage collector with TTL=0 (never expire)
+	gcConfig := GarbageCollectorConfig{
+		DefaultPolicy: RetentionPolicy{
+			CompletedMessageTTL: 0, // Never expire
+		},
+	}
+	gc := NewGarbageCollector(pq, gcConfig)
+
+	// Run collection multiple times
+	for i := 0; i < 3; i++ {
+		if err := gc.collect(ctx); err != nil {
+			t.Fatalf("garbage collection failed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify completed message is still present
+	stats, err = pq.GetStats(ctx, "gc-zero-ttl-test", QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats: %v", err)
+	}
+
+	if stats.CompletedCount != 1 {
+		t.Errorf("expected 1 completed message to be preserved with TTL=0, got %d", stats.CompletedCount)
+	}
+}
+
 func TestPurgeQueue(t *testing.T) {
 	pq, cleanup := setupTestDB(t)
 	defer cleanup()

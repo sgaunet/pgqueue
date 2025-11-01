@@ -21,9 +21,6 @@ func NewGarbageCollector(pq *PGQueue, config GarbageCollectorConfig) *GarbageCol
 	if config.Interval == 0 {
 		config.Interval = 5 * time.Minute
 	}
-	if config.DefaultPolicy.CompletedMessageTTL == 0 {
-		config.DefaultPolicy.CompletedMessageTTL = 24 * time.Hour
-	}
 	if config.Policies == nil {
 		config.Policies = make(map[string]RetentionPolicy)
 	}

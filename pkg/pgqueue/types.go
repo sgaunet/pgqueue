@@ -134,7 +134,7 @@ type DLQMessage struct {
 
 // RetentionPolicy defines how messages should be garbage collected
 type RetentionPolicy struct {
-	CompletedMessageTTL time.Duration // How long to keep completed messages
+	CompletedMessageTTL time.Duration // How long to keep completed messages (0 = forever)
 	MaxPendingAge       time.Duration // Maximum age for pending messages (0 = no limit)
 	DLQRetention        time.Duration // How long to keep DLQ messages (0 = forever)
 }
