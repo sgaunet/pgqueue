@@ -12,12 +12,9 @@ import (
 // baseSchemaSQL contains the DDL for creating the base schema tables required by pgqueue.
 // This includes: pgqueue_metadata, pgqueue_subscribers, and pgqueue_replay_log.
 const baseSchemaSQL = `
--- Enable UUID extension for UUIDv7 generation
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 -- Metadata table to track all queues (topics and channels)
 CREATE TABLE IF NOT EXISTS pgqueue_metadata (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT uuidv7(),
     queue_type TEXT NOT NULL CHECK (queue_type IN ('pubsub', 'channel')),
     queue_name TEXT NOT NULL,
     table_name TEXT NOT NULL,
@@ -32,7 +29,7 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_metadata_table_name ON pgqueue_metadata(t
 
 -- Subscribers table for pub/sub topics
 CREATE TABLE IF NOT EXISTS pgqueue_subscribers (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT uuidv7(),
     topic_name TEXT NOT NULL,
     subscriber_id TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -44,7 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_subscribers_topic ON pgqueue_subscribers(
 
 -- Replay audit log
 CREATE TABLE IF NOT EXISTS pgqueue_replay_log (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT uuidv7(),
     queue_type TEXT NOT NULL,
     queue_name TEXT NOT NULL,
     replay_type TEXT NOT NULL CHECK (replay_type IN ('timestamp', 'message_id', 'dlq')),
@@ -236,7 +233,7 @@ func (pq *PGQueue) createPubSubTables(ctx context.Context, tx *sql.Tx, tableName
 	// Create subscription table
 	subscriptionTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS pgqueue_sub_%s (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			message_id UUID NOT NULL,
 			subscriber_id TEXT NOT NULL,
 			status TEXT NOT NULL DEFAULT 'pending',
@@ -315,7 +312,7 @@ func (pq *PGQueue) createChannelTables(ctx context.Context, tx *sql.Tx, tableNam
 func (pq *PGQueue) createDLQTable(ctx context.Context, tx *sql.Tx, tableName string) error {
 	dlqTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS pgqueue_dlq_%s (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			original_message_id UUID NOT NULL,
 			payload BYTEA NOT NULL,
 			failure_reason TEXT NOT NULL,

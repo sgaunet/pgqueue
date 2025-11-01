@@ -53,10 +53,8 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 
 	// Run migrations
 	migrations := `
-		CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 		CREATE TABLE IF NOT EXISTS pgqueue_metadata (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			queue_type TEXT NOT NULL CHECK (queue_type IN ('pubsub', 'channel')),
 			queue_name TEXT NOT NULL,
 			table_name TEXT NOT NULL,
@@ -70,7 +68,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		CREATE INDEX idx_pgqueue_metadata_table_name ON pgqueue_metadata(table_name);
 
 		CREATE TABLE IF NOT EXISTS pgqueue_subscribers (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			topic_name TEXT NOT NULL,
 			subscriber_id TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -81,7 +79,7 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		CREATE INDEX idx_pgqueue_subscribers_topic ON pgqueue_subscribers(topic_name) WHERE active = TRUE;
 
 		CREATE TABLE IF NOT EXISTS pgqueue_replay_log (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			queue_type TEXT NOT NULL,
 			queue_name TEXT NOT NULL,
 			replay_type TEXT NOT NULL CHECK (replay_type IN ('timestamp', 'message_id', 'dlq')),

@@ -98,21 +98,6 @@ func TestInitSchema(t *testing.T) {
 		if !tableExists {
 			t.Error("pgqueue_replay_log table was not created")
 		}
-
-		// Verify pgcrypto extension is enabled
-		var extensionExists bool
-		err = db.QueryRowContext(ctx, `
-			SELECT EXISTS (
-				SELECT FROM pg_extension
-				WHERE extname = 'pgcrypto'
-			)
-		`).Scan(&extensionExists)
-		if err != nil {
-			t.Fatalf("failed to check pgcrypto extension: %v", err)
-		}
-		if !extensionExists {
-			t.Error("pgcrypto extension was not enabled")
-		}
 	})
 
 	t.Run("idempotent_behavior", func(t *testing.T) {
