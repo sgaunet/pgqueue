@@ -7,9 +7,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-
-	"github.com/google/uuid"
-	"github.com/sgaunet/pgqueue/internal/db"
 )
 
 // baseSchemaSQL contains the DDL for creating the base schema tables required by pgqueue.
@@ -63,9 +60,8 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_l
 
 // PGQueue is the main struct for the message queue system
 type PGQueue struct {
-	db      *sql.DB
-	queries *db.Queries
-	config  Config
+	db     *sql.DB
+	config Config
 }
 
 var (
@@ -139,9 +135,8 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 	}
 
 	pq := &PGQueue{
-		db:      cfg.DB,
-		queries: db.New(cfg.DB),
-		config:  cfg,
+		db:     cfg.DB,
+		config: cfg,
 	}
 
 	return pq, nil
@@ -165,11 +160,8 @@ func (pq *PGQueue) createQueue(ctx context.Context, queueType QueueType, name st
 	}
 
 	// Check if queue already exists
-	existing, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: name,
-	})
-	if err == nil && existing.ID != [16]byte{} {
+	existing, err := pq.getQueueMetadata(ctx, string(queueType), name)
+	if err == nil && existing != nil {
 		return fmt.Errorf("queue already exists: %s/%s", queueType, name)
 	}
 	if err != nil && err != sql.ErrNoRows {
@@ -192,15 +184,8 @@ func (pq *PGQueue) createQueue(ctx context.Context, queueType QueueType, name st
 	}
 	defer tx.Rollback()
 
-	qtx := pq.queries.WithTx(tx)
-
 	// Create metadata entry
-	_, err = qtx.CreateQueueMetadata(ctx, db.CreateQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: name,
-		TableName: tableName,
-		Config:    configJSON,
-	})
+	_, err = pq.createQueueMetadata(ctx, tx, string(queueType), name, tableName, configJSON)
 	if err != nil {
 		return fmt.Errorf("failed to create queue metadata: %w", err)
 	}
@@ -367,7 +352,7 @@ func (pq *PGQueue) ListChannels(ctx context.Context) ([]QueueMetadata, error) {
 
 // listQueues is the internal implementation for listing queues
 func (pq *PGQueue) listQueues(ctx context.Context, queueType QueueType) ([]QueueMetadata, error) {
-	rows, err := pq.queries.ListQueues(ctx, string(queueType))
+	rows, err := pq.listQueuesRaw(ctx, string(queueType))
 	if err != nil {
 		return nil, fmt.Errorf("failed to list queues: %w", err)
 	}
@@ -380,11 +365,11 @@ func (pq *PGQueue) listQueues(ctx context.Context, queueType QueueType) ([]Queue
 		}
 
 		result = append(result, QueueMetadata{
-			ID:        uuid.UUID(row.ID),
-			QueueType: QueueType(row.QueueType),
+			ID:        row.ID,
+			QueueType: row.QueueType,
 			QueueName: row.QueueName,
 			TableName: row.TableName,
-			Config:    config,
+			Config:    row.Config,
 			CreatedAt: row.CreatedAt,
 			UpdatedAt: row.UpdatedAt,
 		})

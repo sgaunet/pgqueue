@@ -7,16 +7,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sgaunet/pgqueue/internal/db"
 )
 
 // Subscribe registers a subscriber for a topic and returns a channel to consume messages
 func (pq *PGQueue) Subscribe(ctx context.Context, topicName, subscriberID string) error {
 	// Verify topic exists
-	_, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypePubSub),
-		QueueName: topicName,
-	})
+	_, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("topic not found: %s", topicName)
@@ -25,10 +21,7 @@ func (pq *PGQueue) Subscribe(ctx context.Context, topicName, subscriberID string
 	}
 
 	// Register subscriber
-	_, err = pq.queries.RegisterSubscriber(ctx, db.RegisterSubscriberParams{
-		TopicName:    topicName,
-		SubscriberID: subscriberID,
-	})
+	_, err = pq.registerSubscriber(ctx, topicName, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to register subscriber: %w", err)
 	}
@@ -38,10 +31,7 @@ func (pq *PGQueue) Subscribe(ctx context.Context, topicName, subscriberID string
 
 // Unsubscribe removes a subscriber from a topic
 func (pq *PGQueue) Unsubscribe(ctx context.Context, topicName, subscriberID string) error {
-	err := pq.queries.UnregisterSubscriber(ctx, db.UnregisterSubscriberParams{
-		TopicName:    topicName,
-		SubscriberID: subscriberID,
-	})
+	err := pq.unregisterSubscriber(ctx, topicName, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to unsubscribe: %w", err)
 	}
@@ -53,10 +43,7 @@ func (pq *PGQueue) Unsubscribe(ctx context.Context, topicName, subscriberID stri
 // Returns nil message if no messages available
 func (pq *PGQueue) ConsumeFromTopic(ctx context.Context, topicName, subscriberID string, visibilityTimeout time.Duration) (*Message, error) {
 	// Get queue metadata
-	queueMeta, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypePubSub),
-		QueueName: topicName,
-	})
+	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
 	}
@@ -131,10 +118,7 @@ func (pq *PGQueue) ConsumeFromTopic(ctx context.Context, topicName, subscriberID
 
 // AckTopic acknowledges a message for a subscriber
 func (pq *PGQueue) AckTopic(ctx context.Context, topicName, subscriberID string, messageID uuid.UUID) error {
-	queueMeta, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypePubSub),
-		QueueName: topicName,
-	})
+	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err != nil {
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}
@@ -163,10 +147,7 @@ func (pq *PGQueue) AckTopic(ctx context.Context, topicName, subscriberID string,
 
 // NackTopic negatively acknowledges a message for a subscriber (retry)
 func (pq *PGQueue) NackTopic(ctx context.Context, topicName, subscriberID string, messageID uuid.UUID, errorMsg string) error {
-	queueMeta, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypePubSub),
-		QueueName: topicName,
-	})
+	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err != nil {
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}

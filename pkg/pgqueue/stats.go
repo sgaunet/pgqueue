@@ -5,17 +5,12 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
-
-	"github.com/sgaunet/pgqueue/internal/db"
 )
 
 // GetStats returns statistics for a queue
 func (pq *PGQueue) GetStats(ctx context.Context, queueName string, queueType QueueType) (*QueueStats, error) {
 	// Get queue metadata
-	metadata, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-	})
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
@@ -133,10 +128,7 @@ func (pq *PGQueue) getPubSubStats(ctx context.Context, tableName string, stats *
 // GetQueueDepth returns the number of pending messages in a queue
 func (pq *PGQueue) GetQueueDepth(ctx context.Context, queueName string, queueType QueueType) (int64, error) {
 	// Get queue metadata
-	metadata, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-	})
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
@@ -165,10 +157,7 @@ func (pq *PGQueue) GetQueueDepth(ctx context.Context, queueName string, queueTyp
 // GetSubscriberLag returns lag statistics for a specific subscriber on a topic
 func (pq *PGQueue) GetSubscriberLag(ctx context.Context, topicName string, subscriberID string) (*SubscriberLag, error) {
 	// Get topic metadata
-	metadata, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypePubSub),
-		QueueName: topicName,
-	})
+	metadata, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("topic not found: %s", topicName)
 	}
@@ -216,10 +205,7 @@ func (pq *PGQueue) GetSubscriberLag(ctx context.Context, topicName string, subsc
 // GetDLQStats returns statistics about messages in the dead letter queue
 func (pq *PGQueue) GetDLQStats(ctx context.Context, queueName string, queueType QueueType) (*DLQStats, error) {
 	// Get queue metadata
-	metadata, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-	})
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}

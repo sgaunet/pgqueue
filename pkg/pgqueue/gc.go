@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
-
-	"github.com/sgaunet/pgqueue/internal/db"
 )
 
 // GarbageCollector handles automatic cleanup of old messages
@@ -117,14 +115,14 @@ func (gc *GarbageCollector) collectQueue(ctx context.Context, queue QueueMetadat
 	}
 
 	// Reset timed-out messages for channels
-	if queue.QueueType == QueueTypeChannel {
+	if queue.QueueType == string(QueueTypeChannel) {
 		if err := gc.resetTimedOutMessages(ctx, queue.TableName); err != nil {
 			return fmt.Errorf("failed to reset timed-out messages: %w", err)
 		}
 	}
 
 	// Reset timed-out subscriptions for pub/sub
-	if queue.QueueType == QueueTypePubSub {
+	if queue.QueueType == string(QueueTypePubSub) {
 		if err := gc.resetTimedOutSubscriptions(ctx, queue.TableName); err != nil {
 			return fmt.Errorf("failed to reset timed-out subscriptions: %w", err)
 		}
@@ -261,10 +259,7 @@ func (gc *GarbageCollector) PurgeQueue(ctx context.Context, queueName string, qu
 	}
 
 	// Get queue metadata
-	metadata, err := gc.pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-	})
+	metadata, err := gc.pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}

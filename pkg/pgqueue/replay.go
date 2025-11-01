@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sgaunet/pgqueue/internal/db"
 )
 
 // ReplayFrom resets messages after a specific timestamp to pending status
@@ -18,10 +17,7 @@ func (pq *PGQueue) ReplayFrom(ctx context.Context, queueName string, queueType Q
 	}
 
 	// Get queue metadata
-	metadata, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-	})
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
@@ -116,10 +112,7 @@ func (pq *PGQueue) ReplayMessage(ctx context.Context, queueName string, queueTyp
 	}
 
 	// Get queue metadata
-	metadata, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-	})
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
@@ -188,10 +181,7 @@ func (pq *PGQueue) ReplayDLQ(ctx context.Context, queueName string, queueType Qu
 	}
 
 	// Get queue metadata
-	metadata, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-	})
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
@@ -304,26 +294,18 @@ func (pq *PGQueue) logReplay(ctx context.Context, queueName string, queueType Qu
 		return fmt.Errorf("failed to marshal replay params: %w", err)
 	}
 
-	_, err = pq.queries.CreateReplayLog(ctx, db.CreateReplayLogParams{
-		QueueType:    string(queueType),
-		QueueName:    queueName,
-		ReplayType:   operation,
-		ReplayParams: params,
-		MessageCount: int32(messageCount),
-		CreatedBy:    sql.NullString{String: performedBy, Valid: performedBy != ""},
-	})
-	return err
+	var createdBy *string
+	if performedBy != "" {
+		createdBy = &performedBy
+	}
+	return pq.createReplayLog(ctx, string(queueType), queueName, operation, params, messageCount, createdBy)
 }
 
 // GetReplayHistory returns the replay history for a queue
-func (pq *PGQueue) GetReplayHistory(ctx context.Context, queueName string, queueType QueueType, limit int) ([]db.PgqueueReplayLog, error) {
+func (pq *PGQueue) GetReplayHistory(ctx context.Context, queueName string, queueType QueueType, limit int) ([]ReplayLog, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 
-	return pq.queries.GetReplayHistory(ctx, db.GetReplayHistoryParams{
-		QueueType: string(queueType),
-		QueueName: queueName,
-		Limit:     int32(limit),
-	})
+	return pq.getReplayHistory(ctx, string(queueType), queueName, limit)
 }

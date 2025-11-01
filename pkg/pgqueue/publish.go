@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/sgaunet/pgqueue/internal/db"
 )
 
 // Publish publishes a message to a topic or channel
@@ -21,20 +20,14 @@ func (pq *PGQueue) Publish(ctx context.Context, queueName string, payload []byte
 // metadata is optional and can be nil
 func (pq *PGQueue) PublishWithID(ctx context.Context, queueName string, messageID uuid.UUID, payload []byte, metadata map[string]interface{}) (uuid.UUID, error) {
 	// Get queue metadata to determine type and validate
-	var queueMeta db.PgqueueMetadatum
+	var queueMeta *QueueMetadata
 	var err error
 
 	// Try pub/sub first
-	queueMeta, err = pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypePubSub),
-		QueueName: queueName,
-	})
+	queueMeta, err = pq.getQueueMetadata(ctx, string(QueueTypePubSub), queueName)
 	if err == sql.ErrNoRows {
 		// Try channel
-		queueMeta, err = pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-			QueueType: string(QueueTypeChannel),
-			QueueName: queueName,
-		})
+		queueMeta, err = pq.getQueueMetadata(ctx, string(QueueTypeChannel), queueName)
 	}
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -127,7 +120,7 @@ func (pq *PGQueue) publishToPubSub(ctx context.Context, topicName, tableName str
 	}
 
 	// Get active subscribers
-	subscribers, err := pq.queries.WithTx(tx).GetActiveSubscribers(ctx, topicName)
+	subscribers, err := pq.getActiveSubscribers(ctx, tx, topicName)
 	if err != nil {
 		return fmt.Errorf("failed to get active subscribers: %w", err)
 	}

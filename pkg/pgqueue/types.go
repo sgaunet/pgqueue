@@ -77,15 +77,36 @@ type Subscription struct {
 	AckedAt      *time.Time
 }
 
-// QueueMetadata holds information about a queue
+// QueueMetadata holds information about a queue (database model)
 type QueueMetadata struct {
 	ID        uuid.UUID
-	QueueType QueueType
+	QueueType string
 	QueueName string
 	TableName string
-	Config    map[string]interface{}
+	Config    []byte // json.RawMessage from database
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// Subscriber represents a pub/sub subscriber registration (database model)
+type Subscriber struct {
+	ID           uuid.UUID
+	TopicName    string
+	SubscriberID string
+	CreatedAt    time.Time
+	Active       bool
+}
+
+// ReplayLog represents an audit log entry for replay operations (database model)
+type ReplayLog struct {
+	ID           uuid.UUID
+	QueueType    string
+	QueueName    string
+	ReplayType   string
+	ReplayParams []byte // json.RawMessage from database
+	MessageCount int
+	CreatedAt    time.Time
+	CreatedBy    *string // nullable string
 }
 
 // QueueStats holds statistics about a queue

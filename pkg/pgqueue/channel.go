@@ -7,17 +7,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sgaunet/pgqueue/internal/db"
 )
 
 // ConsumeFromChannel retrieves the next available message from a channel
 // Returns nil if no messages are available
 func (pq *PGQueue) ConsumeFromChannel(ctx context.Context, channelName string, visibilityTimeout time.Duration) (*Message, error) {
 	// Get queue metadata
-	queueMeta, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypeChannel),
-		QueueName: channelName,
-	})
+	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypeChannel), channelName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
@@ -94,10 +90,7 @@ func (pq *PGQueue) ConsumeFromChannel(ctx context.Context, channelName string, v
 
 // AckChannel acknowledges a message from a channel (marks as completed)
 func (pq *PGQueue) AckChannel(ctx context.Context, channelName string, messageID uuid.UUID) error {
-	queueMeta, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypeChannel),
-		QueueName: channelName,
-	})
+	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypeChannel), channelName)
 	if err != nil {
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
@@ -126,10 +119,7 @@ func (pq *PGQueue) AckChannel(ctx context.Context, channelName string, messageID
 
 // NackChannel negatively acknowledges a message from a channel (retry or move to DLQ)
 func (pq *PGQueue) NackChannel(ctx context.Context, channelName string, messageID uuid.UUID, errorMsg string) error {
-	queueMeta, err := pq.queries.GetQueueMetadata(ctx, db.GetQueueMetadataParams{
-		QueueType: string(QueueTypeChannel),
-		QueueName: channelName,
-	})
+	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypeChannel), channelName)
 	if err != nil {
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
