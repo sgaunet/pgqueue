@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -25,12 +26,12 @@ func (pq *PGQueue) PublishWithID(ctx context.Context, queueName string, messageI
 
 	// Try pub/sub first
 	queueMeta, err = pq.getQueueMetadata(ctx, string(QueueTypePubSub), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		// Try channel
 		queueMeta, err = pq.getQueueMetadata(ctx, string(QueueTypeChannel), queueName)
 	}
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return uuid.UUID{}, fmt.Errorf("queue not found: %s", queueName)
 		}
 		return uuid.UUID{}, fmt.Errorf("failed to get queue metadata: %w", err)
@@ -95,7 +96,7 @@ func (pq *PGQueue) publishToPubSub(ctx context.Context, topicName, tableName str
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Check for duplicate message ID (deduplication)
 	checkQuery := fmt.Sprintf(`SELECT id FROM pgqueue_msg_%s WHERE id = $1`, tableName)
@@ -104,7 +105,7 @@ func (pq *PGQueue) publishToPubSub(ctx context.Context, topicName, tableName str
 	if err == nil {
 		return fmt.Errorf("duplicate message ID: %s", messageID)
 	}
-	if err != sql.ErrNoRows {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check for duplicate: %w", err)
 	}
 
@@ -136,7 +137,7 @@ func (pq *PGQueue) publishToPubSub(ctx context.Context, topicName, tableName str
 		if err != nil {
 			return fmt.Errorf("failed to prepare subscription insert: %w", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		for _, sub := range subscribers {
 			if _, err := stmt.ExecContext(ctx, messageID, sub.SubscriberID); err != nil {
@@ -162,7 +163,7 @@ func (pq *PGQueue) publishToChannel(ctx context.Context, tableName string, messa
 	if err == nil {
 		return fmt.Errorf("duplicate message ID: %s", messageID)
 	}
-	if err != sql.ErrNoRows {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check for duplicate: %w", err)
 	}
 
@@ -178,12 +179,4 @@ func (pq *PGQueue) publishToChannel(ctx context.Context, tableName string, messa
 	}
 
 	return nil
-}
-
-// reverseTableName converts a sanitized table name back to queue name
-// This is a simple implementation that reverses sanitizeTableName
-func reverseTableName(tableName string) string {
-	// For now, just return as-is since we only lowercase and replace dashes
-	// The actual topic name is stored in metadata
-	return tableName
 }

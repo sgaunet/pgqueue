@@ -3,11 +3,12 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
 
-// GarbageCollector handles automatic cleanup of old messages
+// GarbageCollector handles automatic cleanup of old messages.
 type GarbageCollector struct {
 	pq       *PGQueue
 	config   GarbageCollectorConfig
@@ -15,7 +16,7 @@ type GarbageCollector struct {
 	doneChan chan struct{}
 }
 
-// NewGarbageCollector creates a new garbage collector instance
+// NewGarbageCollector creates a new garbage collector instance.
 func NewGarbageCollector(pq *PGQueue, config GarbageCollectorConfig) *GarbageCollector {
 	// Set defaults
 	if config.Interval == 0 {
@@ -33,7 +34,7 @@ func NewGarbageCollector(pq *PGQueue, config GarbageCollectorConfig) *GarbageCol
 	}
 }
 
-// Start begins the garbage collection loop
+// Start begins the garbage collection loop.
 func (gc *GarbageCollector) Start(ctx context.Context) {
 	ticker := time.NewTicker(gc.config.Interval)
 	defer ticker.Stop()
@@ -54,13 +55,13 @@ func (gc *GarbageCollector) Start(ctx context.Context) {
 	}
 }
 
-// Stop gracefully stops the garbage collector
+// Stop gracefully stops the garbage collector.
 func (gc *GarbageCollector) Stop() {
 	close(gc.stopChan)
 	<-gc.doneChan
 }
 
-// collect performs a single garbage collection pass
+// collect performs a single garbage collection pass.
 func (gc *GarbageCollector) collect(ctx context.Context) error {
 	// Get all queues
 	topics, err := gc.pq.ListTopics(ctx)
@@ -86,7 +87,7 @@ func (gc *GarbageCollector) collect(ctx context.Context) error {
 	return nil
 }
 
-// collectQueue performs garbage collection for a single queue
+// collectQueue performs garbage collection for a single queue.
 func (gc *GarbageCollector) collectQueue(ctx context.Context, queue QueueMetadata) error {
 	policy := gc.getPolicy(queue.QueueName)
 
@@ -128,7 +129,7 @@ func (gc *GarbageCollector) collectQueue(ctx context.Context, queue QueueMetadat
 	return nil
 }
 
-// getPolicy returns the retention policy for a queue
+// getPolicy returns the retention policy for a queue.
 func (gc *GarbageCollector) getPolicy(queueName string) RetentionPolicy {
 	if policy, exists := gc.config.Policies[queueName]; exists {
 		return policy
@@ -136,7 +137,7 @@ func (gc *GarbageCollector) getPolicy(queueName string) RetentionPolicy {
 	return gc.config.DefaultPolicy
 }
 
-// purgeCompletedMessages deletes completed messages older than TTL
+// purgeCompletedMessages deletes completed messages older than TTL.
 func (gc *GarbageCollector) purgeCompletedMessages(ctx context.Context, tableName string, ttl time.Duration) error {
 	query := fmt.Sprintf(`
 		DELETE FROM pgqueue_msg_%s
@@ -158,7 +159,7 @@ func (gc *GarbageCollector) purgeCompletedMessages(ctx context.Context, tableNam
 	return nil
 }
 
-// purgeOldPendingMessages deletes pending messages older than max age
+// purgeOldPendingMessages deletes pending messages older than max age.
 func (gc *GarbageCollector) purgeOldPendingMessages(ctx context.Context, tableName string, maxAge time.Duration) error {
 	query := fmt.Sprintf(`
 		DELETE FROM pgqueue_msg_%s
@@ -180,7 +181,7 @@ func (gc *GarbageCollector) purgeOldPendingMessages(ctx context.Context, tableNa
 	return nil
 }
 
-// purgeDLQMessages deletes DLQ messages older than retention period
+// purgeDLQMessages deletes DLQ messages older than retention period.
 func (gc *GarbageCollector) purgeDLQMessages(ctx context.Context, tableName string, retention time.Duration) error {
 	query := fmt.Sprintf(`
 		DELETE FROM pgqueue_dlq_%s
@@ -201,7 +202,7 @@ func (gc *GarbageCollector) purgeDLQMessages(ctx context.Context, tableName stri
 	return nil
 }
 
-// resetTimedOutMessages resets messages with expired visibility timeouts
+// resetTimedOutMessages resets messages with expired visibility timeouts.
 func (gc *GarbageCollector) resetTimedOutMessages(ctx context.Context, tableName string) error {
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
@@ -225,7 +226,7 @@ func (gc *GarbageCollector) resetTimedOutMessages(ctx context.Context, tableName
 	return nil
 }
 
-// resetTimedOutSubscriptions resets subscriptions with expired visibility timeouts
+// resetTimedOutSubscriptions resets subscriptions with expired visibility timeouts.
 func (gc *GarbageCollector) resetTimedOutSubscriptions(ctx context.Context, tableName string) error {
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
@@ -257,7 +258,7 @@ func (gc *GarbageCollector) PurgeQueue(ctx context.Context, queueName string, qu
 
 	// Get queue metadata
 	metadata, err := gc.pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
 	if err != nil {
@@ -271,7 +272,7 @@ func (gc *GarbageCollector) PurgeQueue(ctx context.Context, queueName string, qu
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Delete all messages
 	deleteMsg := fmt.Sprintf("DELETE FROM pgqueue_msg_%s", tableName)

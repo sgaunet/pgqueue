@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,7 +19,7 @@ func (pq *PGQueue) ReplayFrom(ctx context.Context, queueName string, queueType Q
 
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
 	if err != nil {
@@ -113,7 +114,7 @@ func (pq *PGQueue) ReplayMessage(ctx context.Context, queueName string, queueTyp
 
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
 	if err != nil {
@@ -182,7 +183,7 @@ func (pq *PGQueue) ReplayDLQ(ctx context.Context, queueName string, queueType Qu
 
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
 	if err != nil {
@@ -209,7 +210,7 @@ func (pq *PGQueue) ReplayDLQ(ctx context.Context, queueName string, queueType Qu
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Get DLQ messages
 	selectQuery := fmt.Sprintf(`
@@ -225,7 +226,7 @@ func (pq *PGQueue) ReplayDLQ(ctx context.Context, queueName string, queueType Qu
 	if err != nil {
 		return 0, fmt.Errorf("failed to query DLQ: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type dlqRow struct {
 		id                uuid.UUID

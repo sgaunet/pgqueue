@@ -70,7 +70,7 @@ func (pq *PGQueue) listQueuesRaw(ctx context.Context, queueType string) ([]Queue
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	items := []QueueMetadata{}
 	for rows.Next() {
@@ -97,78 +97,6 @@ func (pq *PGQueue) listQueuesRaw(ctx context.Context, queueType string) ([]Queue
 	}
 
 	return items, nil
-}
-
-func (pq *PGQueue) listAllQueues(ctx context.Context) ([]QueueMetadata, error) {
-	query := `
-		SELECT id, queue_type, queue_name, table_name, config, created_at, updated_at
-		FROM pgqueue_metadata
-		ORDER BY queue_type, queue_name
-	`
-
-	rows, err := pq.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	items := []QueueMetadata{}
-	for rows.Next() {
-		var meta QueueMetadata
-		if err := rows.Scan(
-			&meta.ID,
-			&meta.QueueType,
-			&meta.QueueName,
-			&meta.TableName,
-			&meta.Config,
-			&meta.CreatedAt,
-			&meta.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, meta)
-	}
-
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return items, nil
-}
-
-func (pq *PGQueue) deleteQueueMetadata(ctx context.Context, queueType, queueName string) error {
-	query := `DELETE FROM pgqueue_metadata WHERE queue_type = $1 AND queue_name = $2`
-	_, err := pq.db.ExecContext(ctx, query, queueType, queueName)
-	return err
-}
-
-func (pq *PGQueue) updateQueueConfig(ctx context.Context, queueType, queueName string, config []byte) (*QueueMetadata, error) {
-	query := `
-		UPDATE pgqueue_metadata
-		SET config = $3, updated_at = NOW()
-		WHERE queue_type = $1 AND queue_name = $2
-		RETURNING id, queue_type, queue_name, table_name, config, created_at, updated_at
-	`
-
-	var meta QueueMetadata
-	err := pq.db.QueryRowContext(ctx, query, queueType, queueName, config).Scan(
-		&meta.ID,
-		&meta.QueueType,
-		&meta.QueueName,
-		&meta.TableName,
-		&meta.Config,
-		&meta.CreatedAt,
-		&meta.UpdatedAt,
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return &meta, nil
 }
 
 // Subscriber query methods
@@ -227,7 +155,7 @@ func (pq *PGQueue) getActiveSubscribers(ctx context.Context, tx *sql.Tx, topicNa
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	items := []Subscriber{}
 	for rows.Next() {
@@ -252,36 +180,6 @@ func (pq *PGQueue) getActiveSubscribers(ctx context.Context, tx *sql.Tx, topicNa
 	}
 
 	return items, nil
-}
-
-func (pq *PGQueue) getSubscriber(ctx context.Context, topicName, subscriberID string) (*Subscriber, error) {
-	query := `
-		SELECT id, topic_name, subscriber_id, created_at, active
-		FROM pgqueue_subscribers
-		WHERE topic_name = $1 AND subscriber_id = $2
-		LIMIT 1
-	`
-
-	var sub Subscriber
-	err := pq.db.QueryRowContext(ctx, query, topicName, subscriberID).Scan(
-		&sub.ID,
-		&sub.TopicName,
-		&sub.SubscriberID,
-		&sub.CreatedAt,
-		&sub.Active,
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return &sub, nil
-}
-
-func (pq *PGQueue) deleteSubscriber(ctx context.Context, topicName, subscriberID string) error {
-	query := `DELETE FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2`
-	_, err := pq.db.ExecContext(ctx, query, topicName, subscriberID)
-	return err
 }
 
 // Replay log query methods
@@ -309,49 +207,7 @@ func (pq *PGQueue) getReplayHistory(ctx context.Context, queueType, queueName st
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	items := []ReplayLog{}
-	for rows.Next() {
-		var log ReplayLog
-		if err := rows.Scan(
-			&log.ID,
-			&log.QueueType,
-			&log.QueueName,
-			&log.ReplayType,
-			&log.ReplayParams,
-			&log.MessageCount,
-			&log.CreatedAt,
-			&log.CreatedBy,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, log)
-	}
-
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return items, nil
-}
-
-func (pq *PGQueue) getReplayHistoryAll(ctx context.Context, limit int) ([]ReplayLog, error) {
-	query := `
-		SELECT id, queue_type, queue_name, replay_type, replay_params, message_count, created_at, created_by
-		FROM pgqueue_replay_log
-		ORDER BY created_at DESC
-		LIMIT $1
-	`
-
-	rows, err := pq.db.QueryContext(ctx, query, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	items := []ReplayLog{}
 	for rows.Next() {

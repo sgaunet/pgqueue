@@ -3,14 +3,15 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// ConsumeFromChannel retrieves the next available message from a channel
-// Returns nil if no messages are available
+// ConsumeFromChannel retrieves the next available message from a channel.
+// Returns nil if no messages are available.
 func (pq *PGQueue) ConsumeFromChannel(ctx context.Context, channelName string, visibilityTimeout time.Duration) (*Message, error) {
 	// Get queue metadata
 	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypeChannel), channelName)
@@ -23,7 +24,7 @@ func (pq *PGQueue) ConsumeFromChannel(ctx context.Context, channelName string, v
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Get next pending message using FOR UPDATE SKIP LOCKED
 	query := fmt.Sprintf(`
@@ -46,8 +47,8 @@ func (pq *PGQueue) ConsumeFromChannel(ctx context.Context, channelName string, v
 	err = tx.QueryRowContext(ctx, query).Scan(
 		&msgID, &payload, &createdAt, &retryCount, &maxRetries, &metadataJSON,
 	)
-	if err == sql.ErrNoRows {
-		tx.Rollback()
+	if errors.Is(err, sql.ErrNoRows) {
+		_ = tx.Rollback()
 		return nil, nil // No messages available
 	}
 	if err != nil {
@@ -88,7 +89,7 @@ func (pq *PGQueue) ConsumeFromChannel(ctx context.Context, channelName string, v
 	return msg, nil
 }
 
-// AckChannel acknowledges a message from a channel (marks as completed)
+// AckChannel acknowledges a message from a channel (marks as completed).
 func (pq *PGQueue) AckChannel(ctx context.Context, channelName string, messageID uuid.UUID) error {
 	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypeChannel), channelName)
 	if err != nil {
@@ -117,7 +118,7 @@ func (pq *PGQueue) AckChannel(ctx context.Context, channelName string, messageID
 	return nil
 }
 
-// NackChannel negatively acknowledges a message from a channel (retry or move to DLQ)
+// NackChannel negatively acknowledges a message from a channel (retry or move to DLQ).
 func (pq *PGQueue) NackChannel(ctx context.Context, channelName string, messageID uuid.UUID, errorMsg string) error {
 	queueMeta, err := pq.getQueueMetadata(ctx, string(QueueTypeChannel), channelName)
 	if err != nil {
@@ -129,7 +130,7 @@ func (pq *PGQueue) NackChannel(ctx context.Context, channelName string, messageI
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Get current message state
 	query := fmt.Sprintf(`
@@ -145,8 +146,8 @@ func (pq *PGQueue) NackChannel(ctx context.Context, channelName string, messageI
 	var metadataJSON sql.NullString
 
 	err = tx.QueryRowContext(ctx, query, messageID).Scan(&retryCount, &maxRetries, &payload, &metadataJSON)
-	if err == sql.ErrNoRows {
-		tx.Rollback()
+	if errors.Is(err, sql.ErrNoRows) {
+		_ = tx.Rollback()
 		return fmt.Errorf("message not found or not in processing state")
 	}
 	if err != nil {

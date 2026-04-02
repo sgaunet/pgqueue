@@ -3,6 +3,7 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -11,7 +12,7 @@ import (
 func (pq *PGQueue) GetStats(ctx context.Context, queueName string, queueType QueueType) (*QueueStats, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
 	if err != nil {
@@ -129,7 +130,7 @@ func (pq *PGQueue) getPubSubStats(ctx context.Context, tableName string, stats *
 func (pq *PGQueue) GetQueueDepth(ctx context.Context, queueName string, queueType QueueType) (int64, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
 	if err != nil {
@@ -158,7 +159,7 @@ func (pq *PGQueue) GetQueueDepth(ctx context.Context, queueName string, queueTyp
 func (pq *PGQueue) GetSubscriberLag(ctx context.Context, topicName string, subscriberID string) (*SubscriberLag, error) {
 	// Get topic metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("topic not found: %s", topicName)
 	}
 	if err != nil {
@@ -206,7 +207,7 @@ func (pq *PGQueue) GetSubscriberLag(ctx context.Context, topicName string, subsc
 func (pq *PGQueue) GetDLQStats(ctx context.Context, queueName string, queueType QueueType) (*DLQStats, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
 	}
 	if err != nil {

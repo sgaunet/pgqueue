@@ -3,6 +3,7 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,7 +15,7 @@ func (pq *PGQueue) Subscribe(ctx context.Context, topicName, subscriberID string
 	// Verify topic exists
 	_, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("topic not found: %s", topicName)
 		}
 		return fmt.Errorf("failed to get topic metadata: %w", err)
@@ -53,7 +54,7 @@ func (pq *PGQueue) ConsumeFromTopic(ctx context.Context, topicName, subscriberID
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Get next pending subscription for this subscriber
 	query := fmt.Sprintf(`
@@ -78,8 +79,8 @@ func (pq *PGQueue) ConsumeFromTopic(ctx context.Context, topicName, subscriberID
 	err = tx.QueryRowContext(ctx, query, subscriberID).Scan(
 		&subID, &msgID, &payload, &createdAt, &retryCount, &metadataJSON,
 	)
-	if err == sql.ErrNoRows {
-		tx.Rollback()
+	if errors.Is(err, sql.ErrNoRows) {
+		_ = tx.Rollback()
 		return nil, nil // No messages available
 	}
 	if err != nil {

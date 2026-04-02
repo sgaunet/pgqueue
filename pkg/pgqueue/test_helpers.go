@@ -12,14 +12,17 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+//nolint:unused // Used by test files
 const (
 	testDBName = "testdb"
 	testUser   = "testuser"
 	testPass   = "testpass"
 )
 
-// setupTestDB creates a PostgreSQL container and returns a PGQueue instance
+//nolint:unused // Used by test files
+// setupTestDB creates a PostgreSQL container and returns a PGQueue instance.
 func setupTestDB(t *testing.T) (*PGQueue, func()) {
+	t.Helper()
 	ctx := context.Background()
 
 	// Start PostgreSQL container
@@ -57,7 +60,7 @@ func setupTestDB(t *testing.T) (*PGQueue, func()) {
 	// Initialize PGQueue
 	pq, err := Init(ctx, Config{
 		DB:                db,
-		MaxMessageSize:    1024,
+		MaxMessageSize:    1024 * 1024, // 1MB
 		DefaultMaxRetries: 3,
 	})
 	if err != nil {
@@ -66,7 +69,7 @@ func setupTestDB(t *testing.T) (*PGQueue, func()) {
 
 	// Cleanup function
 	cleanup := func() {
-		pq.Close()
+		_ = pq.Close()
 		if err := postgresContainer.Terminate(ctx); err != nil {
 			t.Logf("failed to terminate container: %v", err)
 		}

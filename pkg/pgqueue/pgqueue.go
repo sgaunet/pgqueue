@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -161,7 +162,7 @@ func (pq *PGQueue) createQueue(ctx context.Context, queueType QueueType, name st
 	if err == nil && existing != nil {
 		return fmt.Errorf("queue already exists: %s/%s", queueType, name)
 	}
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check existing queue: %w", err)
 	}
 
@@ -179,7 +180,7 @@ func (pq *PGQueue) createQueue(ctx context.Context, queueType QueueType, name st
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Create metadata entry
 	_, err = pq.createQueueMetadata(ctx, tx, string(queueType), name, tableName, configJSON)
