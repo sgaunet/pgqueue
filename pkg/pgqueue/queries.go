@@ -3,8 +3,23 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 )
+
+// parseMetadataJSON parses a nullable JSON string into a metadata map.
+func parseMetadataJSON(s sql.NullString) map[string]any {
+	if !s.Valid || s.String == "" {
+		return nil
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal([]byte(s.String), &m); err != nil {
+		return nil
+	}
+
+	return m
+}
 
 // Metadata query methods
 

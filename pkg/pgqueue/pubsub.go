@@ -231,6 +231,7 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 		CreatedAt:  createdAt,
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
+		Metadata:   parseMetadataJSON(metadataJSON),
 	}
 
 	return msg, &visTimeout, nil

@@ -195,6 +195,7 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 		CreatedAt:  createdAt,
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
+		Metadata:   parseMetadataJSON(metadataJSON),
 	}
 
 	if maxRetries.Valid {
