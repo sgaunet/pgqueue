@@ -1,3 +1,4 @@
+// Package main demonstrates pgqueue pub/sub (fan-out) messaging pattern.
 package main
 
 import (
@@ -9,36 +10,55 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	// _ "github.com/lib/pq" // Alternative: use lib/pq driver
+	// _ "github.com/lib/pq" // Alternative: use lib/pq driver.
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
 
+const (
+	maxMessageSize     = 1024 * 1024 // 1MB.
+	defaultMaxRetries  = 3
+	publishDelay       = 500 * time.Millisecond
+	processingWait     = 8 * time.Second
+	consumerTimeout    = 10 * time.Second
+	visibilityTimeout  = 30 * time.Second
+	noMessageDelay     = 500 * time.Millisecond
+	baseProcessingTime = 100
+	pollInterval       = 1 * time.Second
+	consumerStartDelay = 1 * time.Second
+)
+
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	ctx := context.Background()
 
 	// Open database connection with pgx driver
-	db, err := sql.Open("pgx", "postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable")
-	// Alternative with lib/pq driver:
-	// db, err := sql.Open("postgres", "postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable")
+	db, err := sql.Open(
+		"pgx",
+		"postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable",
+	)
 	if err != nil {
-		log.Fatalf("failed to connect to database: %v", err)
+		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
 	// Initialize base schema (one-time setup, idempotent)
-	// This creates the pgqueue_metadata, pgqueue_subscribers, and pgqueue_replay_log tables
 	if err := pgqueue.InitSchema(ctx, db); err != nil {
-		log.Fatalf("failed to initialize schema: %v", err)
+		return fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
 	// Initialize pgqueue
 	pq, err := pgqueue.Init(ctx, pgqueue.Config{
 		DB:                db,
-		MaxMessageSize:    1024 * 1024, // 1MB
-		DefaultMaxRetries: 3,
+		MaxMessageSize:    maxMessageSize,
+		DefaultMaxRetries: defaultMaxRetries,
 	})
 	if err != nil {
-		log.Fatalf("failed to initialize pgqueue: %v", err)
+		return fmt.Errorf("failed to initialize pgqueue: %w", err)
 	}
 
 	// Create a topic for user events
@@ -48,23 +68,13 @@ func main() {
 		log.Printf("topic might already exist: %v", err)
 	}
 
-	// Define subscribers (different services that need to process user events)
 	subscribers := []string{
-		"email-service",      // Sends welcome emails
-		"analytics-service",  // Tracks user behavior
-		"notification-service", // Sends push notifications
+		"email-service",
+		"analytics-service",
+		"notification-service",
 	}
 
-	// Register all subscribers
-	fmt.Println("Registering subscribers...")
-	for _, subscriberID := range subscribers {
-		err = pq.Subscribe(ctx, topicName, subscriberID)
-		if err != nil {
-			log.Printf("failed to subscribe %s: %v", subscriberID, err)
-		} else {
-			fmt.Printf("Registered: %s\n", subscriberID)
-		}
-	}
+	registerSubscribers(ctx, pq, topicName, subscribers)
 
 	// Start goroutines for each subscriber
 	var wg sync.WaitGroup
@@ -74,9 +84,46 @@ func main() {
 	}
 
 	// Give consumers time to start
-	time.Sleep(1 * time.Second)
+	time.Sleep(consumerStartDelay)
 
-	// Publish some user events
+	publishEvents(ctx, pq, topicName)
+
+	// Wait for processing to complete
+	fmt.Println("\nWaiting for events to be processed by all subscribers...")
+	time.Sleep(processingWait)
+
+	printSubscriberStats(ctx, pq, topicName, subscribers)
+
+	fmt.Println("\nExample completed successfully!")
+	fmt.Println(
+		"Note: Each subscriber processes the same events independently (fan-out pattern)",
+	)
+
+	return nil
+}
+
+func registerSubscribers(
+	ctx context.Context,
+	pq *pgqueue.PGQueue,
+	topicName string,
+	subscribers []string,
+) {
+	fmt.Println("Registering subscribers...")
+	for _, subscriberID := range subscribers {
+		err := pq.Subscribe(ctx, topicName, subscriberID)
+		if err != nil {
+			log.Printf("failed to subscribe %s: %v", subscriberID, err)
+		} else {
+			fmt.Printf("Registered: %s\n", subscriberID)
+		}
+	}
+}
+
+func publishEvents(
+	ctx context.Context,
+	pq *pgqueue.PGQueue,
+	topicName string,
+) {
 	events := []string{
 		"user.registered: user_id=1001, email=alice@example.com",
 		"user.registered: user_id=1002, email=bob@example.com",
@@ -93,14 +140,16 @@ func main() {
 			continue
 		}
 		fmt.Printf("Published: %s (ID: %s)\n", event, msgID)
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(publishDelay)
 	}
+}
 
-	// Wait for processing to complete
-	fmt.Println("\nWaiting for events to be processed by all subscribers...")
-	time.Sleep(8 * time.Second)
-
-	// Get statistics for each subscriber
+func printSubscriberStats(
+	ctx context.Context,
+	pq *pgqueue.PGQueue,
+	topicName string,
+	subscribers []string,
+) {
 	fmt.Println("\nSubscriber Statistics:")
 	for _, subscriberID := range subscribers {
 		lag, err := pq.GetSubscriberLag(ctx, topicName, subscriberID)
@@ -116,18 +165,20 @@ func main() {
 			fmt.Printf("    Oldest Pending Age: %v\n", *lag.OldestPendingAge)
 		}
 	}
-
-	fmt.Println("\nExample completed successfully!")
-	fmt.Println("Note: Each subscriber processes the same events independently (fan-out pattern)")
 }
 
-func consumeEvents(ctx context.Context, pq *pgqueue.PGQueue, topicName, subscriberID string, wg *sync.WaitGroup) {
+func consumeEvents(
+	ctx context.Context,
+	pq *pgqueue.PGQueue,
+	topicName, subscriberID string,
+	wg *sync.WaitGroup,
+) {
 	defer wg.Done()
-	
+
 	fmt.Printf("[%s] Starting...\n", subscriberID)
-	
+
 	// Process for a limited time (for example purposes)
-	timeout := time.After(10 * time.Second)
+	timeout := time.After(consumerTimeout)
 
 	for {
 		select {
@@ -136,22 +187,28 @@ func consumeEvents(ctx context.Context, pq *pgqueue.PGQueue, topicName, subscrib
 			return
 		default:
 			// Consume next event for this subscriber
-			msg, err := pq.ConsumeFromTopic(ctx, topicName, subscriberID, 30*time.Second)
+			msg, err := pq.ConsumeFromTopic(
+				ctx, topicName, subscriberID, visibilityTimeout,
+			)
 			if err != nil {
 				log.Printf("[%s] error consuming: %v", subscriberID, err)
-				time.Sleep(1 * time.Second)
+				time.Sleep(pollInterval)
 				continue
 			}
 
 			// No messages available
 			if msg == nil {
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(noMessageDelay)
 				continue
 			}
 
 			// Process the event (each subscriber handles it differently)
-			processTime := time.Duration(100+subscriberID[0]%3*100) * time.Millisecond
-			fmt.Printf("[%s] Processing: %s\n", subscriberID, string(msg.Payload))
+			processTime := time.Duration(
+				baseProcessingTime+subscriberID[0]%3*baseProcessingTime,
+			) * time.Millisecond
+			fmt.Printf(
+				"[%s] Processing: %s\n", subscriberID, string(msg.Payload),
+			)
 			time.Sleep(processTime) // Simulate varying processing times
 
 			// Acknowledge successful processing
@@ -161,7 +218,9 @@ func consumeEvents(ctx context.Context, pq *pgqueue.PGQueue, topicName, subscrib
 				continue
 			}
 
-			fmt.Printf("[%s] Completed: %s\n", subscriberID, string(msg.Payload))
+			fmt.Printf(
+				"[%s] Completed: %s\n", subscriberID, string(msg.Payload),
+			)
 		}
 	}
 }

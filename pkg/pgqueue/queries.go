@@ -3,11 +3,15 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"fmt"
 )
 
 // Metadata query methods
 
-func (pq *PGQueue) getQueueMetadata(ctx context.Context, queueType, queueName string) (*QueueMetadata, error) {
+func (pq *PGQueue) getQueueMetadata(
+	ctx context.Context,
+	queueType, queueName string,
+) (*QueueMetadata, error) {
 	query := `
 		SELECT id, queue_type, queue_name, table_name, config, created_at, updated_at
 		FROM pgqueue_metadata
@@ -27,13 +31,18 @@ func (pq *PGQueue) getQueueMetadata(ctx context.Context, queueType, queueName st
 	)
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to scan queue metadata: %w", err)
 	}
 
 	return &meta, nil
 }
 
-func (pq *PGQueue) createQueueMetadata(ctx context.Context, tx *sql.Tx, queueType, queueName, tableName string, config []byte) (*QueueMetadata, error) {
+func (pq *PGQueue) createQueueMetadata(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueType, queueName, tableName string,
+	config []byte,
+) (*QueueMetadata, error) {
 	query := `
 		INSERT INTO pgqueue_metadata (queue_type, queue_name, table_name, config)
 		VALUES ($1, $2, $3, $4)
@@ -52,13 +61,16 @@ func (pq *PGQueue) createQueueMetadata(ctx context.Context, tx *sql.Tx, queueTyp
 	)
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to insert queue metadata: %w", err)
 	}
 
 	return &meta, nil
 }
 
-func (pq *PGQueue) listQueuesRaw(ctx context.Context, queueType string) ([]QueueMetadata, error) {
+func (pq *PGQueue) listQueuesRaw(
+	ctx context.Context,
+	queueType string,
+) ([]QueueMetadata, error) {
 	query := `
 		SELECT id, queue_type, queue_name, table_name, config, created_at, updated_at
 		FROM pgqueue_metadata
@@ -68,7 +80,7 @@ func (pq *PGQueue) listQueuesRaw(ctx context.Context, queueType string) ([]Queue
 
 	rows, err := pq.db.QueryContext(ctx, query, queueType)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query queues: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -84,16 +96,13 @@ func (pq *PGQueue) listQueuesRaw(ctx context.Context, queueType string) ([]Queue
 			&meta.CreatedAt,
 			&meta.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to scan queue row: %w", err)
 		}
 		items = append(items, meta)
 	}
 
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to iterate queue rows: %w", err)
 	}
 
 	return items, nil
@@ -101,7 +110,10 @@ func (pq *PGQueue) listQueuesRaw(ctx context.Context, queueType string) ([]Queue
 
 // Subscriber query methods
 
-func (pq *PGQueue) registerSubscriber(ctx context.Context, topicName, subscriberID string) (*Subscriber, error) {
+func (pq *PGQueue) registerSubscriber(
+	ctx context.Context,
+	topicName, subscriberID string,
+) (*Subscriber, error) {
 	query := `
 		INSERT INTO pgqueue_subscribers (topic_name, subscriber_id)
 		VALUES ($1, $2)
@@ -120,23 +132,34 @@ func (pq *PGQueue) registerSubscriber(ctx context.Context, topicName, subscriber
 	)
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to scan subscriber: %w", err)
 	}
 
 	return &sub, nil
 }
 
-func (pq *PGQueue) unregisterSubscriber(ctx context.Context, topicName, subscriberID string) error {
+func (pq *PGQueue) unregisterSubscriber(
+	ctx context.Context,
+	topicName, subscriberID string,
+) error {
 	query := `
 		UPDATE pgqueue_subscribers
 		SET active = FALSE
 		WHERE topic_name = $1 AND subscriber_id = $2
 	`
 	_, err := pq.db.ExecContext(ctx, query, topicName, subscriberID)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to unregister subscriber: %w", err)
+	}
+
+	return nil
 }
 
-func (pq *PGQueue) getActiveSubscribers(ctx context.Context, tx *sql.Tx, topicName string) ([]Subscriber, error) {
+func (pq *PGQueue) getActiveSubscribers(
+	ctx context.Context,
+	tx *sql.Tx,
+	topicName string,
+) ([]Subscriber, error) {
 	query := `
 		SELECT id, topic_name, subscriber_id, created_at, active
 		FROM pgqueue_subscribers
@@ -153,7 +176,7 @@ func (pq *PGQueue) getActiveSubscribers(ctx context.Context, tx *sql.Tx, topicNa
 	}
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query subscribers: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -167,16 +190,13 @@ func (pq *PGQueue) getActiveSubscribers(ctx context.Context, tx *sql.Tx, topicNa
 			&sub.CreatedAt,
 			&sub.Active,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to scan subscriber row: %w", err)
 		}
 		items = append(items, sub)
 	}
 
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to iterate subscriber rows: %w", err)
 	}
 
 	return items, nil
@@ -184,19 +204,41 @@ func (pq *PGQueue) getActiveSubscribers(ctx context.Context, tx *sql.Tx, topicNa
 
 // Replay log query methods
 
-func (pq *PGQueue) createReplayLog(ctx context.Context, queueType, queueName, replayType string, replayParams []byte, messageCount int, createdBy *string) error {
+func (pq *PGQueue) createReplayLog(
+	ctx context.Context,
+	queueType, queueName, replayType string,
+	replayParams []byte,
+	messageCount int,
+	createdBy *string,
+) error {
 	query := `
-		INSERT INTO pgqueue_replay_log (queue_type, queue_name, replay_type, replay_params, message_count, created_by)
+		INSERT INTO pgqueue_replay_log (
+			queue_type, queue_name, replay_type,
+			replay_params, message_count, created_by
+		)
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`
 
-	_, err := pq.db.ExecContext(ctx, query, queueType, queueName, replayType, replayParams, messageCount, createdBy)
-	return err
+	_, err := pq.db.ExecContext(
+		ctx, query,
+		queueType, queueName, replayType,
+		replayParams, messageCount, createdBy,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create replay log: %w", err)
+	}
+
+	return nil
 }
 
-func (pq *PGQueue) getReplayHistory(ctx context.Context, queueType, queueName string, limit int) ([]ReplayLog, error) {
+func (pq *PGQueue) getReplayHistory(
+	ctx context.Context,
+	queueType, queueName string,
+	limit int,
+) ([]ReplayLog, error) {
 	query := `
-		SELECT id, queue_type, queue_name, replay_type, replay_params, message_count, created_at, created_by
+		SELECT id, queue_type, queue_name, replay_type,
+		       replay_params, message_count, created_at, created_by
 		FROM pgqueue_replay_log
 		WHERE queue_type = $1 AND queue_name = $2
 		ORDER BY created_at DESC
@@ -205,33 +247,30 @@ func (pq *PGQueue) getReplayHistory(ctx context.Context, queueType, queueName st
 
 	rows, err := pq.db.QueryContext(ctx, query, queueType, queueName, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query replay history: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	items := []ReplayLog{}
 	for rows.Next() {
-		var log ReplayLog
+		var rl ReplayLog
 		if err := rows.Scan(
-			&log.ID,
-			&log.QueueType,
-			&log.QueueName,
-			&log.ReplayType,
-			&log.ReplayParams,
-			&log.MessageCount,
-			&log.CreatedAt,
-			&log.CreatedBy,
+			&rl.ID,
+			&rl.QueueType,
+			&rl.QueueName,
+			&rl.ReplayType,
+			&rl.ReplayParams,
+			&rl.MessageCount,
+			&rl.CreatedAt,
+			&rl.CreatedBy,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to scan replay log row: %w", err)
 		}
-		items = append(items, log)
+		items = append(items, rl)
 	}
 
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to iterate replay log rows: %w", err)
 	}
 
 	return items, nil

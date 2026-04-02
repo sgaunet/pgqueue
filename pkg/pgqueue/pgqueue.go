@@ -1,3 +1,6 @@
+// Package pgqueue provides a PostgreSQL-based message queue library with
+// exactly-once delivery guarantees, supporting both point-to-point channels
+// and fan-out pub/sub topics.
 package pgqueue
 
 import (
@@ -56,16 +59,14 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_queue ON pgqueue_replay_log(qu
 CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_log(created_at);
 `
 
-// PGQueue is the main struct for the message queue system
+// PGQueue is the main struct for the message queue system.
 type PGQueue struct {
 	db     *sql.DB
 	config Config
 }
 
-var (
-	// queueNameRegex validates queue names (alphanumeric, underscore, dash)
-	queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-)
+// queueNameRegex validates queue names (alphanumeric, underscore, dash).
+var queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // InitSchema initializes the base schema tables required by pgqueue.
 // This function must be called once before creating any queues or topics.
@@ -102,7 +103,7 @@ var (
 //	}
 func InitSchema(ctx context.Context, db *sql.DB) error {
 	if db == nil {
-		return fmt.Errorf("database connection cannot be nil")
+		return ErrDBNil
 	}
 
 	_, err := db.ExecContext(ctx, baseSchemaSQL)
@@ -113,10 +114,10 @@ func InitSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// Init initializes the PGQueue system with the provided configuration
+// Init initializes the PGQueue system with the provided configuration.
 func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 	if cfg.DB == nil {
-		return nil, fmt.Errorf("database connection is required")
+		return nil, ErrDBRequired
 	}
 
 	// Set defaults
@@ -140,30 +141,60 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 	return pq, nil
 }
 
-// CreateTopic creates a new pub/sub topic with the specified options
-func (pq *PGQueue) CreateTopic(ctx context.Context, name string, opts TopicOptions) error {
+// CreateTopic creates a new pub/sub topic with the specified options.
+func (pq *PGQueue) CreateTopic(
+	ctx context.Context,
+	name string,
+	opts TopicOptions,
+) error {
 	return pq.createQueue(ctx, QueueTypePubSub, name, opts)
 }
 
-// CreateChannel creates a new point-to-point channel with the specified options
-func (pq *PGQueue) CreateChannel(ctx context.Context, name string, opts ChannelOptions) error {
+// CreateChannel creates a new point-to-point channel with the specified options.
+func (pq *PGQueue) CreateChannel(
+	ctx context.Context,
+	name string,
+	opts ChannelOptions,
+) error {
 	return pq.createQueue(ctx, QueueTypeChannel, name, opts)
 }
 
-// createQueue is the internal implementation for creating queues
-func (pq *PGQueue) createQueue(ctx context.Context, queueType QueueType, name string, opts interface{}) error {
-	// Validate queue name
-	if !queueNameRegex.MatchString(name) {
-		return fmt.Errorf("invalid queue name: must contain only alphanumeric characters, underscores, and dashes")
+// ListTopics returns all pub/sub topics.
+func (pq *PGQueue) ListTopics(
+	ctx context.Context,
+) ([]QueueMetadata, error) {
+	return pq.listQueues(ctx, QueueTypePubSub)
+}
+
+// ListChannels returns all point-to-point channels.
+func (pq *PGQueue) ListChannels(
+	ctx context.Context,
+) ([]QueueMetadata, error) {
+	return pq.listQueues(ctx, QueueTypeChannel)
+}
+
+// Close closes the database connection.
+func (pq *PGQueue) Close() error {
+	if err := pq.db.Close(); err != nil {
+		return fmt.Errorf("failed to close database: %w", err)
 	}
 
-	// Check if queue already exists
-	existing, err := pq.getQueueMetadata(ctx, string(queueType), name)
-	if err == nil && existing != nil {
-		return fmt.Errorf("queue already exists: %s/%s", queueType, name)
+	return nil
+}
+
+// createQueue is the internal implementation for creating queues.
+func (pq *PGQueue) createQueue(
+	ctx context.Context,
+	queueType QueueType,
+	name string,
+	opts any,
+) error {
+	if err := pq.validateQueueName(name); err != nil {
+		return err
 	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("failed to check existing queue: %w", err)
+
+	if err := pq.checkQueueNotExists(ctx, queueType, name); err != nil {
+		return err
 	}
 
 	// Sanitize table name
@@ -183,7 +214,9 @@ func (pq *PGQueue) createQueue(ctx context.Context, queueType QueueType, name st
 	defer func() { _ = tx.Rollback() }()
 
 	// Create metadata entry
-	_, err = pq.createQueueMetadata(ctx, tx, string(queueType), name, tableName, configJSON)
+	_, err = pq.createQueueMetadata(
+		ctx, tx, string(queueType), name, tableName, configJSON,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create queue metadata: %w", err)
 	}
@@ -207,8 +240,36 @@ func (pq *PGQueue) createQueue(ctx context.Context, queueType QueueType, name st
 	return nil
 }
 
-// createPubSubTables creates message and subscription tables for a pub/sub topic
-func (pq *PGQueue) createPubSubTables(ctx context.Context, tx *sql.Tx, tableName string) error {
+func (pq *PGQueue) validateQueueName(name string) error {
+	if !queueNameRegex.MatchString(name) {
+		return ErrInvalidQueueName
+	}
+
+	return nil
+}
+
+func (pq *PGQueue) checkQueueNotExists(
+	ctx context.Context,
+	queueType QueueType,
+	name string,
+) error {
+	existing, err := pq.getQueueMetadata(ctx, string(queueType), name)
+	if err == nil && existing != nil {
+		return fmt.Errorf("%s/%s: %w", queueType, name, ErrQueueAlreadyExists)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check existing queue: %w", err)
+	}
+
+	return nil
+}
+
+// createPubSubTables creates message and subscription tables for a pub/sub topic.
+func (pq *PGQueue) createPubSubTables(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+) error {
 	// Create message table
 	messageTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS pgqueue_msg_%s (
@@ -232,6 +293,7 @@ func (pq *PGQueue) createPubSubTables(ctx context.Context, tx *sql.Tx, tableName
 	}
 
 	// Create subscription table
+	//nolint:gosec // G201: table name validated by queueNameRegex
 	subscriptionTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS pgqueue_sub_%s (
 			id UUID PRIMARY KEY DEFAULT uuidv7(),
@@ -243,18 +305,43 @@ func (pq *PGQueue) createPubSubTables(ctx context.Context, tx *sql.Tx, tableName
 			visibility_timeout TIMESTAMPTZ,
 			retry_count INT NOT NULL DEFAULT 0,
 			error_message TEXT,
-			FOREIGN KEY (message_id) REFERENCES pgqueue_msg_%s(id) ON DELETE CASCADE
+			FOREIGN KEY (message_id)
+				REFERENCES pgqueue_msg_%s(id) ON DELETE CASCADE
 		)`, tableName, tableName)
 
 	if _, err := tx.ExecContext(ctx, subscriptionTable); err != nil {
 		return fmt.Errorf("failed to create subscription table: %w", err)
 	}
 
-	// Create subscription indexes
+	if err := pq.createPubSubIndexes(ctx, tx, tableName); err != nil {
+		return err
+	}
+
+	// Create DLQ table for pub/sub
+	return pq.createDLQTable(ctx, tx, tableName)
+}
+
+func (pq *PGQueue) createPubSubIndexes(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+) error {
 	subIndexes := []string{
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_msg_id ON pgqueue_sub_%s(message_id)`, tableName, tableName),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_subscriber ON pgqueue_sub_%s(subscriber_id, status)`, tableName, tableName),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_status ON pgqueue_sub_%s(status) WHERE status = 'pending'`, tableName, tableName),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_msg_id
+			 ON pgqueue_sub_%s(message_id)`,
+			tableName, tableName,
+		),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_subscriber
+			 ON pgqueue_sub_%s(subscriber_id, status)`,
+			tableName, tableName,
+		),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_status
+			 ON pgqueue_sub_%s(status) WHERE status = 'pending'`,
+			tableName, tableName,
+		),
 	}
 
 	for _, idx := range subIndexes {
@@ -263,12 +350,15 @@ func (pq *PGQueue) createPubSubTables(ctx context.Context, tx *sql.Tx, tableName
 		}
 	}
 
-	// Create DLQ table for pub/sub
-	return pq.createDLQTable(ctx, tx, tableName)
+	return nil
 }
 
-// createChannelTables creates message table for a point-to-point channel
-func (pq *PGQueue) createChannelTables(ctx context.Context, tx *sql.Tx, tableName string) error {
+// createChannelTables creates message table for a point-to-point channel.
+func (pq *PGQueue) createChannelTables(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+) error {
 	// Create message table
 	messageTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS pgqueue_msg_%s (
@@ -289,14 +379,38 @@ func (pq *PGQueue) createChannelTables(ctx context.Context, tx *sql.Tx, tableNam
 		return fmt.Errorf("failed to create message table: %w", err)
 	}
 
-	// Create indexes for efficient querying
+	if err := pq.createChannelIndexes(ctx, tx, tableName); err != nil {
+		return err
+	}
+
+	// Create DLQ table
+	return pq.createDLQTable(ctx, tx, tableName)
+}
+
+func (pq *PGQueue) createChannelIndexes(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+) error {
 	indexes := []string{
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_status_created
-			ON pgqueue_msg_%s(status, created_at) WHERE status = 'pending'`, tableName, tableName),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_visibility
-			ON pgqueue_msg_%s(visibility_timeout) WHERE visibility_timeout IS NOT NULL`, tableName, tableName),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_ack_deadline
-			ON pgqueue_msg_%s(ack_deadline) WHERE ack_deadline IS NOT NULL`, tableName, tableName),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_status_created
+			 ON pgqueue_msg_%s(status, created_at)
+			 WHERE status = 'pending'`,
+			tableName, tableName,
+		),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_visibility
+			 ON pgqueue_msg_%s(visibility_timeout)
+			 WHERE visibility_timeout IS NOT NULL`,
+			tableName, tableName,
+		),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_ack_deadline
+			 ON pgqueue_msg_%s(ack_deadline)
+			 WHERE ack_deadline IS NOT NULL`,
+			tableName, tableName,
+		),
 	}
 
 	for _, idx := range indexes {
@@ -305,12 +419,15 @@ func (pq *PGQueue) createChannelTables(ctx context.Context, tx *sql.Tx, tableNam
 		}
 	}
 
-	// Create DLQ table
-	return pq.createDLQTable(ctx, tx, tableName)
+	return nil
 }
 
-// createDLQTable creates a dead letter queue table
-func (pq *PGQueue) createDLQTable(ctx context.Context, tx *sql.Tx, tableName string) error {
+// createDLQTable creates a dead letter queue table.
+func (pq *PGQueue) createDLQTable(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+) error {
 	dlqTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS pgqueue_dlq_%s (
 			id UUID PRIMARY KEY DEFAULT uuidv7(),
@@ -338,18 +455,11 @@ func (pq *PGQueue) createDLQTable(ctx context.Context, tx *sql.Tx, tableName str
 	return nil
 }
 
-// ListTopics returns all pub/sub topics
-func (pq *PGQueue) ListTopics(ctx context.Context) ([]QueueMetadata, error) {
-	return pq.listQueues(ctx, QueueTypePubSub)
-}
-
-// ListChannels returns all point-to-point channels
-func (pq *PGQueue) ListChannels(ctx context.Context) ([]QueueMetadata, error) {
-	return pq.listQueues(ctx, QueueTypeChannel)
-}
-
-// listQueues is the internal implementation for listing queues
-func (pq *PGQueue) listQueues(ctx context.Context, queueType QueueType) ([]QueueMetadata, error) {
+// listQueues is the internal implementation for listing queues.
+func (pq *PGQueue) listQueues(
+	ctx context.Context,
+	queueType QueueType,
+) ([]QueueMetadata, error) {
 	rows, err := pq.listQueuesRaw(ctx, string(queueType))
 	if err != nil {
 		return nil, fmt.Errorf("failed to list queues: %w", err)
@@ -357,7 +467,7 @@ func (pq *PGQueue) listQueues(ctx context.Context, queueType QueueType) ([]Queue
 
 	result := make([]QueueMetadata, 0, len(rows))
 	for _, row := range rows {
-		var config map[string]interface{}
+		var config map[string]any
 		if err := json.Unmarshal(row.Config, &config); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 		}
@@ -376,12 +486,7 @@ func (pq *PGQueue) listQueues(ctx context.Context, queueType QueueType) ([]Queue
 	return result, nil
 }
 
-// Close closes the database connection
-func (pq *PGQueue) Close() error {
-	return pq.db.Close()
-}
-
-// sanitizeTableName converts a queue name to a safe table name
+// sanitizeTableName converts a queue name to a safe table name.
 func sanitizeTableName(name string) string {
 	// Replace dashes with underscores and convert to lowercase
 	return strings.ToLower(strings.ReplaceAll(name, "-", "_"))

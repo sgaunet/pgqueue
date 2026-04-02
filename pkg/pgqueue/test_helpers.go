@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib" // pgx database driver registration for database/sql
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -14,9 +14,13 @@ import (
 
 //nolint:unused // Used by test files
 const (
-	testDBName = "testdb"
-	testUser   = "testuser"
-	testPass   = "testpass"
+	testDBName            = "testdb"
+	testUser              = "testuser"
+	testPass              = "testpass"
+	testWaitLogOccurrence = 2
+	testStartupTimeout    = 5 * time.Second
+	testMaxMessageSize    = 1024 * 1024 // 1MB
+	testDefaultMaxRetries = 3
 )
 
 //nolint:unused // Used by test files
@@ -33,8 +37,8 @@ func setupTestDB(t *testing.T) (*PGQueue, func()) {
 		postgres.WithPassword(testPass),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(5*time.Second)),
+				WithOccurrence(testWaitLogOccurrence).
+				WithStartupTimeout(testStartupTimeout)),
 	)
 	if err != nil {
 		t.Fatalf("failed to start postgres container: %v", err)
@@ -60,8 +64,8 @@ func setupTestDB(t *testing.T) (*PGQueue, func()) {
 	// Initialize PGQueue
 	pq, err := Init(ctx, Config{
 		DB:                db,
-		MaxMessageSize:    1024 * 1024, // 1MB
-		DefaultMaxRetries: 3,
+		MaxMessageSize:    testMaxMessageSize,
+		DefaultMaxRetries: testDefaultMaxRetries,
 	})
 	if err != nil {
 		t.Fatalf("failed to init pgqueue: %v", err)

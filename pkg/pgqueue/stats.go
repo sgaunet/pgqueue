@@ -8,12 +8,18 @@ import (
 	"time"
 )
 
-// GetStats returns statistics for a queue
-func (pq *PGQueue) GetStats(ctx context.Context, queueName string, queueType QueueType) (*QueueStats, error) {
+// GetStats returns statistics for a queue.
+func (pq *PGQueue) GetStats(
+	ctx context.Context,
+	queueName string,
+	queueType QueueType,
+) (*QueueStats, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
+		return nil, fmt.Errorf(
+			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
+		)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue metadata: %w", err)
@@ -36,7 +42,7 @@ func (pq *PGQueue) GetStats(ctx context.Context, queueName string, queueType Que
 	}
 
 	// Get DLQ count
-	dlqQuery := fmt.Sprintf("SELECT COUNT(*) FROM pgqueue_dlq_%s", tableName)
+	dlqQuery := "SELECT COUNT(*) FROM pgqueue_dlq_" + tableName
 	if err := pq.db.QueryRowContext(ctx, dlqQuery).Scan(&stats.DLQCount); err != nil {
 		return nil, fmt.Errorf("failed to get DLQ count: %w", err)
 	}
@@ -44,94 +50,18 @@ func (pq *PGQueue) GetStats(ctx context.Context, queueName string, queueType Que
 	return stats, nil
 }
 
-// getChannelStats gets statistics for a channel queue
-func (pq *PGQueue) getChannelStats(ctx context.Context, tableName string, stats *QueueStats) error {
-	query := fmt.Sprintf(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
-			COUNT(*) FILTER (WHERE status = 'completed') AS completed,
-			COUNT(*) FILTER (WHERE status = 'failed') AS failed,
-			AVG(EXTRACT(EPOCH FROM (processed_at - created_at))) FILTER (WHERE processed_at IS NOT NULL) AS avg_processing_time,
-			MIN(created_at) FILTER (WHERE status = 'pending') AS oldest_pending
-		FROM pgqueue_msg_%s
-	`, tableName)
-
-	var avgSeconds sql.NullFloat64
-	var oldestPending sql.NullTime
-
-	err := pq.db.QueryRowContext(ctx, query).Scan(
-		&stats.PendingCount,
-		&stats.ProcessingCount,
-		&stats.CompletedCount,
-		&stats.FailedCount,
-		&avgSeconds,
-		&oldestPending,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to get channel stats: %w", err)
-	}
-
-	if avgSeconds.Valid {
-		duration := time.Duration(avgSeconds.Float64 * float64(time.Second))
-		stats.AvgProcessingTime = &duration
-	}
-
-	if oldestPending.Valid {
-		age := time.Since(oldestPending.Time)
-		stats.OldestPendingAge = &age
-	}
-
-	return nil
-}
-
-// getPubSubStats gets statistics for a pub/sub topic
-func (pq *PGQueue) getPubSubStats(ctx context.Context, tableName string, stats *QueueStats) error {
-	query := fmt.Sprintf(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
-			COUNT(*) FILTER (WHERE status = 'acked') AS completed,
-			COUNT(*) FILTER (WHERE status = 'nacked') AS failed,
-			AVG(EXTRACT(EPOCH FROM (acked_at - created_at))) FILTER (WHERE acked_at IS NOT NULL) AS avg_processing_time,
-			MIN(created_at) FILTER (WHERE status = 'pending') AS oldest_pending
-		FROM pgqueue_sub_%s
-	`, tableName)
-
-	var avgSeconds sql.NullFloat64
-	var oldestPending sql.NullTime
-
-	err := pq.db.QueryRowContext(ctx, query).Scan(
-		&stats.PendingCount,
-		&stats.ProcessingCount,
-		&stats.CompletedCount,
-		&stats.FailedCount,
-		&avgSeconds,
-		&oldestPending,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to get pub/sub stats: %w", err)
-	}
-
-	if avgSeconds.Valid {
-		duration := time.Duration(avgSeconds.Float64 * float64(time.Second))
-		stats.AvgProcessingTime = &duration
-	}
-
-	if oldestPending.Valid {
-		age := time.Since(oldestPending.Time)
-		stats.OldestPendingAge = &age
-	}
-
-	return nil
-}
-
-// GetQueueDepth returns the number of pending messages in a queue
-func (pq *PGQueue) GetQueueDepth(ctx context.Context, queueName string, queueType QueueType) (int64, error) {
+// GetQueueDepth returns the number of pending messages in a queue.
+func (pq *PGQueue) GetQueueDepth(
+	ctx context.Context,
+	queueName string,
+	queueType QueueType,
+) (int64, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
+		return 0, fmt.Errorf(
+			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
+		)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to get queue metadata: %w", err)
@@ -141,12 +71,20 @@ func (pq *PGQueue) GetQueueDepth(ctx context.Context, queueName string, queueTyp
 	var count int64
 
 	if queueType == QueueTypeChannel {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM pgqueue_msg_%s WHERE status = 'pending'", tableName)
+		//nolint:gosec // G201: table name validated by queueNameRegex
+		query := fmt.Sprintf(
+			"SELECT COUNT(*) FROM pgqueue_msg_%s WHERE status = 'pending'",
+			tableName,
+		)
 		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			return 0, fmt.Errorf("failed to get queue depth: %w", err)
 		}
 	} else {
-		query := fmt.Sprintf("SELECT COUNT(*) FROM pgqueue_sub_%s WHERE status = 'pending'", tableName)
+		//nolint:gosec // G201: table name validated by queueNameRegex
+		query := fmt.Sprintf(
+			"SELECT COUNT(*) FROM pgqueue_sub_%s WHERE status = 'pending'",
+			tableName,
+		)
 		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			return 0, fmt.Errorf("failed to get queue depth: %w", err)
 		}
@@ -155,12 +93,18 @@ func (pq *PGQueue) GetQueueDepth(ctx context.Context, queueName string, queueTyp
 	return count, nil
 }
 
-// GetSubscriberLag returns lag statistics for a specific subscriber on a topic
-func (pq *PGQueue) GetSubscriberLag(ctx context.Context, topicName string, subscriberID string) (*SubscriberLag, error) {
+// GetSubscriberLag returns lag statistics for a specific subscriber on a topic.
+func (pq *PGQueue) GetSubscriberLag(
+	ctx context.Context,
+	topicName string,
+	subscriberID string,
+) (*SubscriberLag, error) {
 	// Get topic metadata
-	metadata, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
+	metadata, err := pq.getQueueMetadata(
+		ctx, string(QueueTypePubSub), topicName,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("topic not found: %s", topicName)
+		return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
@@ -168,6 +112,7 @@ func (pq *PGQueue) GetSubscriberLag(ctx context.Context, topicName string, subsc
 
 	tableName := metadata.TableName
 
+	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
@@ -203,12 +148,18 @@ func (pq *PGQueue) GetSubscriberLag(ctx context.Context, topicName string, subsc
 	return lag, nil
 }
 
-// GetDLQStats returns statistics about messages in the dead letter queue
-func (pq *PGQueue) GetDLQStats(ctx context.Context, queueName string, queueType QueueType) (*DLQStats, error) {
+// GetDLQStats returns statistics about messages in the dead letter queue.
+func (pq *PGQueue) GetDLQStats(
+	ctx context.Context,
+	queueName string,
+	queueType QueueType,
+) (*DLQStats, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("queue not found: %s/%s", queueType, queueName)
+		return nil, fmt.Errorf(
+			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
+		)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get queue metadata: %w", err)
@@ -216,6 +167,7 @@ func (pq *PGQueue) GetDLQStats(ctx context.Context, queueName string, queueType 
 
 	tableName := metadata.TableName
 
+	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) AS total_count,
@@ -257,7 +209,103 @@ func (pq *PGQueue) GetDLQStats(ctx context.Context, queueName string, queueType 
 	return stats, nil
 }
 
-// SubscriberLag holds lag information for a subscriber
+// getChannelStats gets statistics for a channel queue.
+func (pq *PGQueue) getChannelStats(
+	ctx context.Context,
+	tableName string,
+	stats *QueueStats,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+			COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+			COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+			AVG(EXTRACT(EPOCH FROM (processed_at - created_at)))
+				FILTER (WHERE processed_at IS NOT NULL) AS avg_processing_time,
+			MIN(created_at)
+				FILTER (WHERE status = 'pending') AS oldest_pending
+		FROM pgqueue_msg_%s
+	`, tableName)
+
+	var avgSeconds sql.NullFloat64
+	var oldestPending sql.NullTime
+
+	err := pq.db.QueryRowContext(ctx, query).Scan(
+		&stats.PendingCount,
+		&stats.ProcessingCount,
+		&stats.CompletedCount,
+		&stats.FailedCount,
+		&avgSeconds,
+		&oldestPending,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get channel stats: %w", err)
+	}
+
+	if avgSeconds.Valid {
+		duration := time.Duration(avgSeconds.Float64 * float64(time.Second))
+		stats.AvgProcessingTime = &duration
+	}
+
+	if oldestPending.Valid {
+		age := time.Since(oldestPending.Time)
+		stats.OldestPendingAge = &age
+	}
+
+	return nil
+}
+
+// getPubSubStats gets statistics for a pub/sub topic.
+func (pq *PGQueue) getPubSubStats(
+	ctx context.Context,
+	tableName string,
+	stats *QueueStats,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+			COUNT(*) FILTER (WHERE status = 'acked') AS completed,
+			COUNT(*) FILTER (WHERE status = 'nacked') AS failed,
+			AVG(EXTRACT(EPOCH FROM (acked_at - created_at)))
+				FILTER (WHERE acked_at IS NOT NULL) AS avg_processing_time,
+			MIN(created_at)
+				FILTER (WHERE status = 'pending') AS oldest_pending
+		FROM pgqueue_sub_%s
+	`, tableName)
+
+	var avgSeconds sql.NullFloat64
+	var oldestPending sql.NullTime
+
+	err := pq.db.QueryRowContext(ctx, query).Scan(
+		&stats.PendingCount,
+		&stats.ProcessingCount,
+		&stats.CompletedCount,
+		&stats.FailedCount,
+		&avgSeconds,
+		&oldestPending,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get pub/sub stats: %w", err)
+	}
+
+	if avgSeconds.Valid {
+		duration := time.Duration(avgSeconds.Float64 * float64(time.Second))
+		stats.AvgProcessingTime = &duration
+	}
+
+	if oldestPending.Valid {
+		age := time.Since(oldestPending.Time)
+		stats.OldestPendingAge = &age
+	}
+
+	return nil
+}
+
+// SubscriberLag holds lag information for a subscriber.
 type SubscriberLag struct {
 	SubscriberID     string
 	TopicName        string
@@ -267,11 +315,11 @@ type SubscriberLag struct {
 	OldestPendingAge *time.Duration
 }
 
-// DLQStats holds statistics about the dead letter queue
+// DLQStats holds statistics about the dead letter queue.
 type DLQStats struct {
-	QueueName      string
-	TotalCount     int64
-	OldestMovedAt  *time.Time
-	NewestMovedAt  *time.Time
-	AvgRetryCount  float64
+	QueueName     string
+	TotalCount    int64
+	OldestMovedAt *time.Time
+	NewestMovedAt *time.Time
+	AvgRetryCount float64
 }

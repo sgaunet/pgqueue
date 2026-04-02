@@ -7,25 +7,31 @@ import (
 	"github.com/google/uuid"
 )
 
-// QueueType represents the type of queue
+// QueueType represents the type of queue.
 type QueueType string
 
 const (
-	QueueTypePubSub  QueueType = "pubsub"
+	// QueueTypePubSub represents a fan-out pub/sub topic.
+	QueueTypePubSub QueueType = "pubsub"
+	// QueueTypeChannel represents a point-to-point channel.
 	QueueTypeChannel QueueType = "channel"
 )
 
-// MessageStatus represents the current state of a message
+// MessageStatus represents the current state of a message.
 type MessageStatus string
 
 const (
-	MessageStatusPending    MessageStatus = "pending"
+	// MessageStatusPending indicates a message is waiting to be consumed.
+	MessageStatusPending MessageStatus = "pending"
+	// MessageStatusProcessing indicates a message is currently being processed.
 	MessageStatusProcessing MessageStatus = "processing"
-	MessageStatusCompleted  MessageStatus = "completed"
-	MessageStatusFailed     MessageStatus = "failed"
+	// MessageStatusCompleted indicates a message has been successfully processed.
+	MessageStatusCompleted MessageStatus = "completed"
+	// MessageStatusFailed indicates a message has failed processing.
+	MessageStatusFailed MessageStatus = "failed"
 )
 
-// Config holds the configuration for PGQueue
+// Config holds the configuration for PGQueue.
 type Config struct {
 	DB                *sql.DB       // Database connection (user-managed)
 	MaxMessageSize    int           // Maximum message size in bytes (default: 1024)
@@ -33,7 +39,7 @@ type Config struct {
 	DefaultTTL        time.Duration // Default message TTL (0 = no expiration)
 }
 
-// TopicOptions holds configuration for a pub/sub topic
+// TopicOptions holds configuration for a pub/sub topic.
 type TopicOptions struct {
 	MaxMessageSize int           // Maximum message size (0 = use default)
 	TTL            time.Duration // Message time-to-live (0 = no expiration)
@@ -41,7 +47,7 @@ type TopicOptions struct {
 	RetentionTTL   time.Duration // How long to retain completed messages (0 = immediate cleanup)
 }
 
-// ChannelOptions holds configuration for a point-to-point channel
+// ChannelOptions holds configuration for a point-to-point channel.
 type ChannelOptions struct {
 	MaxMessageSize       int           // Maximum message size (0 = use default)
 	TTL                  time.Duration // Message time-to-live (0 = no expiration)
@@ -52,7 +58,7 @@ type ChannelOptions struct {
 	AcknowledgmentTimeout time.Duration // Maximum time to acknowledge a message (0 = no deadline)
 }
 
-// Message represents a message in the queue
+// Message represents a message in the queue.
 type Message struct {
 	ID                uuid.UUID
 	Payload           []byte
@@ -64,10 +70,10 @@ type Message struct {
 	AckDeadline       *time.Time
 	ProcessedAt       *time.Time
 	ErrorMessage      *string
-	Metadata          map[string]interface{}
+	Metadata          map[string]any
 }
 
-// Subscription represents a pub/sub subscription record
+// Subscription represents a pub/sub subscription record.
 type Subscription struct {
 	ID           uuid.UUID
 	MessageID    uuid.UUID
@@ -77,7 +83,7 @@ type Subscription struct {
 	AckedAt      *time.Time
 }
 
-// QueueMetadata holds information about a queue (database model)
+// QueueMetadata holds information about a queue (database model).
 type QueueMetadata struct {
 	ID        uuid.UUID
 	QueueType string
@@ -88,7 +94,7 @@ type QueueMetadata struct {
 	UpdatedAt time.Time
 }
 
-// Subscriber represents a pub/sub subscriber registration (database model)
+// Subscriber represents a pub/sub subscriber registration (database model).
 type Subscriber struct {
 	ID           uuid.UUID
 	TopicName    string
@@ -97,7 +103,7 @@ type Subscriber struct {
 	Active       bool
 }
 
-// ReplayLog represents an audit log entry for replay operations (database model)
+// ReplayLog represents an audit log entry for replay operations (database model).
 type ReplayLog struct {
 	ID           uuid.UUID
 	QueueType    string
@@ -109,7 +115,7 @@ type ReplayLog struct {
 	CreatedBy    *string // nullable string
 }
 
-// QueueStats holds statistics about a queue
+// QueueStats holds statistics about a queue.
 type QueueStats struct {
 	QueueName         string
 	PendingCount      int64
@@ -121,7 +127,7 @@ type QueueStats struct {
 	OldestPendingAge  *time.Duration
 }
 
-// DLQMessage represents a message in the dead letter queue
+// DLQMessage represents a message in the dead letter queue.
 type DLQMessage struct {
 	ID                uuid.UUID
 	OriginalMessageID uuid.UUID
@@ -129,24 +135,24 @@ type DLQMessage struct {
 	FailureReason     string
 	RetryCount        int
 	MovedAt           time.Time
-	Metadata          map[string]interface{}
+	Metadata          map[string]any
 }
 
-// RetentionPolicy defines how messages should be garbage collected
+// RetentionPolicy defines how messages should be garbage collected.
 type RetentionPolicy struct {
 	CompletedMessageTTL time.Duration // How long to keep completed messages (0 = forever)
 	MaxPendingAge       time.Duration // Maximum age for pending messages (0 = no limit)
 	DLQRetention        time.Duration // How long to keep DLQ messages (0 = forever)
 }
 
-// GarbageCollectorConfig holds configuration for the garbage collector
+// GarbageCollectorConfig holds configuration for the garbage collector.
 type GarbageCollectorConfig struct {
 	Interval time.Duration          // How often to run garbage collection
 	Policies map[string]RetentionPolicy // Policies per queue (queue name -> policy)
 	DefaultPolicy RetentionPolicy    // Default policy for queues without specific policy
 }
 
-// ReplayOptions holds options for replay operations
+// ReplayOptions holds options for replay operations.
 type ReplayOptions struct {
 	DryRun      bool   // If true, return count without performing replay
 	Limit       int    // Maximum number of messages to replay (0 = no limit)
