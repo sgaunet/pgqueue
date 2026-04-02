@@ -1,6 +1,3 @@
-// Package pgqueue provides a PostgreSQL-based message queue library with
-// exactly-once delivery guarantees, supporting both point-to-point channels
-// and fan-out pub/sub topics.
 package pgqueue
 
 import (
