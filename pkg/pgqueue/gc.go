@@ -53,8 +53,7 @@ func (gc *GarbageCollector) Start(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := gc.collect(ctx); err != nil {
-				// Log error but continue running
-				fmt.Printf("garbage collection error: %v\n", err)
+				gc.pq.logError("garbage collection error", "error", err)
 			}
 		}
 	}
@@ -153,9 +152,8 @@ func (gc *GarbageCollector) collect(ctx context.Context) error {
 
 	for _, queue := range allQueues {
 		if err := gc.collectQueue(ctx, queue); err != nil {
-			fmt.Printf(
-				"failed to collect queue %s: %v\n",
-				queue.QueueName, err,
+			gc.pq.logError("failed to collect queue",
+				"queue", queue.QueueName, "error", err,
 			)
 			continue
 		}
@@ -260,7 +258,7 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 
 	rows, _ := result.RowsAffected()
 	if rows > 0 {
-		fmt.Printf("purged %d completed messages from %s\n", rows, tableName)
+		gc.pq.logInfo("purged completed messages", "count", rows, "table", tableName)
 	}
 
 	return nil
@@ -287,9 +285,7 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 
 	rows, _ := result.RowsAffected()
 	if rows > 0 {
-		fmt.Printf(
-			"purged %d old pending messages from %s\n", rows, tableName,
-		)
+		gc.pq.logInfo("purged old pending messages", "count", rows, "table", tableName)
 	}
 
 	return nil
@@ -315,7 +311,7 @@ func (gc *GarbageCollector) purgeDLQMessages(
 
 	rows, _ := result.RowsAffected()
 	if rows > 0 {
-		fmt.Printf("purged %d DLQ messages from %s\n", rows, tableName)
+		gc.pq.logInfo("purged DLQ messages", "count", rows, "table", tableName)
 	}
 
 	return nil
@@ -343,7 +339,7 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 
 	rows, _ := result.RowsAffected()
 	if rows > 0 {
-		fmt.Printf("reset %d timed-out messages in %s\n", rows, tableName)
+		gc.pq.logInfo("reset timed-out messages", "count", rows, "table", tableName)
 	}
 
 	return nil
@@ -373,9 +369,7 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 
 	rows, _ := result.RowsAffected()
 	if rows > 0 {
-		fmt.Printf(
-			"reset %d timed-out subscriptions in %s\n", rows, tableName,
-		)
+		gc.pq.logInfo("reset timed-out subscriptions", "count", rows, "table", tableName)
 	}
 
 	return nil

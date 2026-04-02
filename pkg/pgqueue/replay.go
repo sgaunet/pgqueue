@@ -491,6 +491,6 @@ func (pq *PGQueue) logReplayIfNeeded(
 		ctx, queueName, queueType,
 		operation, count, performedBy, details,
 	); err != nil {
-		fmt.Printf("failed to log replay operation: %v\n", err)
+		pq.logError("failed to log replay operation", "error", err)
 	}
 }

@@ -2,6 +2,7 @@ package pgqueue
 
 import (
 	"database/sql"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,6 +38,7 @@ type Config struct {
 	MaxMessageSize    int           // Maximum message size in bytes (default: 1024)
 	DefaultMaxRetries int           // Default maximum retry attempts (default: 3)
 	DefaultTTL        time.Duration // Default message TTL (0 = no expiration)
+	Logger            *slog.Logger  // Optional structured logger (nil = silent, the default)
 }
 
 // TopicOptions holds configuration for a pub/sub topic.

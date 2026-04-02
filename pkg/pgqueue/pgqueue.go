@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 )
@@ -63,6 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_l
 type PGQueue struct {
 	db     *sql.DB
 	config Config
+	logger *slog.Logger
 }
 
 // queueNameRegex validates queue names (alphanumeric, underscore, dash).
@@ -136,6 +138,7 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 	pq := &PGQueue{
 		db:     cfg.DB,
 		config: cfg,
+		logger: cfg.Logger,
 	}
 
 	return pq, nil
@@ -180,6 +183,18 @@ func (pq *PGQueue) Close() error {
 	}
 
 	return nil
+}
+
+func (pq *PGQueue) logInfo(msg string, args ...any) {
+	if pq.logger != nil {
+		pq.logger.Info(msg, args...)
+	}
+}
+
+func (pq *PGQueue) logError(msg string, args ...any) {
+	if pq.logger != nil {
+		pq.logger.Error(msg, args...)
+	}
 }
 
 // createQueue is the internal implementation for creating queues.
