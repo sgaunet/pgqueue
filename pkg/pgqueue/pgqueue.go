@@ -133,6 +133,15 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
+	// Check PostgreSQL version (18+ required for uuidv7())
+	var versionNum int
+	if err := cfg.DB.QueryRowContext(ctx, "SHOW server_version_num").Scan(&versionNum); err != nil {
+		return nil, fmt.Errorf("failed to check PostgreSQL version: %w", err)
+	}
+	if versionNum < 180000 {
+		return nil, fmt.Errorf("%w: got %d", ErrUnsupportedPGVersion, versionNum)
+	}
+
 	pq := &PGQueue{
 		db:     cfg.DB,
 		config: cfg,

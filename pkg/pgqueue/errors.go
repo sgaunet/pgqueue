@@ -61,4 +61,7 @@ var (
 	ErrInvalidSubscriberID = errors.New(
 		"invalid subscriber ID: must be 1-128 characters, alphanumeric, underscores, and dashes only",
 	)
+
+	// ErrUnsupportedPGVersion is returned when the PostgreSQL server version is below 18.
+	ErrUnsupportedPGVersion = errors.New("pgqueue requires PostgreSQL 18+")
 )

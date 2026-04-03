@@ -2,10 +2,16 @@ package pgqueue_test
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // TestPublishAfterConnectionLoss tests behavior when connection is lost during publish
@@ -493,6 +499,54 @@ func TestInitWithNilDatabase(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("expected error when initializing with nil database, got nil")
+	}
+}
+
+// TestInitWithUnsupportedPGVersion tests that Init rejects PostgreSQL < 18.
+func TestInitWithUnsupportedPGVersion(t *testing.T) {
+	ctx := context.Background()
+
+	// Start a PostgreSQL 16 container
+	postgresContainer, err := postgres.Run(ctx,
+		"postgres:16-alpine",
+		postgres.WithDatabase(testDBName),
+		postgres.WithUsername(testUser),
+		postgres.WithPassword(testPass),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(testWaitLogOccurrence).
+				WithStartupTimeout(testStartupTimeout)),
+	)
+	if err != nil {
+		t.Fatalf("failed to start postgres 16 container: %v", err)
+	}
+	defer func() {
+		if err := postgresContainer.Terminate(ctx); err != nil {
+			t.Logf("failed to terminate container: %v", err)
+		}
+	}()
+
+	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("failed to get connection string: %v", err)
+	}
+
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = pgqueue.Init(ctx, pgqueue.Config{
+		DB:                db,
+		MaxMessageSize:    testMaxMessageSize,
+		DefaultMaxRetries: testDefaultMaxRetries,
+	})
+	if err == nil {
+		t.Fatal("expected error for PostgreSQL 16, got nil")
+	}
+	if !errors.Is(err, pgqueue.ErrUnsupportedPGVersion) {
+		t.Errorf("expected ErrUnsupportedPGVersion, got: %v", err)
 	}
 }
 
