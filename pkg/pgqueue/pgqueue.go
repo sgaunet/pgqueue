@@ -134,11 +134,13 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 	}
 
 	// Check PostgreSQL version (18+ required for uuidv7())
+	const minPGVersionNum = 180000 // PostgreSQL 18
+
 	var versionNum int
 	if err := cfg.DB.QueryRowContext(ctx, "SHOW server_version_num").Scan(&versionNum); err != nil {
 		return nil, fmt.Errorf("failed to check PostgreSQL version: %w", err)
 	}
-	if versionNum < 180000 {
+	if versionNum < minPGVersionNum {
 		return nil, fmt.Errorf("%w: got %d", ErrUnsupportedPGVersion, versionNum)
 	}
 
