@@ -99,6 +99,10 @@ func (pq *PGQueue) GetSubscriberLag(
 	topicName string,
 	subscriberID string,
 ) (*SubscriberLag, error) {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return nil, err
+	}
+
 	// Get topic metadata
 	metadata, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,

@@ -347,6 +347,68 @@ func TestNackExceedsMaxRetries(t *testing.T) {
 	_ = msgID // Used for deduplication test earlier
 }
 
+// TestInvalidSubscriberID tests that subscriber operations reject invalid subscriber IDs.
+func TestInvalidSubscriberID(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "sub-id-test", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	invalidIDs := []string{
+		"",                  // empty
+		"sub with spaces",   // space
+		"sub@id",            // special char
+		"sub/id",            // slash
+		"sub.id",            // dot
+		"sub\x00id",         // null byte
+		string(make([]byte, 129)), // too long (129 chars, filled with null bytes)
+	}
+
+	// Also test a 129-char alphanumeric string
+	longID := make([]byte, 129)
+	for i := range longID {
+		longID[i] = 'a'
+	}
+	invalidIDs[len(invalidIDs)-1] = string(longID)
+
+	for _, id := range invalidIDs {
+		if err := pq.Subscribe(ctx, "sub-id-test", id); err == nil {
+			t.Errorf("Subscribe: expected error for invalid subscriber ID %q, got nil", id)
+		}
+		if err := pq.Unsubscribe(ctx, "sub-id-test", id); err == nil {
+			t.Errorf("Unsubscribe: expected error for invalid subscriber ID %q, got nil", id)
+		}
+		if _, err := pq.ConsumeFromTopic(ctx, "sub-id-test", id, 30*time.Second); err == nil {
+			t.Errorf("ConsumeFromTopic: expected error for invalid subscriber ID %q, got nil", id)
+		}
+	}
+
+	// Verify valid IDs still work
+	validIDs := []string{
+		"subscriber-1",
+		"sub_123",
+		"A",
+		string(make([]byte, 128)), // exactly 128 chars
+	}
+	// Fill the 128-char ID with valid characters
+	valid128 := make([]byte, 128)
+	for i := range valid128 {
+		valid128[i] = 'b'
+	}
+	validIDs[len(validIDs)-1] = string(valid128)
+
+	for _, id := range validIDs {
+		if err := pq.Subscribe(ctx, "sub-id-test", id); err != nil {
+			t.Errorf("Subscribe: unexpected error for valid subscriber ID %q: %v", id, err)
+		}
+	}
+}
+
 // TestSubscribeToNonExistentTopic tests subscribing to a topic that doesn't exist
 func TestSubscribeToNonExistentTopic(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)

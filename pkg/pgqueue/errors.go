@@ -55,4 +55,10 @@ var (
 
 	// ErrQueuePaused is returned when attempting to consume from a paused queue.
 	ErrQueuePaused = errors.New("queue is paused")
+
+	// ErrInvalidSubscriberID is returned when a subscriber ID is empty, too long,
+	// or contains invalid characters.
+	ErrInvalidSubscriberID = errors.New(
+		"invalid subscriber ID: must be 1-128 characters, alphanumeric, underscores, and dashes only",
+	)
 )

@@ -402,6 +402,17 @@ func (pq *PGQueue) validateQueueName(name string) error {
 	return nil
 }
 
+// maxSubscriberIDLength is the maximum allowed length for a subscriber ID.
+const maxSubscriberIDLength = 128
+
+func validateSubscriberID(id string) error {
+	if len(id) == 0 || len(id) > maxSubscriberIDLength || !queueNameRegex.MatchString(id) {
+		return ErrInvalidSubscriberID
+	}
+
+	return nil
+}
+
 func (pq *PGQueue) checkQueueNotExists(
 	ctx context.Context,
 	queueType QueueType,

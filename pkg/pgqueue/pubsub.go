@@ -15,6 +15,10 @@ func (pq *PGQueue) Subscribe(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return err
+	}
+
 	// Verify topic exists
 	_, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err != nil {
@@ -38,6 +42,10 @@ func (pq *PGQueue) Unsubscribe(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return err
+	}
+
 	err := pq.unregisterSubscriber(ctx, topicName, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to unsubscribe: %w", err)
@@ -53,6 +61,10 @@ func (pq *PGQueue) ConsumeFromTopic(
 	topicName, subscriberID string,
 	visibilityTimeout time.Duration,
 ) (*Message, error) {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return nil, err
+	}
+
 	// Get queue metadata
 	queueMeta, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,
@@ -101,6 +113,10 @@ func (pq *PGQueue) AckTopic(
 	topicName, subscriberID string,
 	messageID uuid.UUID,
 ) error {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return err
+	}
+
 	queueMeta, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,
 	)
@@ -140,6 +156,10 @@ func (pq *PGQueue) NackTopic(
 	messageID uuid.UUID,
 	errorMsg string,
 ) error {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return err
+	}
+
 	queueMeta, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,
 	)

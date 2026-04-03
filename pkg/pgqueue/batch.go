@@ -116,6 +116,9 @@ func (pq *PGQueue) AckTopicBatch(
 	subscriberID string,
 	messageIDs []uuid.UUID,
 ) error {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return err
+	}
 	if len(messageIDs) == 0 {
 		return nil
 	}
