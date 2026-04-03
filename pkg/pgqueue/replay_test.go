@@ -293,3 +293,74 @@ func TestReplayDLQ(t *testing.T) {
 		t.Errorf("expected 0 messages in DLQ after replay, got %d", dlqStats.TotalCount)
 	}
 }
+
+func TestReplayDLQPubSub(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create topic with max 1 retry so messages go to DLQ after 2 nacks
+	err := pq.CreateTopic(ctx, "replay-dlq-pubsub", pgqueue.TopicOptions{
+		MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	err = pq.Subscribe(ctx, "replay-dlq-pubsub", "sub1")
+	if err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, "replay-dlq-pubsub", []byte("replay-me")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Nack until message goes to DLQ
+	for i := 0; i < 2; i++ {
+		msg, err := pq.ConsumeFromTopic(ctx, "replay-dlq-pubsub", "sub1", 30*time.Second)
+		if err != nil {
+			t.Fatalf("consume %d failed: %v", i, err)
+		}
+		if msg == nil {
+			t.Fatalf("consume %d returned nil", i)
+		}
+		err = pq.NackTopic(ctx, "replay-dlq-pubsub", "sub1", msg.ID, "fail")
+		if err != nil {
+			t.Fatalf("nack %d failed: %v", i, err)
+		}
+	}
+
+	// Verify message in DLQ
+	dlqStats, err := pq.GetDLQStats(ctx, "replay-dlq-pubsub", pgqueue.QueueTypePubSub)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats: %v", err)
+	}
+	if dlqStats.TotalCount != 1 {
+		t.Errorf("expected 1 DLQ message, got %d", dlqStats.TotalCount)
+	}
+
+	// Replay from DLQ
+	count, err := pq.ReplayDLQ(ctx, "replay-dlq-pubsub", pgqueue.QueueTypePubSub, pgqueue.ReplayOptions{
+		Confirm: true,
+	})
+	if err != nil {
+		t.Fatalf("replay DLQ failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 replayed, got %d", count)
+	}
+
+	// The replayed message must be consumable by the subscriber
+	msg, err := pq.ConsumeFromTopic(ctx, "replay-dlq-pubsub", "sub1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("consume after replay failed: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected message after DLQ replay, got nil")
+	}
+	if string(msg.Payload) != "replay-me" {
+		t.Errorf("expected payload 'replay-me', got '%s'", msg.Payload)
+	}
+}

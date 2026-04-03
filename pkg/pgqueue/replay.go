@@ -112,7 +112,7 @@ func (pq *PGQueue) ReplayDLQ(
 		return pq.countDLQMessages(ctx, tableName)
 	}
 
-	count, err := pq.executeReplayDLQ(ctx, tableName, opts.Limit)
+	count, err := pq.executeReplayDLQ(ctx, queueName, tableName, queueType, opts.Limit)
 	if err != nil {
 		return 0, fmt.Errorf("failed to execute DLQ replay: %w", err)
 	}
@@ -368,7 +368,8 @@ func (pq *PGQueue) countDLQMessages(
 
 func (pq *PGQueue) executeReplayDLQ(
 	ctx context.Context,
-	tableName string,
+	queueName, tableName string,
+	queueType QueueType,
 	limit int,
 ) (int, error) {
 	tx, err := pq.db.BeginTx(ctx, nil)
@@ -382,7 +383,9 @@ func (pq *PGQueue) executeReplayDLQ(
 		return 0, fmt.Errorf("failed to fetch DLQ messages: %w", err)
 	}
 
-	count, err := pq.reinsertDLQMessages(ctx, tx, tableName, dlqMessages)
+	count, err := pq.reinsertDLQMessages(
+		ctx, tx, queueName, tableName, queueType, dlqMessages,
+	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to reinsert DLQ messages: %w", err)
 	}
@@ -449,6 +452,20 @@ func (pq *PGQueue) fetchDLQMessages(
 func (pq *PGQueue) reinsertDLQMessages(
 	ctx context.Context,
 	tx *sql.Tx,
+	queueName, tableName string,
+	queueType QueueType,
+	dlqMessages []dlqRow,
+) (int, error) {
+	if queueType == QueueTypePubSub {
+		return pq.reinsertDLQPubSub(ctx, tx, queueName, tableName, dlqMessages)
+	}
+
+	return pq.reinsertDLQChannel(ctx, tx, tableName, dlqMessages)
+}
+
+func (pq *PGQueue) reinsertDLQChannel(
+	ctx context.Context,
+	tx *sql.Tx,
 	tableName string,
 	dlqMessages []dlqRow,
 ) (int, error) {
@@ -474,17 +491,60 @@ func (pq *PGQueue) reinsertDLQMessages(
 		if affected > 0 {
 			count++
 
-			//nolint:gosec // G201: table name validated by queueNameRegex
-			deleteQuery := fmt.Sprintf(
-				`DELETE FROM pgqueue_dlq_%s WHERE id = $1`, tableName,
-			)
-			if _, err := tx.ExecContext(ctx, deleteQuery, msg.id); err != nil {
-				return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
+			if err := pq.deleteDLQEntry(ctx, tx, tableName, msg.id); err != nil {
+				return 0, err
 			}
 		}
 	}
 
 	return count, nil
+}
+
+// reinsertDLQPubSub re-creates subscription records for pub/sub DLQ messages.
+// The original message still exists in pgqueue_msg_ (only the subscription was
+// deleted when moved to DLQ), so we just need to re-create subscription records.
+func (pq *PGQueue) reinsertDLQPubSub(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueName, tableName string,
+	dlqMessages []dlqRow,
+) (int, error) {
+	count := 0
+	for _, msg := range dlqMessages {
+		if err := pq.createSubscriptionRecords(
+			ctx, tx, queueName, tableName, msg.originalMessageID,
+		); err != nil {
+			return 0, fmt.Errorf(
+				"failed to create subscription records: %w", err,
+			)
+		}
+
+		count++
+
+		if err := pq.deleteDLQEntry(ctx, tx, tableName, msg.id); err != nil {
+			return 0, err
+		}
+	}
+
+	return count, nil
+}
+
+func (pq *PGQueue) deleteDLQEntry(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	dlqID uuid.UUID,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	deleteQuery := fmt.Sprintf(
+		`DELETE FROM pgqueue_dlq_%s WHERE id = $1`, tableName,
+	)
+
+	if _, err := tx.ExecContext(ctx, deleteQuery, dlqID); err != nil {
+		return fmt.Errorf("failed to delete from DLQ: %w", err)
+	}
+
+	return nil
 }
 
 // logReplay logs a replay operation to the audit log.
