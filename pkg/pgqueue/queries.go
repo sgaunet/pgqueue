@@ -153,7 +153,7 @@ func (pq *PGQueue) registerSubscriber(
 		INSERT INTO pgqueue_subscribers (topic_name, subscriber_id)
 		VALUES ($1, $2)
 		ON CONFLICT (topic_name, subscriber_id)
-		DO UPDATE SET active = TRUE, created_at = NOW()
+		DO UPDATE SET active = TRUE
 		RETURNING id, topic_name, subscriber_id, created_at, active
 	`
 

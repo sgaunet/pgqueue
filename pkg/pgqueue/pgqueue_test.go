@@ -785,6 +785,74 @@ func TestIsQueuePaused(t *testing.T) {
 	}
 }
 
+func TestResubscribePreservesCreatedAt(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "resub-test", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	// Subscribe
+	if err := pq.Subscribe(ctx, "resub-test", "sub-1"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	// Record original created_at
+	var originalCreatedAt time.Time
+	err = db.QueryRowContext(ctx,
+		"SELECT created_at FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
+		"resub-test", "sub-1",
+	).Scan(&originalCreatedAt)
+	if err != nil {
+		t.Fatalf("failed to get original created_at: %v", err)
+	}
+
+	// Unsubscribe
+	if err := pq.Unsubscribe(ctx, "resub-test", "sub-1"); err != nil {
+		t.Fatalf("failed to unsubscribe: %v", err)
+	}
+
+	// Wait to ensure timestamps would differ
+	time.Sleep(10 * time.Millisecond)
+
+	// Re-subscribe
+	if err := pq.Subscribe(ctx, "resub-test", "sub-1"); err != nil {
+		t.Fatalf("failed to re-subscribe: %v", err)
+	}
+
+	// Verify created_at was preserved
+	var newCreatedAt time.Time
+	err = db.QueryRowContext(ctx,
+		"SELECT created_at FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
+		"resub-test", "sub-1",
+	).Scan(&newCreatedAt)
+	if err != nil {
+		t.Fatalf("failed to get new created_at: %v", err)
+	}
+
+	if !originalCreatedAt.Equal(newCreatedAt) {
+		t.Errorf("created_at was reset on re-subscribe: original=%v, new=%v",
+			originalCreatedAt, newCreatedAt)
+	}
+
+	// Verify subscriber is active again
+	var active bool
+	err = db.QueryRowContext(ctx,
+		"SELECT active FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
+		"resub-test", "sub-1",
+	).Scan(&active)
+	if err != nil {
+		t.Fatalf("failed to get active state: %v", err)
+	}
+	if !active {
+		t.Error("expected subscriber to be active after re-subscribe")
+	}
+}
+
 func TestPauseNonExistentQueue(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
