@@ -36,7 +36,7 @@ func (pq *PGQueue) ConsumeFromChannel(
 		ctx, tx, queueMeta.TableName, visibilityTimeout,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch pending channel message: %w", err)
 	}
 	if msg == nil {
 		_ = tx.Rollback()
@@ -115,13 +115,13 @@ func (pq *PGQueue) NackChannel(
 		ctx, tx, queueMeta.TableName, messageID,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get message state: %w", err)
 	}
 
 	if err := pq.handleNack(
 		ctx, tx, queueMeta.TableName, messageID, errorMsg, msgState,
 	); err != nil {
-		return err
+		return fmt.Errorf("failed to handle nack: %w", err)
 	}
 
 	// Commit transaction

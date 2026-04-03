@@ -120,6 +120,10 @@ func (pq *PGQueue) listQueuesRaw(
 		return nil, fmt.Errorf("failed to iterate queue rows: %w", err)
 	}
 
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close rows: %w", err)
+	}
+
 	return items, nil
 }
 
@@ -212,6 +216,10 @@ func (pq *PGQueue) getActiveSubscribers(
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate subscriber rows: %w", err)
+	}
+
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close rows: %w", err)
 	}
 
 	return items, nil
@@ -316,6 +324,10 @@ func (pq *PGQueue) getReplayHistory(
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate replay log rows: %w", err)
+	}
+
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close rows: %w", err)
 	}
 
 	return items, nil

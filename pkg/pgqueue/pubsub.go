@@ -72,7 +72,7 @@ func (pq *PGQueue) ConsumeFromTopic(
 		ctx, tx, queueMeta.TableName, subscriberID, visibilityTimeout,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch pending topic message: %w", err)
 	}
 	if msg == nil {
 		_ = tx.Rollback()

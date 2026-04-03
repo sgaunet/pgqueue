@@ -33,11 +33,11 @@ func (pq *PGQueue) GetStats(
 	// Get message counts by status
 	if queueType == QueueTypeChannel {
 		if err := pq.getChannelStats(ctx, tableName, stats); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get channel stats: %w", err)
 		}
 	} else {
 		if err := pq.getPubSubStats(ctx, tableName, stats); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get pub/sub stats: %w", err)
 		}
 	}
 

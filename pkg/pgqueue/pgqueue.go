@@ -222,11 +222,11 @@ func (pq *PGQueue) createQueue(
 	opts any,
 ) error {
 	if err := pq.validateQueueName(name); err != nil {
-		return err
+		return fmt.Errorf("failed to validate queue name: %w", err)
 	}
 
 	if err := pq.checkQueueNotExists(ctx, queueType, name); err != nil {
-		return err
+		return fmt.Errorf("failed to check queue existence: %w", err)
 	}
 
 	// Sanitize table name
@@ -256,11 +256,11 @@ func (pq *PGQueue) createQueue(
 	// Create queue tables based on type
 	if queueType == QueueTypePubSub {
 		if err := pq.createPubSubTables(ctx, tx, tableName); err != nil {
-			return err
+			return fmt.Errorf("failed to create pub/sub tables: %w", err)
 		}
 	} else {
 		if err := pq.createChannelTables(ctx, tx, tableName); err != nil {
-			return err
+			return fmt.Errorf("failed to create channel tables: %w", err)
 		}
 	}
 
@@ -284,7 +284,7 @@ func (pq *PGQueue) deleteQueue(
 	}
 
 	if err := pq.validateQueueName(name); err != nil {
-		return err
+		return fmt.Errorf("failed to validate queue name: %w", err)
 	}
 
 	// Verify queue exists
@@ -306,7 +306,7 @@ func (pq *PGQueue) deleteQueue(
 
 	// Drop queue-specific tables and clean up global tables
 	if err := pq.executeDelete(ctx, tx, queueType, name, metadata.TableName); err != nil {
-		return err
+		return fmt.Errorf("failed to execute queue deletion: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -420,7 +420,7 @@ func (pq *PGQueue) createPubSubTables(
 	}
 
 	if err := pq.createPubSubIndexes(ctx, tx, tableName); err != nil {
-		return err
+		return fmt.Errorf("failed to create pub/sub indexes: %w", err)
 	}
 
 	// Create DLQ table for pub/sub
@@ -486,7 +486,7 @@ func (pq *PGQueue) createChannelTables(
 	}
 
 	if err := pq.createChannelIndexes(ctx, tx, tableName); err != nil {
-		return err
+		return fmt.Errorf("failed to create channel indexes: %w", err)
 	}
 
 	// Create DLQ table

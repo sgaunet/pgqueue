@@ -20,12 +20,12 @@ func (pq *PGQueue) ReplayFrom(
 	opts ReplayOptions,
 ) (int, error) {
 	if err := validateReplayOpts(opts); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to validate replay options: %w", err)
 	}
 
 	metadata, err := pq.getReplayQueueMetadata(ctx, queueType, queueName)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to get queue metadata for replay: %w", err)
 	}
 
 	tableName := metadata.TableName
@@ -40,7 +40,7 @@ func (pq *PGQueue) ReplayFrom(
 		ctx, tableName, queueType, since, opts.Limit,
 	)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to execute replay from timestamp: %w", err)
 	}
 
 	pq.logReplayIfNeeded(
@@ -61,12 +61,12 @@ func (pq *PGQueue) ReplayMessage(
 	opts ReplayOptions,
 ) error {
 	if err := validateReplayOpts(opts); err != nil {
-		return err
+		return fmt.Errorf("failed to validate replay options: %w", err)
 	}
 
 	metadata, err := pq.getReplayQueueMetadata(ctx, queueType, queueName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get queue metadata for replay: %w", err)
 	}
 
 	tableName := metadata.TableName
@@ -78,7 +78,7 @@ func (pq *PGQueue) ReplayMessage(
 	if err := pq.executeReplayMessage(
 		ctx, tableName, messageID,
 	); err != nil {
-		return err
+		return fmt.Errorf("failed to replay message: %w", err)
 	}
 
 	pq.logReplayIfNeeded(
@@ -98,12 +98,12 @@ func (pq *PGQueue) ReplayDLQ(
 	opts ReplayOptions,
 ) (int, error) {
 	if err := validateReplayOpts(opts); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to validate replay options: %w", err)
 	}
 
 	metadata, err := pq.getReplayQueueMetadata(ctx, queueType, queueName)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to get queue metadata for replay: %w", err)
 	}
 
 	tableName := metadata.TableName
@@ -114,7 +114,7 @@ func (pq *PGQueue) ReplayDLQ(
 
 	count, err := pq.executeReplayDLQ(ctx, tableName, opts.Limit)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to execute DLQ replay: %w", err)
 	}
 
 	pq.logReplayIfNeeded(
@@ -346,12 +346,12 @@ func (pq *PGQueue) executeReplayDLQ(
 
 	dlqMessages, err := pq.fetchDLQMessages(ctx, tx, tableName, limit)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to fetch DLQ messages: %w", err)
 	}
 
 	count, err := pq.reinsertDLQMessages(ctx, tx, tableName, dlqMessages)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to reinsert DLQ messages: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -404,6 +404,10 @@ func (pq *PGQueue) fetchDLQMessages(
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating DLQ messages: %w", err)
+	}
+
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close rows: %w", err)
 	}
 
 	return dlqMessages, nil

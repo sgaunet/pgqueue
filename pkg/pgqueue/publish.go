@@ -178,7 +178,7 @@ func (pq *PGQueue) publishToPubSub(
 	if err := pq.createSubscriptionRecords(
 		ctx, tx, topicName, tableName, messageID,
 	); err != nil {
-		return err
+		return fmt.Errorf("failed to create subscription records: %w", err)
 	}
 
 	// Commit transaction

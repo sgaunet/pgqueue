@@ -170,7 +170,7 @@ func (gc *GarbageCollector) collectQueue(
 	policy := gc.getPolicy(queue.QueueName)
 
 	if err := gc.applyRetentionPolicy(ctx, queue, policy); err != nil {
-		return err
+		return fmt.Errorf("failed to apply retention policy: %w", err)
 	}
 
 	return gc.resetTimedOutEntries(ctx, queue)
