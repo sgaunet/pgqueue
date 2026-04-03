@@ -10,6 +10,19 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	minVisibilityTimeout = 1 * time.Second
+	maxVisibilityTimeout = 24 * time.Hour
+)
+
+func validateVisibilityTimeout(d time.Duration) error {
+	if d < minVisibilityTimeout || d > maxVisibilityTimeout {
+		return ErrInvalidVisibilityTimeout
+	}
+
+	return nil
+}
+
 // ConsumeFromChannel retrieves the next available message from a channel.
 // Returns nil if no messages are available.
 func (pq *PGQueue) ConsumeFromChannel(
@@ -17,6 +30,10 @@ func (pq *PGQueue) ConsumeFromChannel(
 	channelName string,
 	visibilityTimeout time.Duration,
 ) (*Message, error) {
+	if err := validateVisibilityTimeout(visibilityTimeout); err != nil {
+		return nil, err
+	}
+
 	// Get queue metadata
 	queueMeta, err := pq.getQueueMetadata(
 		ctx, string(QueueTypeChannel), channelName,

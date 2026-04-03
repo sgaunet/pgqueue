@@ -64,4 +64,9 @@ var (
 
 	// ErrUnsupportedPGVersion is returned when the PostgreSQL server version is below 18.
 	ErrUnsupportedPGVersion = errors.New("pgqueue requires PostgreSQL 18+")
+
+	// ErrInvalidVisibilityTimeout is returned when the visibility timeout is out of bounds.
+	ErrInvalidVisibilityTimeout = errors.New(
+		"visibility timeout must be between 1s and 24h",
+	)
 )

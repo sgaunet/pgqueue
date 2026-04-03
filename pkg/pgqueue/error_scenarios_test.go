@@ -440,6 +440,42 @@ func TestInvalidSubscriberID(t *testing.T) {
 	}
 }
 
+func TestVisibilityTimeoutBounds(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "vis-test", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Zero timeout should be rejected
+	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 0)
+	if !errors.Is(err, pgqueue.ErrInvalidVisibilityTimeout) {
+		t.Errorf("zero timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
+	}
+
+	// Sub-second timeout should be rejected
+	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 500*time.Millisecond)
+	if !errors.Is(err, pgqueue.ErrInvalidVisibilityTimeout) {
+		t.Errorf("500ms timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
+	}
+
+	// Over 24h should be rejected
+	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 25*time.Hour)
+	if !errors.Is(err, pgqueue.ErrInvalidVisibilityTimeout) {
+		t.Errorf("25h timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
+	}
+
+	// Valid timeout should work (no message to consume, but no error)
+	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 30*time.Second)
+	if err != nil {
+		t.Errorf("valid timeout: unexpected error %v", err)
+	}
+}
+
 // TestSubscribeToNonExistentTopic tests subscribing to a topic that doesn't exist
 func TestSubscribeToNonExistentTopic(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)

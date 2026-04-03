@@ -61,6 +61,10 @@ func (pq *PGQueue) ConsumeFromTopic(
 	topicName, subscriberID string,
 	visibilityTimeout time.Duration,
 ) (*Message, error) {
+	if err := validateVisibilityTimeout(visibilityTimeout); err != nil {
+		return nil, err
+	}
+
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return nil, err
 	}
