@@ -1,21 +1,21 @@
-package pgqueue
+package pgqueue_test
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
 
 func TestGetStats(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "stats-test", ChannelOptions{})
+	err := pq.CreateChannel(ctx, "stats-test", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -28,7 +28,7 @@ func TestGetStats(t *testing.T) {
 	}
 
 	// Get initial stats
-	stats, err := pq.GetStats(ctx, "stats-test", QueueTypeChannel)
+	stats, err := pq.GetStats(ctx, "stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestGetStats(t *testing.T) {
 	}
 
 	// Get updated stats
-	stats, err = pq.GetStats(ctx, "stats-test", QueueTypeChannel)
+	stats, err = pq.GetStats(ctx, "stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -72,19 +72,19 @@ func TestGetStats(t *testing.T) {
 }
 
 func TestGetQueueDepth(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "depth-test", ChannelOptions{})
+	err := pq.CreateChannel(ctx, "depth-test", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
 	// Initial depth should be 0
-	depth, err := pq.GetQueueDepth(ctx, "depth-test", QueueTypeChannel)
+	depth, err := pq.GetQueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestGetQueueDepth(t *testing.T) {
 	}
 
 	// Depth should be 20
-	depth, err = pq.GetQueueDepth(ctx, "depth-test", QueueTypeChannel)
+	depth, err = pq.GetQueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestGetQueueDepth(t *testing.T) {
 	}
 
 	// Depth should still be 10 (consumed but not acked are processing, not pending)
-	depth, err = pq.GetQueueDepth(ctx, "depth-test", QueueTypeChannel)
+	depth, err = pq.GetQueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -127,13 +127,13 @@ func TestGetQueueDepth(t *testing.T) {
 }
 
 func TestGetSubscriberLag(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test topic
-	err := pq.CreateTopic(ctx, "lag-test", TopicOptions{})
+	err := pq.CreateTopic(ctx, "lag-test", pgqueue.TopicOptions{})
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -187,13 +187,13 @@ func TestGetSubscriberLag(t *testing.T) {
 }
 
 func TestGetDLQStats(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel with max retries
-	err := pq.CreateChannel(ctx, "dlq-stats-test", ChannelOptions{
+	err := pq.CreateChannel(ctx, "dlq-stats-test", pgqueue.ChannelOptions{
 		MaxRetries: 1,
 	})
 	if err != nil {
@@ -201,7 +201,7 @@ func TestGetDLQStats(t *testing.T) {
 	}
 
 	// Initial DLQ stats should be empty
-	dlqStats, err := pq.GetDLQStats(ctx, "dlq-stats-test", QueueTypeChannel)
+	dlqStats, err := pq.GetDLQStats(ctx, "dlq-stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestGetDLQStats(t *testing.T) {
 	}
 
 	// Get DLQ stats
-	dlqStats, err = pq.GetDLQStats(ctx, "dlq-stats-test", QueueTypeChannel)
+	dlqStats, err = pq.GetDLQStats(ctx, "dlq-stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -251,13 +251,13 @@ func TestGetDLQStats(t *testing.T) {
 }
 
 func TestPubSubStats(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a topic
-	err := pq.CreateTopic(ctx, "pubsub-stats-test", TopicOptions{})
+	err := pq.CreateTopic(ctx, "pubsub-stats-test", pgqueue.TopicOptions{})
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestPubSubStats(t *testing.T) {
 	}
 
 	// Get stats (should show subscriptions)
-	stats, err := pq.GetStats(ctx, "pubsub-stats-test", QueueTypePubSub)
+	stats, err := pq.GetStats(ctx, "pubsub-stats-test", pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}

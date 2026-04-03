@@ -1,21 +1,21 @@
-package pgqueue
+package pgqueue_test
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
 
 func TestGarbageCollector(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "gc-test", ChannelOptions{
+	err := pq.CreateChannel(ctx, "gc-test", pgqueue.ChannelOptions{
 		MaxRetries: 3,
 	})
 	if err != nil {
@@ -44,22 +44,22 @@ func TestGarbageCollector(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Run garbage collector to purge completed messages
-	gcConfig := GarbageCollectorConfig{
-		DefaultPolicy: RetentionPolicy{
+	gcConfig := pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 1 * time.Millisecond, // Very short TTL for testing
 		},
 	}
-	gc := NewGarbageCollector(pq, gcConfig)
+	gc := pgqueue.NewGarbageCollector(pq, gcConfig)
 
 	// Wait for TTL to expire
 	time.Sleep(10 * time.Millisecond)
 
-	if err := gc.collect(ctx); err != nil {
+	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
 
 	// Check stats
-	stats, err := pq.GetStats(ctx, "gc-test", QueueTypeChannel)
+	stats, err := pq.GetStats(ctx, "gc-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -75,13 +75,13 @@ func TestGarbageCollector(t *testing.T) {
 }
 
 func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "gc-timeout-test", ChannelOptions{
+	err := pq.CreateChannel(ctx, "gc-timeout-test", pgqueue.ChannelOptions{
 		MaxRetries: 3,
 	})
 	if err != nil {
@@ -100,7 +100,7 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	}
 
 	// Verify message is in processing state
-	stats, err := pq.GetStats(ctx, "gc-timeout-test", QueueTypeChannel)
+	stats, err := pq.GetStats(ctx, "gc-timeout-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -112,13 +112,13 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Run GC to reset timed-out messages
-	gc := NewGarbageCollector(pq, GarbageCollectorConfig{})
-	if err := gc.collect(ctx); err != nil {
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
 
 	// Check that message is back to pending
-	stats, err = pq.GetStats(ctx, "gc-timeout-test", QueueTypeChannel)
+	stats, err = pq.GetStats(ctx, "gc-timeout-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -143,13 +143,13 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 }
 
 func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "gc-zero-ttl-test", ChannelOptions{
+	err := pq.CreateChannel(ctx, "gc-zero-ttl-test", pgqueue.ChannelOptions{
 		MaxRetries: 3,
 	})
 	if err != nil {
@@ -175,7 +175,7 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify message is completed
-	stats, err := pq.GetStats(ctx, "gc-zero-ttl-test", QueueTypeChannel)
+	stats, err := pq.GetStats(ctx, "gc-zero-ttl-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -184,23 +184,23 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 	}
 
 	// Run garbage collector with TTL=0 (never expire)
-	gcConfig := GarbageCollectorConfig{
-		DefaultPolicy: RetentionPolicy{
+	gcConfig := pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 0, // Never expire
 		},
 	}
-	gc := NewGarbageCollector(pq, gcConfig)
+	gc := pgqueue.NewGarbageCollector(pq, gcConfig)
 
 	// Run collection multiple times
 	for i := 0; i < 3; i++ {
-		if err := gc.collect(ctx); err != nil {
+		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("garbage collection failed: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Verify completed message is still present
-	stats, err = pq.GetStats(ctx, "gc-zero-ttl-test", QueueTypeChannel)
+	stats, err = pq.GetStats(ctx, "gc-zero-ttl-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -211,13 +211,13 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 }
 
 func TestPurgeQueue(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "purge-test", ChannelOptions{})
+	err := pq.CreateChannel(ctx, "purge-test", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestPurgeQueue(t *testing.T) {
 	}
 
 	// Verify messages exist
-	depth, err := pq.GetQueueDepth(ctx, "purge-test", QueueTypeChannel)
+	depth, err := pq.GetQueueDepth(ctx, "purge-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -239,20 +239,20 @@ func TestPurgeQueue(t *testing.T) {
 	}
 
 	// Purge without confirmation should fail
-	gc := NewGarbageCollector(pq, GarbageCollectorConfig{})
-	err = gc.PurgeQueue(ctx, "purge-test", QueueTypeChannel, false)
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	err = gc.PurgeQueue(ctx, "purge-test", pgqueue.QueueTypeChannel, false)
 	if err == nil {
 		t.Error("expected error when purging without confirmation")
 	}
 
 	// Purge with confirmation
-	err = gc.PurgeQueue(ctx, "purge-test", QueueTypeChannel, true)
+	err = gc.PurgeQueue(ctx, "purge-test", pgqueue.QueueTypeChannel, true)
 	if err != nil {
 		t.Fatalf("failed to purge queue: %v", err)
 	}
 
 	// Verify all messages are gone
-	depth, err = pq.GetQueueDepth(ctx, "purge-test", QueueTypeChannel)
+	depth, err = pq.GetQueueDepth(ctx, "purge-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}

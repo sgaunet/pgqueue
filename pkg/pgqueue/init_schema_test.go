@@ -1,4 +1,4 @@
-package pgqueue
+package pgqueue_test
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -48,7 +49,7 @@ func TestInitSchema(t *testing.T) {
 
 	t.Run("successful_initialization", func(t *testing.T) {
 		// Initialize schema
-		err := InitSchema(ctx, db)
+		err := pgqueue.InitSchema(ctx, db)
 		if err != nil {
 			t.Fatalf("InitSchema failed: %v", err)
 		}
@@ -102,7 +103,7 @@ func TestInitSchema(t *testing.T) {
 
 	t.Run("idempotent_behavior", func(t *testing.T) {
 		// Call InitSchema again (should succeed without errors)
-		err := InitSchema(ctx, db)
+		err := pgqueue.InitSchema(ctx, db)
 		if err != nil {
 			t.Fatalf("InitSchema second call failed: %v", err)
 		}
@@ -128,7 +129,7 @@ func TestInitSchemaNilDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Test with nil database connection
-	err := InitSchema(ctx, nil)
+	err := pgqueue.InitSchema(ctx, nil)
 	if err == nil {
 		t.Fatal("InitSchema should fail with nil database")
 	}
@@ -150,7 +151,7 @@ func TestInitSchemaInvalidConnection(t *testing.T) {
 	defer db.Close()
 
 	// Test InitSchema with invalid connection
-	err = InitSchema(ctx, db)
+	err = pgqueue.InitSchema(ctx, db)
 	if err == nil {
 		t.Fatal("InitSchema should fail with invalid connection")
 	}

@@ -16,13 +16,18 @@ import (
 )
 
 const (
-	testDBName = "testdb"
-	testUser   = "testuser"
-	testPass   = "testpass"
+	testDBName            = "testdb"
+	testUser              = "testuser"
+	testPass              = "testpass"
+	testWaitLogOccurrence = 2
+	testStartupTimeout    = 5 * time.Second
+	testMaxMessageSize    = 1024 * 1024 // 1MB
+	testDefaultMaxRetries = 3
 )
 
-// setupTestDB creates a PostgreSQL container and returns a database connection
-func setupTestDB(t *testing.T) (*sql.DB, func()) {
+// setupTestDB creates a PostgreSQL container and returns a PGQueue instance and raw DB handle.
+func setupTestDB(t *testing.T) (*pgqueue.PGQueue, *sql.DB, func()) {
+	t.Helper()
 	ctx := context.Background()
 
 	// Start PostgreSQL container
@@ -33,8 +38,8 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		postgres.WithPassword(testPass),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(5*time.Second)),
+				WithOccurrence(testWaitLogOccurrence).
+				WithStartupTimeout(testStartupTimeout)),
 	)
 	if err != nil {
 		t.Fatalf("failed to start postgres container: %v", err)
@@ -52,77 +57,35 @@ func setupTestDB(t *testing.T) (*sql.DB, func()) {
 		t.Fatalf("failed to connect to database: %v", err)
 	}
 
-	// Run migrations
-	migrations := `
-		CREATE TABLE IF NOT EXISTS pgqueue_metadata (
-			id UUID PRIMARY KEY DEFAULT uuidv7(),
-			queue_type TEXT NOT NULL CHECK (queue_type IN ('pubsub', 'channel')),
-			queue_name TEXT NOT NULL,
-			table_name TEXT NOT NULL,
-			config JSONB NOT NULL DEFAULT '{}'::jsonb,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE(queue_type, queue_name)
-		);
+	// Initialize base schema using public API
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("failed to initialize schema: %v", err)
+	}
 
-		CREATE INDEX idx_pgqueue_metadata_type_name ON pgqueue_metadata(queue_type, queue_name);
-		CREATE INDEX idx_pgqueue_metadata_table_name ON pgqueue_metadata(table_name);
-
-		CREATE TABLE IF NOT EXISTS pgqueue_subscribers (
-			id UUID PRIMARY KEY DEFAULT uuidv7(),
-			topic_name TEXT NOT NULL,
-			subscriber_id TEXT NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			active BOOLEAN NOT NULL DEFAULT TRUE,
-			UNIQUE(topic_name, subscriber_id)
-		);
-
-		CREATE INDEX idx_pgqueue_subscribers_topic ON pgqueue_subscribers(topic_name) WHERE active = TRUE;
-
-		CREATE TABLE IF NOT EXISTS pgqueue_replay_log (
-			id UUID PRIMARY KEY DEFAULT uuidv7(),
-			queue_type TEXT NOT NULL,
-			queue_name TEXT NOT NULL,
-			replay_type TEXT NOT NULL CHECK (replay_type IN ('timestamp', 'message_id', 'dlq')),
-			replay_params JSONB NOT NULL,
-			message_count INT NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			created_by TEXT
-		);
-
-		CREATE INDEX idx_pgqueue_replay_log_queue ON pgqueue_replay_log(queue_type, queue_name);
-		CREATE INDEX idx_pgqueue_replay_log_created_at ON pgqueue_replay_log(created_at);
-	`
-
-	if _, err := db.ExecContext(ctx, migrations); err != nil {
-		t.Fatalf("failed to run migrations: %v", err)
+	// Initialize PGQueue
+	pq, err := pgqueue.Init(ctx, pgqueue.Config{
+		DB:                db,
+		MaxMessageSize:    testMaxMessageSize,
+		DefaultMaxRetries: testDefaultMaxRetries,
+	})
+	if err != nil {
+		t.Fatalf("failed to init pgqueue: %v", err)
 	}
 
 	// Cleanup function
 	cleanup := func() {
-		db.Close()
+		_ = pq.Close()
 		if err := postgresContainer.Terminate(ctx); err != nil {
 			t.Logf("failed to terminate container: %v", err)
 		}
 	}
 
-	return db, cleanup
+	return pq, db, cleanup
 }
 
 func TestInit(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
-
-	ctx := context.Background()
-
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB:                db,
-		MaxMessageSize:   1024,
-		DefaultMaxRetries: 3,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
 
 	if pq == nil {
 		t.Fatal("expected non-nil pgqueue instance")
@@ -130,20 +93,13 @@ func TestInit(t *testing.T) {
 }
 
 func TestCreateChannel(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
 	// Create a channel
-	err = pq.CreateChannel(ctx, "test-channel", pgqueue.ChannelOptions{
+	err := pq.CreateChannel(ctx, "test-channel", pgqueue.ChannelOptions{
 		MaxMessageSize: 2048,
 	})
 	if err != nil {
@@ -172,20 +128,13 @@ func TestCreateChannel(t *testing.T) {
 }
 
 func TestPublishAndConsumeChannel(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
 	// Create a channel
-	err = pq.CreateChannel(ctx, "orders", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "orders", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -230,20 +179,13 @@ func TestPublishAndConsumeChannel(t *testing.T) {
 }
 
 func TestCreateTopic(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
 	// Create a topic
-	err = pq.CreateTopic(ctx, "notifications", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "notifications", pgqueue.TopicOptions{})
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -264,20 +206,13 @@ func TestCreateTopic(t *testing.T) {
 }
 
 func TestPubSubFanout(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
 	// Create a topic
-	err = pq.CreateTopic(ctx, "events", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "events", pgqueue.TopicOptions{})
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -326,21 +261,14 @@ func TestPubSubFanout(t *testing.T) {
 }
 
 func TestMessageOrdering(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
 	t.Run("channel_ordering", func(t *testing.T) {
 		// Create a channel
-		err = pq.CreateChannel(ctx, "ordered-channel", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "ordered-channel", pgqueue.ChannelOptions{})
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -382,7 +310,7 @@ func TestMessageOrdering(t *testing.T) {
 
 	t.Run("topic_ordering", func(t *testing.T) {
 		// Create a topic
-		err = pq.CreateTopic(ctx, "ordered-topic", pgqueue.TopicOptions{})
+		err := pq.CreateTopic(ctx, "ordered-topic", pgqueue.TopicOptions{})
 		if err != nil {
 			t.Fatalf("failed to create topic: %v", err)
 		}
@@ -431,20 +359,13 @@ func TestMessageOrdering(t *testing.T) {
 }
 
 func TestDeleteChannel(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
 	// Create a channel and publish a message
-	err = pq.CreateChannel(ctx, "delete-me", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "delete-me", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -493,20 +414,13 @@ func TestDeleteChannel(t *testing.T) {
 }
 
 func TestDeleteTopic(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
 	// Create a topic with a subscriber
-	err = pq.CreateTopic(ctx, "delete-topic", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "delete-topic", pgqueue.TopicOptions{})
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -567,19 +481,12 @@ func TestDeleteTopic(t *testing.T) {
 }
 
 func TestDeleteChannelNotConfirmed(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
-	err = pq.CreateChannel(ctx, "no-delete", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "no-delete", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -602,19 +509,12 @@ func TestDeleteChannelNotConfirmed(t *testing.T) {
 }
 
 func TestDeleteNonExistentQueue(t *testing.T) {
-	db, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: db,
-	})
-	if err != nil {
-		t.Fatalf("failed to init pgqueue: %v", err)
-	}
-
-	err = pq.DeleteChannel(ctx, "ghost-queue", true)
+	err := pq.DeleteChannel(ctx, "ghost-queue", true)
 	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
 		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
 	}

@@ -52,7 +52,7 @@ func (gc *GarbageCollector) Start(ctx context.Context) {
 		case <-gc.stopChan:
 			return
 		case <-ticker.C:
-			if err := gc.collect(ctx); err != nil {
+			if err := gc.Collect(ctx); err != nil {
 				gc.pq.logError("garbage collection error", "error", err)
 			}
 		}
@@ -92,6 +92,38 @@ func (gc *GarbageCollector) PurgeQueue(
 	return gc.executePurge(ctx, metadata.TableName, queueType)
 }
 
+// Collect performs a single garbage collection pass.
+func (gc *GarbageCollector) Collect(ctx context.Context) error {
+	// Get all queues
+	topics, err := gc.pq.ListTopics(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list topics: %w", err)
+	}
+
+	channels, err := gc.pq.ListChannels(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list channels: %w", err)
+	}
+
+	// Combine all queues
+	allQueues := make(
+		[]QueueMetadata, 0, len(topics)+len(channels),
+	)
+	allQueues = append(allQueues, topics...)
+	allQueues = append(allQueues, channels...)
+
+	for _, queue := range allQueues {
+		if err := gc.collectQueue(ctx, queue); err != nil {
+			gc.pq.logError("failed to collect queue",
+				"queue", queue.QueueName, "error", err,
+			)
+			continue
+		}
+	}
+
+	return nil
+}
+
 func (gc *GarbageCollector) executePurge(
 	ctx context.Context,
 	tableName string,
@@ -125,38 +157,6 @@ func (gc *GarbageCollector) executePurge(
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit purge: %w", err)
-	}
-
-	return nil
-}
-
-// collect performs a single garbage collection pass.
-func (gc *GarbageCollector) collect(ctx context.Context) error {
-	// Get all queues
-	topics, err := gc.pq.ListTopics(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to list topics: %w", err)
-	}
-
-	channels, err := gc.pq.ListChannels(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to list channels: %w", err)
-	}
-
-	// Combine all queues
-	allQueues := make(
-		[]QueueMetadata, 0, len(topics)+len(channels),
-	)
-	allQueues = append(allQueues, topics...)
-	allQueues = append(allQueues, channels...)
-
-	for _, queue := range allQueues {
-		if err := gc.collectQueue(ctx, queue); err != nil {
-			gc.pq.logError("failed to collect queue",
-				"queue", queue.QueueName, "error", err,
-			)
-			continue
-		}
 	}
 
 	return nil

@@ -1,21 +1,21 @@
-package pgqueue
+package pgqueue_test
 
 import (
 	"context"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
 
 func TestReplayFrom(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "replay-test", ChannelOptions{})
+	err := pq.CreateChannel(ctx, "replay-test", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Verify all completed
-	stats, err := pq.GetStats(ctx, "replay-test", QueueTypeChannel)
+	stats, err := pq.GetStats(ctx, "replay-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Dry-run replay
-	count, err := pq.ReplayFrom(ctx, "replay-test", QueueTypeChannel, startTime, ReplayOptions{
+	count, err := pq.ReplayFrom(ctx, "replay-test", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
 		DryRun: true,
 	})
 	if err != nil {
@@ -63,13 +63,13 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Replay without confirmation should fail
-	_, err = pq.ReplayFrom(ctx, "replay-test", QueueTypeChannel, startTime, ReplayOptions{})
+	_, err = pq.ReplayFrom(ctx, "replay-test", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{})
 	if err == nil {
 		t.Error("expected error when replaying without confirmation")
 	}
 
 	// Replay with confirmation
-	count, err = pq.ReplayFrom(ctx, "replay-test", QueueTypeChannel, startTime, ReplayOptions{
+	count, err = pq.ReplayFrom(ctx, "replay-test", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
 		Confirm:     true,
 		PerformedBy: "test-user",
 	})
@@ -81,7 +81,7 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Verify messages are pending again
-	stats, err = pq.GetStats(ctx, "replay-test", QueueTypeChannel)
+	stats, err = pq.GetStats(ctx, "replay-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Verify replay history
-	history, err := pq.GetReplayHistory(ctx, "replay-test", QueueTypeChannel, 10)
+	history, err := pq.GetReplayHistory(ctx, "replay-test", pgqueue.QueueTypeChannel, 10)
 	if err != nil {
 		t.Fatalf("failed to get replay history: %v", err)
 	}
@@ -103,13 +103,13 @@ func TestReplayFrom(t *testing.T) {
 }
 
 func TestReplayMessage(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "replay-msg-test", ChannelOptions{})
+	err := pq.CreateChannel(ctx, "replay-msg-test", pgqueue.ChannelOptions{})
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestReplayMessage(t *testing.T) {
 	}
 
 	// Verify completed
-	stats, err := pq.GetStats(ctx, "replay-msg-test", QueueTypeChannel)
+	stats, err := pq.GetStats(ctx, "replay-msg-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestReplayMessage(t *testing.T) {
 	}
 
 	// Replay the specific message
-	err = pq.ReplayMessage(ctx, "replay-msg-test", QueueTypeChannel, msg.ID, ReplayOptions{
+	err = pq.ReplayMessage(ctx, "replay-msg-test", pgqueue.QueueTypeChannel, msg.ID, pgqueue.ReplayOptions{
 		Confirm:     true,
 		PerformedBy: "test-user",
 	})
@@ -147,7 +147,7 @@ func TestReplayMessage(t *testing.T) {
 	}
 
 	// Verify message is pending again
-	stats, err = pq.GetStats(ctx, "replay-msg-test", QueueTypeChannel)
+	stats, err = pq.GetStats(ctx, "replay-msg-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -157,13 +157,13 @@ func TestReplayMessage(t *testing.T) {
 }
 
 func TestReplayDLQ(t *testing.T) {
-	pq, cleanup := setupTestDB(t)
+	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel with max retries
-	err := pq.CreateChannel(ctx, "replay-dlq-test", ChannelOptions{
+	err := pq.CreateChannel(ctx, "replay-dlq-test", pgqueue.ChannelOptions{
 		MaxRetries: 1,
 	})
 	if err != nil {
@@ -190,7 +190,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Verify message in DLQ
-	dlqStats, err := pq.GetDLQStats(ctx, "replay-dlq-test", QueueTypeChannel)
+	dlqStats, err := pq.GetDLQStats(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Dry-run DLQ replay
-	count, err := pq.ReplayDLQ(ctx, "replay-dlq-test", QueueTypeChannel, ReplayOptions{
+	count, err := pq.ReplayDLQ(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
 		DryRun: true,
 	})
 	if err != nil {
@@ -210,7 +210,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Replay from DLQ
-	count, err = pq.ReplayDLQ(ctx, "replay-dlq-test", QueueTypeChannel, ReplayOptions{
+	count, err = pq.ReplayDLQ(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
 		Confirm:     true,
 		PerformedBy: "test-user",
 	})
@@ -222,7 +222,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Verify message is back in main queue
-	depth, err := pq.GetQueueDepth(ctx, "replay-dlq-test", QueueTypeChannel)
+	depth, err := pq.GetQueueDepth(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Verify DLQ is empty
-	dlqStats, err = pq.GetDLQStats(ctx, "replay-dlq-test", QueueTypeChannel)
+	dlqStats, err = pq.GetDLQStats(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
