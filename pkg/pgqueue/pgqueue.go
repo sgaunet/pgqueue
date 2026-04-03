@@ -448,6 +448,21 @@ func (pq *PGQueue) createPubSubIndexes(
 			 ON pgqueue_sub_%s(status) WHERE status = 'pending'`,
 			tableName, tableName,
 		),
+		// Consumption-optimized indexes: split the OR condition on
+		// visibility_timeout into two partial indexes for efficient
+		// subscriber message fetching.
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_null
+			 ON pgqueue_sub_%s(subscriber_id, message_id)
+			 WHERE status = 'pending' AND visibility_timeout IS NULL`,
+			tableName, tableName,
+		),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
+			 ON pgqueue_sub_%s(subscriber_id, visibility_timeout, message_id)
+			 WHERE status = 'pending' AND visibility_timeout IS NOT NULL`,
+			tableName, tableName,
+		),
 	}
 
 	for _, idx := range subIndexes {
@@ -515,6 +530,21 @@ func (pq *PGQueue) createChannelIndexes(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_ack_deadline
 			 ON pgqueue_msg_%s(ack_deadline)
 			 WHERE ack_deadline IS NOT NULL`,
+			tableName, tableName,
+		),
+		// Consumption-optimized indexes: split the OR condition on
+		// visibility_timeout into two partial indexes so PostgreSQL
+		// can use an efficient index scan for each branch.
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_null
+			 ON pgqueue_msg_%s(id)
+			 WHERE status = 'pending' AND visibility_timeout IS NULL`,
+			tableName, tableName,
+		),
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_timeout
+			 ON pgqueue_msg_%s(visibility_timeout, id)
+			 WHERE status = 'pending' AND visibility_timeout IS NOT NULL`,
 			tableName, tableName,
 		),
 	}
