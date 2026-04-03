@@ -25,12 +25,12 @@ const (
 	testDefaultMaxRetries = 3
 )
 
-// setupTestDB creates a PostgreSQL container and returns a PGQueue instance and raw DB handle.
-func setupTestDB(t *testing.T) (*pgqueue.PGQueue, *sql.DB, func()) {
+// setupTestContainer starts a PostgreSQL 18 container and returns a raw DB handle.
+// This is the single source of truth for test container configuration.
+func setupTestContainer(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
 	ctx := context.Background()
 
-	// Start PostgreSQL container
 	postgresContainer, err := postgres.Run(ctx,
 		"postgres:18-alpine",
 		postgres.WithDatabase(testDBName),
@@ -45,24 +45,37 @@ func setupTestDB(t *testing.T) (*pgqueue.PGQueue, *sql.DB, func()) {
 		t.Fatalf("failed to start postgres container: %v", err)
 	}
 
-	// Get connection string
 	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		t.Fatalf("failed to get connection string: %v", err)
 	}
 
-	// Connect to database
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
 		t.Fatalf("failed to connect to database: %v", err)
 	}
 
-	// Initialize base schema using public API
+	cleanup := func() {
+		_ = db.Close()
+		if err := postgresContainer.Terminate(ctx); err != nil {
+			t.Logf("failed to terminate container: %v", err)
+		}
+	}
+
+	return db, cleanup
+}
+
+// setupTestDB creates a PostgreSQL container and returns a PGQueue instance and raw DB handle.
+func setupTestDB(t *testing.T) (*pgqueue.PGQueue, *sql.DB, func()) {
+	t.Helper()
+	ctx := context.Background()
+
+	db, containerCleanup := setupTestContainer(t)
+
 	if err := pgqueue.InitSchema(ctx, db); err != nil {
 		t.Fatalf("failed to initialize schema: %v", err)
 	}
 
-	// Initialize PGQueue
 	pq, err := pgqueue.Init(ctx, pgqueue.Config{
 		DB:                db,
 		MaxMessageSize:    testMaxMessageSize,
@@ -72,12 +85,9 @@ func setupTestDB(t *testing.T) (*pgqueue.PGQueue, *sql.DB, func()) {
 		t.Fatalf("failed to init pgqueue: %v", err)
 	}
 
-	// Cleanup function
 	cleanup := func() {
 		_ = pq.Close()
-		if err := postgresContainer.Terminate(ctx); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
+		containerCleanup()
 	}
 
 	return pq, db, cleanup

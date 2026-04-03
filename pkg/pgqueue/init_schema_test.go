@@ -7,48 +7,15 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 func TestInitSchema(t *testing.T) {
+	db, cleanup := setupTestContainer(t)
+	defer cleanup()
+
 	ctx := context.Background()
 
-	// Start PostgreSQL container
-	postgresContainer, err := postgres.Run(ctx,
-		"postgres:18-alpine",
-		postgres.WithDatabase("testdb"),
-		postgres.WithUsername("testuser"),
-		postgres.WithPassword("testpass"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2)),
-	)
-	if err != nil {
-		t.Fatalf("failed to start postgres container: %v", err)
-	}
-	defer func() {
-		if err := postgresContainer.Terminate(ctx); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	}()
-
-	// Get connection string
-	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("failed to get connection string: %v", err)
-	}
-
-	// Connect to database
-	db, err := sql.Open("pgx", connStr)
-	if err != nil {
-		t.Fatalf("failed to connect to database: %v", err)
-	}
-	defer db.Close()
-
 	t.Run("successful_initialization", func(t *testing.T) {
-		// Initialize schema
 		err := pgqueue.InitSchema(ctx, db)
 		if err != nil {
 			t.Fatalf("InitSchema failed: %v", err)
@@ -102,13 +69,11 @@ func TestInitSchema(t *testing.T) {
 	})
 
 	t.Run("idempotent_behavior", func(t *testing.T) {
-		// Call InitSchema again (should succeed without errors)
 		err := pgqueue.InitSchema(ctx, db)
 		if err != nil {
 			t.Fatalf("InitSchema second call failed: %v", err)
 		}
 
-		// Verify tables still exist
 		var tableCount int
 		err = db.QueryRowContext(ctx, `
 			SELECT COUNT(*)
@@ -128,7 +93,6 @@ func TestInitSchema(t *testing.T) {
 func TestInitSchemaNilDB(t *testing.T) {
 	ctx := context.Background()
 
-	// Test with nil database connection
 	err := pgqueue.InitSchema(ctx, nil)
 	if err == nil {
 		t.Fatal("InitSchema should fail with nil database")
@@ -143,20 +107,17 @@ func TestInitSchemaNilDB(t *testing.T) {
 func TestInitSchemaInvalidConnection(t *testing.T) {
 	ctx := context.Background()
 
-	// Create database connection with invalid connection string
 	db, err := sql.Open("pgx", "postgres://invalid:invalid@localhost:9999/invalid?sslmode=disable&connect_timeout=1")
 	if err != nil {
 		t.Fatalf("failed to create invalid db connection: %v", err)
 	}
 	defer db.Close()
 
-	// Test InitSchema with invalid connection
 	err = pgqueue.InitSchema(ctx, db)
 	if err == nil {
 		t.Fatal("InitSchema should fail with invalid connection")
 	}
 
-	// Should contain error message about failed initialization
 	if err.Error()[:30] != "failed to initialize base sche" {
 		t.Errorf("unexpected error message: %v", err)
 	}
