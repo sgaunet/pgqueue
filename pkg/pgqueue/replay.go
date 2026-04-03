@@ -237,7 +237,6 @@ func (pq *PGQueue) buildReplayFromQuery(
 
 func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 	if limit > 0 {
-		//nolint:gosec // G201: table name validated by queueNameRegex
 		return fmt.Sprintf(`
 			UPDATE pgqueue_msg_%s
 			SET status = 'pending',
@@ -254,7 +253,6 @@ func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 		`, tableName, tableName, limit)
 	}
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	return fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = 'pending',
@@ -270,7 +268,6 @@ func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 
 func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
 	if limit > 0 {
-		//nolint:gosec // G201: table name validated by queueNameRegex
 		return fmt.Sprintf(`
 			UPDATE pgqueue_sub_%s
 			SET status = 'pending',
@@ -286,7 +283,6 @@ func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
 		`, tableName, tableName, limit)
 	}
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	return fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = 'pending',
