@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS pgqueue_metadata (
     queue_name TEXT NOT NULL,
     table_name TEXT NOT NULL,
     config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    paused BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(queue_type, queue_name)
@@ -197,6 +198,53 @@ func (pq *PGQueue) ListChannels(
 func (pq *PGQueue) Close() error {
 	if err := pq.db.Close(); err != nil {
 		return fmt.Errorf("failed to close database: %w", err)
+	}
+
+	return nil
+}
+
+// PauseQueue prevents new messages from being consumed from the specified queue.
+// Publishing is still allowed while paused. Works for both channels and topics.
+func (pq *PGQueue) PauseQueue(ctx context.Context, queueName string) error {
+	return pq.setQueuePaused(ctx, queueName, true)
+}
+
+// ResumeQueue allows message consumption again for the specified queue.
+func (pq *PGQueue) ResumeQueue(ctx context.Context, queueName string) error {
+	return pq.setQueuePaused(ctx, queueName, false)
+}
+
+// IsQueuePaused returns whether the specified queue is currently paused.
+func (pq *PGQueue) IsQueuePaused(ctx context.Context, queueName string) (bool, error) {
+	meta, err := pq.resolveQueueMetadata(ctx, queueName)
+	if err != nil {
+		return false, err
+	}
+
+	return meta.Paused, nil
+}
+
+func (pq *PGQueue) setQueuePaused(ctx context.Context, queueName string, paused bool) error {
+	meta, err := pq.resolveQueueMetadata(ctx, queueName)
+	if err != nil {
+		return err
+	}
+
+	result, err := pq.db.ExecContext(ctx,
+		`UPDATE pgqueue_metadata SET paused = $1, updated_at = NOW()
+		 WHERE queue_type = $2 AND queue_name = $3`,
+		paused, meta.QueueType, meta.QueueName,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update queue paused state: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrQueueNotFound
 	}
 
 	return nil
@@ -614,6 +662,7 @@ func (pq *PGQueue) listQueues(
 			QueueName: row.QueueName,
 			TableName: row.TableName,
 			Config:    row.Config,
+			Paused:    row.Paused,
 			CreatedAt: row.CreatedAt,
 			UpdatedAt: row.UpdatedAt,
 		})

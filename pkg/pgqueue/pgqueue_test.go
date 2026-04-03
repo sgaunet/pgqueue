@@ -635,3 +635,164 @@ func TestTopicTTLEnforcedOnConsume(t *testing.T) {
 		t.Error("expected nil message after TTL expiration, but got one")
 	}
 }
+
+func TestPauseResumeChannel(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "pause-ch", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish a message
+	_, err = pq.Publish(ctx, "pause-ch", []byte("hello"))
+	if err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Pause the queue
+	err = pq.PauseQueue(ctx, "pause-ch")
+	if err != nil {
+		t.Fatalf("failed to pause queue: %v", err)
+	}
+
+	// Consume should fail with ErrQueuePaused
+	_, err = pq.ConsumeFromChannel(ctx, "pause-ch", 30*time.Second)
+	if !errors.Is(err, pgqueue.ErrQueuePaused) {
+		t.Fatalf("expected ErrQueuePaused, got: %v", err)
+	}
+
+	// Publishing should still work while paused
+	_, err = pq.Publish(ctx, "pause-ch", []byte("world"))
+	if err != nil {
+		t.Fatalf("publishing should work while paused: %v", err)
+	}
+
+	// Resume the queue
+	err = pq.ResumeQueue(ctx, "pause-ch")
+	if err != nil {
+		t.Fatalf("failed to resume queue: %v", err)
+	}
+
+	// Consume should work now
+	msg, err := pq.ConsumeFromChannel(ctx, "pause-ch", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume after resume: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected message after resume, got nil")
+	}
+}
+
+func TestPauseResumeTopic(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "pause-topic", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	err = pq.Subscribe(ctx, "pause-topic", "sub-1")
+	if err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	_, err = pq.Publish(ctx, "pause-topic", []byte("hello"))
+	if err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Pause
+	err = pq.PauseQueue(ctx, "pause-topic")
+	if err != nil {
+		t.Fatalf("failed to pause: %v", err)
+	}
+
+	// Consume should fail
+	_, err = pq.ConsumeFromTopic(ctx, "pause-topic", "sub-1", 30*time.Second)
+	if !errors.Is(err, pgqueue.ErrQueuePaused) {
+		t.Fatalf("expected ErrQueuePaused, got: %v", err)
+	}
+
+	// Resume
+	err = pq.ResumeQueue(ctx, "pause-topic")
+	if err != nil {
+		t.Fatalf("failed to resume: %v", err)
+	}
+
+	// Consume should work
+	msg, err := pq.ConsumeFromTopic(ctx, "pause-topic", "sub-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume after resume: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected message after resume, got nil")
+	}
+}
+
+func TestIsQueuePaused(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "pause-check", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Initially not paused
+	paused, err := pq.IsQueuePaused(ctx, "pause-check")
+	if err != nil {
+		t.Fatalf("failed to check paused state: %v", err)
+	}
+	if paused {
+		t.Error("expected queue to not be paused initially")
+	}
+
+	// Pause
+	err = pq.PauseQueue(ctx, "pause-check")
+	if err != nil {
+		t.Fatalf("failed to pause: %v", err)
+	}
+
+	paused, err = pq.IsQueuePaused(ctx, "pause-check")
+	if err != nil {
+		t.Fatalf("failed to check paused state: %v", err)
+	}
+	if !paused {
+		t.Error("expected queue to be paused")
+	}
+
+	// Resume
+	err = pq.ResumeQueue(ctx, "pause-check")
+	if err != nil {
+		t.Fatalf("failed to resume: %v", err)
+	}
+
+	paused, err = pq.IsQueuePaused(ctx, "pause-check")
+	if err != nil {
+		t.Fatalf("failed to check paused state: %v", err)
+	}
+	if paused {
+		t.Error("expected queue to not be paused after resume")
+	}
+}
+
+func TestPauseNonExistentQueue(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.PauseQueue(ctx, "ghost-queue")
+	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
+		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
+	}
+}

@@ -25,6 +25,10 @@ func (pq *PGQueue) ConsumeFromChannel(
 		return nil, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
+	if queueMeta.Paused {
+		return nil, ErrQueuePaused
+	}
+
 	// Begin transaction
 	tx, err := pq.db.BeginTx(ctx, nil)
 	if err != nil {

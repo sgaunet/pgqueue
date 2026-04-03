@@ -92,6 +92,7 @@ type QueueMetadata struct {
 	QueueName string
 	TableName string
 	Config    []byte // json.RawMessage from database
+	Paused    bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

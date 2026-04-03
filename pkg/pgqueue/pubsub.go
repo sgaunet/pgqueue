@@ -61,6 +61,10 @@ func (pq *PGQueue) ConsumeFromTopic(
 		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
+	if queueMeta.Paused {
+		return nil, ErrQueuePaused
+	}
+
 	// Begin transaction
 	tx, err := pq.db.BeginTx(ctx, nil)
 	if err != nil {

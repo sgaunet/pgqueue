@@ -52,4 +52,7 @@ var (
 
 	// ErrBatchTooLarge is returned when a batch operation exceeds the maximum batch size.
 	ErrBatchTooLarge = errors.New("batch size exceeds maximum allowed")
+
+	// ErrQueuePaused is returned when attempting to consume from a paused queue.
+	ErrQueuePaused = errors.New("queue is paused")
 )
