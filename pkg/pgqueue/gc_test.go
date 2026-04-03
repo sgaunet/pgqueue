@@ -277,6 +277,144 @@ func TestGarbageCollectorParallel(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectorPubSub(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a test topic
+	err := pq.CreateTopic(ctx, "gc-pubsub-test", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	// Subscribe two subscribers
+	if err := pq.Subscribe(ctx, "gc-pubsub-test", "sub-1"); err != nil {
+		t.Fatalf("failed to subscribe sub-1: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "gc-pubsub-test", "sub-2"); err != nil {
+		t.Fatalf("failed to subscribe sub-2: %v", err)
+	}
+
+	// Publish 5 messages
+	for i := 0; i < 5; i++ {
+		if _, err := pq.Publish(ctx, "gc-pubsub-test", []byte("test message")); err != nil {
+			t.Fatalf("failed to publish message: %v", err)
+		}
+	}
+
+	// Ack all messages for both subscribers (fully consumed)
+	for _, sub := range []string{"sub-1", "sub-2"} {
+		for i := 0; i < 5; i++ {
+			msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-test", sub, 30*time.Second)
+			if err != nil {
+				t.Fatalf("failed to consume message for %s: %v", sub, err)
+			}
+			if err := pq.AckTopic(ctx, "gc-pubsub-test", sub, msg.ID); err != nil {
+				t.Fatalf("failed to ack message for %s: %v", sub, err)
+			}
+		}
+	}
+
+	// Verify messages exist in the message table before GC
+	var msgCount int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_msg_gc_pubsub_test").Scan(&msgCount)
+	if err != nil {
+		t.Fatalf("failed to count messages: %v", err)
+	}
+	if msgCount != 5 {
+		t.Fatalf("expected 5 messages before GC, got %d", msgCount)
+	}
+
+	// Wait for TTL to expire then run GC
+	time.Sleep(10 * time.Millisecond)
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			CompletedMessageTTL: 1 * time.Millisecond,
+		},
+	})
+
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	// Verify messages were purged from the message table
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_msg_gc_pubsub_test").Scan(&msgCount)
+	if err != nil {
+		t.Fatalf("failed to count messages after GC: %v", err)
+	}
+	if msgCount != 0 {
+		t.Errorf("expected 0 messages after GC, got %d", msgCount)
+	}
+}
+
+func TestGarbageCollectorPubSubPartialAck(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a test topic
+	err := pq.CreateTopic(ctx, "gc-pubsub-partial", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	// Subscribe two subscribers
+	if err := pq.Subscribe(ctx, "gc-pubsub-partial", "sub-1"); err != nil {
+		t.Fatalf("failed to subscribe sub-1: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "gc-pubsub-partial", "sub-2"); err != nil {
+		t.Fatalf("failed to subscribe sub-2: %v", err)
+	}
+
+	// Publish 3 messages
+	for i := 0; i < 3; i++ {
+		if _, err := pq.Publish(ctx, "gc-pubsub-partial", []byte("test message")); err != nil {
+			t.Fatalf("failed to publish message: %v", err)
+		}
+	}
+
+	// Only sub-1 acks all messages; sub-2 does NOT consume
+	for i := 0; i < 3; i++ {
+		msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-partial", "sub-1", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume message for sub-1: %v", err)
+		}
+		if err := pq.AckTopic(ctx, "gc-pubsub-partial", "sub-1", msg.ID); err != nil {
+			t.Fatalf("failed to ack message for sub-1: %v", err)
+		}
+	}
+
+	// Wait for TTL to expire then run GC
+	time.Sleep(10 * time.Millisecond)
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			CompletedMessageTTL: 1 * time.Millisecond,
+		},
+	})
+
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	// Messages should NOT be purged because sub-2 still has pending subscriptions
+	var msgCount int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_msg_gc_pubsub_partial").Scan(&msgCount)
+	if err != nil {
+		t.Fatalf("failed to count messages after GC: %v", err)
+	}
+	if msgCount != 3 {
+		t.Errorf("expected 3 messages preserved (sub-2 not acked), got %d", msgCount)
+	}
+}
+
 func TestPurgeQueue(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
