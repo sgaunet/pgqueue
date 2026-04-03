@@ -68,8 +68,10 @@ func (pq *PGQueue) ConsumeFromTopic(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	ttl := pq.getQueueTTL(queueMeta.Config)
+
 	msg, visTimeout, err := pq.fetchPendingTopicMessage(
-		ctx, tx, queueMeta.TableName, subscriberID, visibilityTimeout,
+		ctx, tx, queueMeta.TableName, subscriberID, visibilityTimeout, ttl,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending topic message: %w", err)
@@ -176,7 +178,16 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 	tx *sql.Tx,
 	tableName, subscriberID string,
 	visibilityTimeout time.Duration,
+	ttl time.Duration,
 ) (*Message, *time.Time, error) {
+	ttlClause := ""
+	args := []any{subscriberID}
+
+	if ttl > 0 {
+		ttlClause = "AND m.created_at > $2"
+		args = append(args, time.Now().Add(-ttl))
+	}
+
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT s.id, s.message_id, m.payload, m.created_at,
@@ -187,10 +198,11 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 		  AND s.status = 'pending'
 		  AND (s.visibility_timeout IS NULL
 		       OR s.visibility_timeout < NOW())
+		  %s
 		ORDER BY m.id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED
-	`, tableName, tableName)
+	`, tableName, tableName, ttlClause)
 
 	var subID uuid.UUID
 	var msgID uuid.UUID
@@ -199,7 +211,7 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 	var retryCount int
 	var metadataJSON sql.NullString
 
-	err := tx.QueryRowContext(ctx, query, subscriberID).Scan(
+	err := tx.QueryRowContext(ctx, query, args...).Scan(
 		&subID, &msgID, &payload, &createdAt,
 		&retryCount, &metadataJSON,
 	)

@@ -5,7 +5,24 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 )
+
+// getQueueTTL extracts the TTL from queue config JSON, falling back to the
+// default TTL from PGQueue config. Returns 0 if no TTL is configured.
+func (pq *PGQueue) getQueueTTL(configJSON []byte) time.Duration {
+	var cfg struct {
+		TTL time.Duration `json:"TTL"`
+	}
+
+	if len(configJSON) > 0 {
+		if err := json.Unmarshal(configJSON, &cfg); err == nil && cfg.TTL > 0 {
+			return cfg.TTL
+		}
+	}
+
+	return pq.config.DefaultTTL
+}
 
 // parseMetadataJSON parses a nullable JSON string into a metadata map.
 func parseMetadataJSON(s sql.NullString) map[string]any {

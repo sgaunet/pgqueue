@@ -524,3 +524,114 @@ func TestDeleteNonExistentQueue(t *testing.T) {
 		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
 	}
 }
+
+func TestChannelTTLEnforcedOnConsume(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel with a very short TTL
+	err := pq.CreateChannel(ctx, "ttl-test", pgqueue.ChannelOptions{
+		TTL: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish a message
+	_, err = pq.Publish(ctx, "ttl-test", []byte("expires-fast"))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(10 * time.Millisecond)
+
+	// Consume should return nil (message expired)
+	msg, err := pq.ConsumeFromChannel(ctx, "ttl-test", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	if msg != nil {
+		t.Error("expected nil message after TTL expiration, but got one")
+	}
+
+	// Verify the message still exists in the table (not deleted, just filtered)
+	var count int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_msg_ttl_test WHERE status = 'pending'",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to count messages: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 pending message in table, got %d", count)
+	}
+}
+
+func TestChannelNoTTLDeliversAllMessages(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel without TTL (TTL=0 means no expiration)
+	err := pq.CreateChannel(ctx, "no-ttl", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	_, err = pq.Publish(ctx, "no-ttl", []byte("lives-forever"))
+	if err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Should still be consumable
+	msg, err := pq.ConsumeFromChannel(ctx, "no-ttl", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	if msg == nil {
+		t.Error("expected message with TTL=0, got nil")
+	}
+}
+
+func TestTopicTTLEnforcedOnConsume(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a topic with a very short TTL
+	err := pq.CreateTopic(ctx, "ttl-topic", pgqueue.TopicOptions{
+		TTL: 1 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	// Subscribe
+	err = pq.Subscribe(ctx, "ttl-topic", "sub-1")
+	if err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	// Publish
+	_, err = pq.Publish(ctx, "ttl-topic", []byte("expires-fast"))
+	if err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(10 * time.Millisecond)
+
+	// Consume should return nil (message expired)
+	msg, err := pq.ConsumeFromTopic(ctx, "ttl-topic", "sub-1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	if msg != nil {
+		t.Error("expected nil message after TTL expiration, but got one")
+	}
+}

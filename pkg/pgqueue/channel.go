@@ -32,8 +32,10 @@ func (pq *PGQueue) ConsumeFromChannel(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	ttl := pq.getQueueTTL(queueMeta.Config)
+
 	msg, visTimeout, err := pq.fetchPendingChannelMessage(
-		ctx, tx, queueMeta.TableName, visibilityTimeout,
+		ctx, tx, queueMeta.TableName, visibilityTimeout, ttl,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending channel message: %w", err)
@@ -144,17 +146,27 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 	tx *sql.Tx,
 	tableName string,
 	visibilityTimeout time.Duration,
+	ttl time.Duration,
 ) (*Message, *time.Time, error) {
+	ttlClause := ""
+	var args []any
+
+	if ttl > 0 {
+		ttlClause = "AND created_at > $1"
+		args = append(args, time.Now().Add(-ttl))
+	}
+
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT id, payload, created_at, retry_count, max_retries, metadata
 		FROM pgqueue_msg_%s
 		WHERE status = 'pending'
 		  AND (visibility_timeout IS NULL OR visibility_timeout < NOW())
+		  %s
 		ORDER BY id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, tableName)
+	`, tableName, ttlClause)
 
 	var msgID uuid.UUID
 	var payload []byte
@@ -163,7 +175,7 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 	var maxRetries sql.NullInt32
 	var metadataJSON sql.NullString
 
-	err := tx.QueryRowContext(ctx, query).Scan(
+	err := tx.QueryRowContext(ctx, query, args...).Scan(
 		&msgID, &payload, &createdAt,
 		&retryCount, &maxRetries, &metadataJSON,
 	)
