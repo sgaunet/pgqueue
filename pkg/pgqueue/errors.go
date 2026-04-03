@@ -49,4 +49,7 @@ var (
 
 	// ErrReplayMessageNotFound is returned when a message targeted for replay cannot be found.
 	ErrReplayMessageNotFound = errors.New("message not found")
+
+	// ErrBatchTooLarge is returned when a batch operation exceeds the maximum batch size.
+	ErrBatchTooLarge = errors.New("batch size exceeds maximum allowed")
 )

@@ -155,6 +155,15 @@ type GarbageCollectorConfig struct {
 	MaxWorkers    int                        // Max concurrent GC operations (default: 10)
 }
 
+// MaxBatchSize is the maximum number of messages allowed in a single batch operation.
+const MaxBatchSize = 1000
+
+// PublishMessage represents a message to be published in a batch operation.
+type PublishMessage struct {
+	Payload  []byte         // Message payload (required)
+	Metadata map[string]any // Optional message metadata
+}
+
 // ReplayOptions holds options for replay operations.
 type ReplayOptions struct {
 	DryRun      bool   // If true, return count without performing replay

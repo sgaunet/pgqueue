@@ -1,0 +1,688 @@
+package pgqueue_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/google/uuid" //nolint:depguard // needed for uuid.UUID type
+	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+)
+
+func TestPublishBatchChannel(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "batch-chan", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("msg1")},
+		{Payload: []byte("msg2")},
+		{Payload: []byte("msg3")},
+		{Payload: []byte("msg4")},
+		{Payload: []byte("msg5")},
+	}
+
+	ids, err := pq.PublishBatch(ctx, "batch-chan", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	if len(ids) != len(messages) {
+		t.Fatalf("expected %d IDs, got %d", len(messages), len(ids))
+	}
+
+	// Verify queue depth
+	stats, err := pq.GetStats(ctx, "batch-chan", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.PendingCount != 5 {
+		t.Errorf("expected 5 pending messages, got %d", stats.PendingCount)
+	}
+
+	// Consume all messages and verify all payloads present
+	payloadSet := make(map[string]bool)
+	for i := range messages {
+		msg, err := pq.ConsumeFromChannel(ctx, "batch-chan", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromChannel failed: %v", err)
+		}
+		if msg == nil {
+			t.Fatalf("expected message %d, got nil", i)
+		}
+		payloadSet[string(msg.Payload)] = true
+	}
+	for _, m := range messages {
+		if !payloadSet[string(m.Payload)] {
+			t.Errorf("missing payload %q", string(m.Payload))
+		}
+	}
+}
+
+func TestPublishBatchTopic(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "batch-topic", pgqueue.TopicOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	if err := pq.Subscribe(ctx, "batch-topic", "sub1"); err != nil {
+		t.Fatalf("Subscribe sub1 failed: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "batch-topic", "sub2"); err != nil {
+		t.Fatalf("Subscribe sub2 failed: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("t1")},
+		{Payload: []byte("t2")},
+		{Payload: []byte("t3")},
+	}
+
+	ids, err := pq.PublishBatch(ctx, "batch-topic", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+	if len(ids) != 3 {
+		t.Fatalf("expected 3 IDs, got %d", len(ids))
+	}
+
+	// Both subscribers should get all 3 messages
+	for _, subID := range []string{"sub1", "sub2"} {
+		for i := 0; i < 3; i++ {
+			msg, err := pq.ConsumeFromTopic(ctx, "batch-topic", subID, 30*time.Second)
+			if err != nil {
+				t.Fatalf("ConsumeFromTopic(%s) failed: %v", subID, err)
+			}
+			if msg == nil {
+				t.Fatalf("subscriber %s: expected message %d, got nil", subID, i)
+			}
+		}
+	}
+}
+
+func TestPublishBatchEmptySlice(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "empty-batch", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	ids, err := pq.PublishBatch(ctx, "empty-batch", []pgqueue.PublishMessage{})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("expected empty IDs, got %d", len(ids))
+	}
+}
+
+func TestPublishBatchTooLarge(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "large-batch", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := make([]pgqueue.PublishMessage, pgqueue.MaxBatchSize+1)
+	for i := range messages {
+		messages[i] = pgqueue.PublishMessage{Payload: []byte("x")}
+	}
+
+	_, err = pq.PublishBatch(ctx, "large-batch", messages)
+	if !errors.Is(err, pgqueue.ErrBatchTooLarge) {
+		t.Errorf("expected ErrBatchTooLarge, got: %v", err)
+	}
+}
+
+func TestPublishBatchPayloadValidation(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "small-chan", pgqueue.ChannelOptions{
+		MaxMessageSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("ok")},
+		{Payload: []byte("this payload is way too large for the limit")},
+	}
+
+	_, err = pq.PublishBatch(ctx, "small-chan", messages)
+	if !errors.Is(err, pgqueue.ErrMessageSizeExceeded) {
+		t.Errorf("expected ErrMessageSizeExceeded, got: %v", err)
+	}
+
+	// Verify no messages were inserted (all-or-nothing validation)
+	stats, err := pq.GetStats(ctx, "small-chan", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.PendingCount != 0 {
+		t.Errorf("expected 0 pending, got %d", stats.PendingCount)
+	}
+}
+
+func TestPublishBatchWithMetadata(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "meta-batch", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{
+			Payload:  []byte("with-meta"),
+			Metadata: map[string]any{"key": "value"},
+		},
+		{
+			Payload: []byte("no-meta"),
+		},
+	}
+
+	ids, err := pq.PublishBatch(ctx, "meta-batch", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 IDs, got %d", len(ids))
+	}
+
+	// Consume both and check metadata by payload
+	var withMeta, withoutMeta bool
+	for range 2 {
+		msg, err := pq.ConsumeFromChannel(ctx, "meta-batch", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromChannel failed: %v", err)
+		}
+		switch string(msg.Payload) {
+		case "with-meta":
+			if msg.Metadata == nil {
+				t.Error("with-meta message: expected metadata, got nil")
+			} else if msg.Metadata["key"] != "value" {
+				t.Errorf("with-meta message: expected key=value, got %v", msg.Metadata["key"])
+			}
+			withMeta = true
+		case "no-meta":
+			if len(msg.Metadata) != 0 {
+				t.Errorf("no-meta message: expected empty metadata, got %v", msg.Metadata)
+			}
+			withoutMeta = true
+		}
+	}
+	if !withMeta || !withoutMeta {
+		t.Error("did not receive both messages")
+	}
+}
+
+func TestPublishBatchOrderPreserved(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "order-batch", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := make([]pgqueue.PublishMessage, 10)
+	for i := range messages {
+		messages[i] = pgqueue.PublishMessage{
+			Payload: []byte(fmt.Sprintf("msg-%d", i)),
+		}
+	}
+
+	ids, err := pq.PublishBatch(ctx, "order-batch", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	if len(ids) != 10 {
+		t.Fatalf("expected 10 IDs, got %d", len(ids))
+	}
+
+	// Verify all unique IDs returned
+	idSet := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		if idSet[id] {
+			t.Errorf("duplicate ID: %s", id)
+		}
+		idSet[id] = true
+	}
+
+	// Consume all and verify all payloads present
+	payloadSet := make(map[string]bool)
+	for range 10 {
+		msg, err := pq.ConsumeFromChannel(ctx, "order-batch", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromChannel failed: %v", err)
+		}
+		payloadSet[string(msg.Payload)] = true
+	}
+	for i := range 10 {
+		expected := fmt.Sprintf("msg-%d", i)
+		if !payloadSet[expected] {
+			t.Errorf("missing payload %q", expected)
+		}
+	}
+}
+
+func TestPublishBatchQueueNotFound(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("msg")},
+	}
+
+	_, err := pq.PublishBatch(ctx, "nonexistent", messages)
+	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
+		t.Errorf("expected ErrQueueNotFound, got: %v", err)
+	}
+}
+
+func TestAckChannelBatch(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "ack-batch", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("a1")},
+		{Payload: []byte("a2")},
+		{Payload: []byte("a3")},
+		{Payload: []byte("a4")},
+		{Payload: []byte("a5")},
+	}
+
+	_, err = pq.PublishBatch(ctx, "ack-batch", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	// Consume all
+	consumedIDs := make([]uuid.UUID, 5)
+	for i := 0; i < 5; i++ {
+		msg, err := pq.ConsumeFromChannel(ctx, "ack-batch", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromChannel failed: %v", err)
+		}
+		consumedIDs[i] = msg.ID
+	}
+
+	err = pq.AckChannelBatch(ctx, "ack-batch", consumedIDs)
+	if err != nil {
+		t.Fatalf("AckChannelBatch failed: %v", err)
+	}
+
+	stats, err := pq.GetStats(ctx, "ack-batch", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.CompletedCount != 5 {
+		t.Errorf("expected 5 completed, got %d", stats.CompletedCount)
+	}
+}
+
+func TestAckChannelBatchNoneProcessing(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "ack-none", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("p1")},
+		{Payload: []byte("p2")},
+	}
+	ids, err := pq.PublishBatch(ctx, "ack-none", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	// Not consumed → still pending, not processing
+	err = pq.AckChannelBatch(ctx, "ack-none", ids)
+	if !errors.Is(err, pgqueue.ErrMessageNotFound) {
+		t.Errorf("expected ErrMessageNotFound, got: %v", err)
+	}
+}
+
+func TestAckChannelBatchEmptySlice(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "ack-empty", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	err = pq.AckChannelBatch(ctx, "ack-empty", nil)
+	if err != nil {
+		t.Errorf("expected nil error for empty slice, got: %v", err)
+	}
+}
+
+func TestAckChannelBatchTooLarge(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "ack-large", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	ids := make([]uuid.UUID, pgqueue.MaxBatchSize+1)
+
+	err = pq.AckChannelBatch(ctx, "ack-large", ids)
+	if !errors.Is(err, pgqueue.ErrBatchTooLarge) {
+		t.Errorf("expected ErrBatchTooLarge, got: %v", err)
+	}
+}
+
+func TestAckTopicBatch(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "ack-topic-batch", pgqueue.TopicOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	if err := pq.Subscribe(ctx, "ack-topic-batch", "sub1"); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("t1")},
+		{Payload: []byte("t2")},
+		{Payload: []byte("t3")},
+		{Payload: []byte("t4")},
+		{Payload: []byte("t5")},
+	}
+
+	_, err = pq.PublishBatch(ctx, "ack-topic-batch", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	consumedIDs := make([]uuid.UUID, 5)
+	for i := 0; i < 5; i++ {
+		msg, err := pq.ConsumeFromTopic(ctx, "ack-topic-batch", "sub1", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromTopic failed: %v", err)
+		}
+		consumedIDs[i] = msg.ID
+	}
+
+	err = pq.AckTopicBatch(ctx, "ack-topic-batch", "sub1", consumedIDs)
+	if err != nil {
+		t.Fatalf("AckTopicBatch failed: %v", err)
+	}
+}
+
+func TestAckTopicBatchNoneProcessing(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "ack-topic-none", pgqueue.TopicOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	if err := pq.Subscribe(ctx, "ack-topic-none", "sub1"); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("t1")},
+	}
+	ids, err := pq.PublishBatch(ctx, "ack-topic-none", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	err = pq.AckTopicBatch(ctx, "ack-topic-none", "sub1", ids)
+	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
+		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
+	}
+}
+
+func TestNackChannelBatch(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "nack-batch", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+		MaxRetries:     3,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("n1")},
+		{Payload: []byte("n2")},
+		{Payload: []byte("n3")},
+		{Payload: []byte("n4")},
+		{Payload: []byte("n5")},
+	}
+
+	_, err = pq.PublishBatch(ctx, "nack-batch", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	consumedIDs := make([]uuid.UUID, 5)
+	for i := 0; i < 5; i++ {
+		msg, err := pq.ConsumeFromChannel(ctx, "nack-batch", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromChannel failed: %v", err)
+		}
+		consumedIDs[i] = msg.ID
+	}
+
+	err = pq.NackChannelBatch(ctx, "nack-batch", consumedIDs, "transient error")
+	if err != nil {
+		t.Fatalf("NackChannelBatch failed: %v", err)
+	}
+
+	// All messages should be back to pending
+	stats, err := pq.GetStats(ctx, "nack-batch", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.PendingCount != 5 {
+		t.Errorf("expected 5 pending after nack, got %d", stats.PendingCount)
+	}
+
+	// Verify retry count incremented
+	msg, err := pq.ConsumeFromChannel(ctx, "nack-batch", 30*time.Second)
+	if err != nil {
+		t.Fatalf("ConsumeFromChannel failed: %v", err)
+	}
+	if msg.RetryCount != 1 {
+		t.Errorf("expected retry_count=1, got %d", msg.RetryCount)
+	}
+}
+
+func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "nack-mixed", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+		MaxRetries:     1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("m1")},
+		{Payload: []byte("m2")},
+		{Payload: []byte("m3")},
+	}
+
+	_, err = pq.PublishBatch(ctx, "nack-mixed", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	// First round: consume and nack all (retry_count goes to 1)
+	firstIDs := make([]uuid.UUID, 3)
+	for i := 0; i < 3; i++ {
+		msg, err := pq.ConsumeFromChannel(ctx, "nack-mixed", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromChannel failed: %v", err)
+		}
+		firstIDs[i] = msg.ID
+	}
+
+	err = pq.NackChannelBatch(ctx, "nack-mixed", firstIDs, "first failure")
+	if err != nil {
+		t.Fatalf("first NackChannelBatch failed: %v", err)
+	}
+
+	// Second round: consume and nack again (retry_count 1+1=2 > maxRetry 1 → DLQ)
+	secondIDs := make([]uuid.UUID, 3)
+	for i := 0; i < 3; i++ {
+		msg, err := pq.ConsumeFromChannel(ctx, "nack-mixed", 30*time.Second)
+		if err != nil {
+			t.Fatalf("ConsumeFromChannel round 2 failed: %v", err)
+		}
+		if msg == nil {
+			t.Fatalf("expected message %d in round 2, got nil", i)
+		}
+		secondIDs[i] = msg.ID
+	}
+
+	err = pq.NackChannelBatch(ctx, "nack-mixed", secondIDs, "second failure")
+	if err != nil {
+		t.Fatalf("second NackChannelBatch failed: %v", err)
+	}
+
+	// All 3 should be in DLQ
+	stats, err := pq.GetStats(ctx, "nack-mixed", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.DLQCount != 3 {
+		t.Errorf("expected 3 in DLQ, got %d", stats.DLQCount)
+	}
+	if stats.PendingCount != 0 {
+		t.Errorf("expected 0 pending, got %d", stats.PendingCount)
+	}
+}
+
+func TestNackChannelBatchEmptySlice(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "nack-empty", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	err = pq.NackChannelBatch(ctx, "nack-empty", nil, "error")
+	if err != nil {
+		t.Errorf("expected nil error for empty slice, got: %v", err)
+	}
+}
+
+func TestNackChannelBatchNoneProcessing(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "nack-none", pgqueue.ChannelOptions{
+		MaxMessageSize: testMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	messages := []pgqueue.PublishMessage{
+		{Payload: []byte("p1")},
+	}
+	ids, err := pq.PublishBatch(ctx, "nack-none", messages)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	err = pq.NackChannelBatch(ctx, "nack-none", ids, "error")
+	if !errors.Is(err, pgqueue.ErrMessageNotFound) {
+		t.Errorf("expected ErrMessageNotFound, got: %v", err)
+	}
+}
