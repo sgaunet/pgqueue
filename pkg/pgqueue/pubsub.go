@@ -246,17 +246,33 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 		return nil, nil, fmt.Errorf("failed to query subscription: %w", err)
 	}
 
-	// Update subscription status and visibility timeout
+	return pq.claimTopicSubscription(
+		ctx, tx, tableName, visibilityTimeout,
+		subID, msgID, payload, createdAt, retryCount, metadataJSON,
+	)
+}
+
+//nolint:gosec // G201: table name validated by queueNameRegex
+func (pq *PGQueue) claimTopicSubscription(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	visibilityTimeout time.Duration,
+	subID, msgID uuid.UUID,
+	payload []byte,
+	createdAt time.Time,
+	retryCount int,
+	metadataJSON sql.NullString,
+) (*Message, *time.Time, error) {
 	visTimeout := time.Now().Add(visibilityTimeout)
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = 'processing', visibility_timeout = $1
 		WHERE id = $2
 	`, tableName)
 
-	_, err = tx.ExecContext(ctx, updateQuery, visTimeout, subID)
+	_, err := tx.ExecContext(ctx, updateQuery, visTimeout, subID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to update subscription: %w", err)
 	}

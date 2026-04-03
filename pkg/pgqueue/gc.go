@@ -265,9 +265,6 @@ func (gc *GarbageCollector) getPolicy(queueName string) RetentionPolicy {
 	return gc.config.DefaultPolicy
 }
 
-// purgeCompletedMessages deletes completed messages older than TTL.
-// For channels: deletes messages with status='completed'.
-// For pub/sub: deletes messages where all subscriptions are acked.
 func (gc *GarbageCollector) purgeCompletedMessages(
 	ctx context.Context,
 	tableName string,
@@ -278,7 +275,6 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 
 	var query string
 	if queueType == QueueTypePubSub {
-		//nolint:gosec // G201: table name validated by queueNameRegex
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s m
 			WHERE m.created_at < $1
@@ -288,7 +284,6 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 			)
 		`, tableName, tableName)
 	} else {
-		//nolint:gosec // G201: table name validated by queueNameRegex
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s
 			WHERE status = 'completed'
@@ -309,9 +304,6 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 	return nil
 }
 
-// purgeOldPendingMessages deletes pending messages older than max age.
-// For channels: deletes messages with status='pending'.
-// For pub/sub: deletes messages where any subscription is still pending.
 func (gc *GarbageCollector) purgeOldPendingMessages(
 	ctx context.Context,
 	tableName string,
@@ -322,7 +314,6 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 
 	var query string
 	if queueType == QueueTypePubSub {
-		//nolint:gosec // G201: table name validated by queueNameRegex
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s m
 			WHERE m.created_at < $1
@@ -332,7 +323,6 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 			)
 		`, tableName, tableName)
 	} else {
-		//nolint:gosec // G201: table name validated by queueNameRegex
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s
 			WHERE status = 'pending'

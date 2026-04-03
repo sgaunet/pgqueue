@@ -190,17 +190,34 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 		return nil, nil, fmt.Errorf("failed to query message: %w", err)
 	}
 
-	// Update message status and visibility timeout
+	return pq.claimChannelMessage(
+		ctx, tx, tableName, visibilityTimeout,
+		msgID, payload, createdAt, retryCount, maxRetries, metadataJSON,
+	)
+}
+
+//nolint:gosec // G201: table name validated by queueNameRegex
+func (pq *PGQueue) claimChannelMessage(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	visibilityTimeout time.Duration,
+	msgID uuid.UUID,
+	payload []byte,
+	createdAt time.Time,
+	retryCount int,
+	maxRetries sql.NullInt32,
+	metadataJSON sql.NullString,
+) (*Message, *time.Time, error) {
 	visTimeout := time.Now().Add(visibilityTimeout)
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = 'processing', visibility_timeout = $1
 		WHERE id = $2
 	`, tableName)
 
-	_, err = tx.ExecContext(ctx, updateQuery, visTimeout, msgID)
+	_, err := tx.ExecContext(ctx, updateQuery, visTimeout, msgID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to update message: %w", err)
 	}
