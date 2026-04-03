@@ -239,6 +239,12 @@ func (pq *PGQueue) publishToChannel(
 	metadata []byte,
 	maxRetries int,
 ) error {
+	tx, err := pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	// Insert message atomically with conflict detection
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	insertMsg := fmt.Sprintf(`
@@ -247,7 +253,7 @@ func (pq *PGQueue) publishToChannel(
 		ON CONFLICT (id) DO NOTHING
 	`, tableName)
 
-	result, err := pq.db.ExecContext(
+	result, err := tx.ExecContext(
 		ctx, insertMsg, messageID, payload, metadata, maxRetries,
 	)
 	if err != nil {
@@ -257,6 +263,10 @@ func (pq *PGQueue) publishToChannel(
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
 		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
