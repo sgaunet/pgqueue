@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
-const defaultGCInterval = 5 * time.Minute
+const defaultGCInterval   = 5 * time.Minute
+const defaultGCMaxWorkers = 10
 
 // GarbageCollector handles automatic cleanup of old messages.
 type GarbageCollector struct {
@@ -29,6 +31,9 @@ func NewGarbageCollector(
 	}
 	if config.Policies == nil {
 		config.Policies = make(map[string]RetentionPolicy)
+	}
+	if config.MaxWorkers <= 0 {
+		config.MaxWorkers = defaultGCMaxWorkers
 	}
 
 	return &GarbageCollector{
@@ -112,15 +117,36 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	allQueues = append(allQueues, topics...)
 	allQueues = append(allQueues, channels...)
 
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, gc.config.MaxWorkers)
+
 	for _, queue := range allQueues {
-		if err := gc.collectQueue(ctx, queue); err != nil {
-			gc.pq.logError("failed to collect queue",
-				"queue", queue.QueueName, "error", err,
-			)
-			continue
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return fmt.Errorf("garbage collection cancelled: %w", ctx.Err())
+		case sem <- struct{}{}:
+			wg.Add(1)
+			go func(q QueueMetadata) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				start := time.Now()
+				if err := gc.collectQueue(ctx, q); err != nil {
+					gc.pq.logError("failed to collect queue",
+						"queue", q.QueueName, "error", err,
+						"duration", time.Since(start),
+					)
+				} else if d := time.Since(start); d > 100*time.Millisecond {
+					gc.pq.logInfo("collected queue",
+						"queue", q.QueueName, "duration", d,
+					)
+				}
+			}(queue)
 		}
 	}
 
+	wg.Wait()
 	return nil
 }
 

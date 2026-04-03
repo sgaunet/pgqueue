@@ -210,6 +210,73 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectorParallel(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create multiple channels to test parallel GC
+	const numQueues = 5
+	for i := 0; i < numQueues; i++ {
+		name := "gc-parallel-" + string(rune('a'+i))
+		err := pq.CreateChannel(ctx, name, pgqueue.ChannelOptions{
+			MaxRetries: 3,
+		})
+		if err != nil {
+			t.Fatalf("failed to create channel %s: %v", name, err)
+		}
+
+		// Publish messages and ack some
+		for j := 0; j < 3; j++ {
+			if _, err := pq.Publish(ctx, name, []byte("test message")); err != nil {
+				t.Fatalf("failed to publish message: %v", err)
+			}
+		}
+
+		msg, err := pq.ConsumeFromChannel(ctx, name, 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume message: %v", err)
+		}
+		if err := pq.AckChannel(ctx, name, msg.ID); err != nil {
+			t.Fatalf("failed to ack message: %v", err)
+		}
+	}
+
+	// Wait for processed_at to be set
+	time.Sleep(100 * time.Millisecond)
+
+	// Run parallel GC with MaxWorkers=3 (less than numQueues to test semaphore)
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			CompletedMessageTTL: 1 * time.Millisecond,
+		},
+		MaxWorkers: 3,
+	})
+
+	time.Sleep(10 * time.Millisecond)
+
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("parallel garbage collection failed: %v", err)
+	}
+
+	// Verify all queues were processed
+	for i := 0; i < numQueues; i++ {
+		name := "gc-parallel-" + string(rune('a'+i))
+		stats, err := pq.GetStats(ctx, name, pgqueue.QueueTypeChannel)
+		if err != nil {
+			t.Fatalf("failed to get stats for %s: %v", name, err)
+		}
+
+		if stats.CompletedCount != 0 {
+			t.Errorf("queue %s: expected 0 completed messages after GC, got %d", name, stats.CompletedCount)
+		}
+		if stats.PendingCount != 2 {
+			t.Errorf("queue %s: expected 2 pending messages, got %d", name, stats.PendingCount)
+		}
+	}
+}
+
 func TestPurgeQueue(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()

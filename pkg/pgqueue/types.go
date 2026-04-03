@@ -149,9 +149,10 @@ type RetentionPolicy struct {
 
 // GarbageCollectorConfig holds configuration for the garbage collector.
 type GarbageCollectorConfig struct {
-	Interval time.Duration          // How often to run garbage collection
-	Policies map[string]RetentionPolicy // Policies per queue (queue name -> policy)
-	DefaultPolicy RetentionPolicy    // Default policy for queues without specific policy
+	Interval      time.Duration              // How often to run garbage collection
+	Policies      map[string]RetentionPolicy // Policies per queue (queue name -> policy)
+	DefaultPolicy RetentionPolicy            // Default policy for queues without specific policy
+	MaxWorkers    int                        // Max concurrent GC operations (default: 10)
 }
 
 // ReplayOptions holds options for replay operations.
