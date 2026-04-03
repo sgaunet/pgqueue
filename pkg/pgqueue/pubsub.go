@@ -149,7 +149,7 @@ func (pq *PGQueue) AckTopic(
 	return nil
 }
 
-// NackTopic negatively acknowledges a message for a subscriber (retry).
+// NackTopic negatively acknowledges a message for a subscriber (retry or move to DLQ).
 func (pq *PGQueue) NackTopic(
 	ctx context.Context,
 	topicName, subscriberID string,
@@ -167,6 +167,127 @@ func (pq *PGQueue) NackTopic(
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
+	tx, err := pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := pq.getProcessingSubState(
+		ctx, tx, queueMeta.TableName, messageID, subscriberID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get subscription state: %w", err)
+	}
+
+	maxRetry := pq.resolveMaxRetries(queueMeta)
+
+	if state.retryCount+1 > maxRetry {
+		if err := pq.moveSubToDLQ(
+			ctx, tx, queueMeta.TableName,
+			messageID, subscriberID, errorMsg, state,
+		); err != nil {
+			return fmt.Errorf("failed to move to DLQ: %w", err)
+		}
+	} else {
+		if err := pq.retrySubscription(
+			ctx, tx, queueMeta.TableName,
+			messageID, subscriberID, errorMsg,
+		); err != nil {
+			return fmt.Errorf("failed to retry subscription: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+type subState struct {
+	retryCount   int
+	payload      []byte
+	metadataJSON sql.NullString
+}
+
+func (pq *PGQueue) getProcessingSubState(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	messageID uuid.UUID,
+	subscriberID string,
+) (*subState, error) {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		SELECT s.retry_count, m.payload, m.metadata
+		FROM pgqueue_sub_%s s
+		JOIN pgqueue_msg_%s m ON s.message_id = m.id
+		WHERE s.message_id = $1
+		  AND s.subscriber_id = $2
+		  AND s.status = 'processing'
+		FOR UPDATE OF s
+	`, tableName, tableName)
+
+	var state subState
+
+	err := tx.QueryRowContext(ctx, query, messageID, subscriberID).Scan(
+		&state.retryCount, &state.payload, &state.metadataJSON,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrMessageNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query subscription: %w", err)
+	}
+
+	return &state, nil
+}
+
+func (pq *PGQueue) moveSubToDLQ(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	messageID uuid.UUID,
+	subscriberID, errorMsg string,
+	state *subState,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	dlqQuery := fmt.Sprintf(`
+		INSERT INTO pgqueue_dlq_%s
+			(original_message_id, payload, failure_reason, retry_count, metadata)
+		VALUES ($1, $2, $3, $4, $5)
+	`, tableName)
+
+	_, err := tx.ExecContext(
+		ctx, dlqQuery, messageID, state.payload, errorMsg,
+		state.retryCount+1, state.metadataJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert into DLQ: %w", err)
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	deleteQuery := fmt.Sprintf(
+		`DELETE FROM pgqueue_sub_%s WHERE message_id = $1 AND subscriber_id = $2`,
+		tableName,
+	)
+
+	_, err = tx.ExecContext(ctx, deleteQuery, messageID, subscriberID)
+	if err != nil {
+		return fmt.Errorf("failed to delete subscription: %w", err)
+	}
+
+	return nil
+}
+
+func (pq *PGQueue) retrySubscription(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	messageID uuid.UUID,
+	subscriberID, errorMsg string,
+) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
@@ -176,22 +297,11 @@ func (pq *PGQueue) NackTopic(
 		    error_message = $3
 		WHERE message_id = $1
 		  AND subscriber_id = $2
-		  AND status = 'processing'
-	`, queueMeta.TableName)
+	`, tableName)
 
-	result, err := pq.db.ExecContext(
-		ctx, query, messageID, subscriberID, errorMsg,
-	)
+	_, err := tx.ExecContext(ctx, query, messageID, subscriberID, errorMsg)
 	if err != nil {
-		return fmt.Errorf("failed to nack message: %w", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	if rows == 0 {
-		return ErrMessageNotFound
+		return fmt.Errorf("failed to retry subscription: %w", err)
 	}
 
 	return nil

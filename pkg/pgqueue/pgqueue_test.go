@@ -874,3 +874,65 @@ func TestPauseNonExistentQueue(t *testing.T) {
 		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
 	}
 }
+
+func TestNackTopicMovesToDLQ(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create topic with max 1 retry
+	err := pq.CreateTopic(ctx, "nack-dlq-topic", pgqueue.TopicOptions{
+		MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	err = pq.Subscribe(ctx, "nack-dlq-topic", "sub1")
+	if err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, "nack-dlq-topic", []byte("poison")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// First nack: retry (retryCount 0 + 1 = 1, not > maxRetry 1)
+	msg, err := pq.ConsumeFromTopic(ctx, "nack-dlq-topic", "sub1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.ID, "transient error")
+	if err != nil {
+		t.Fatalf("first nack failed: %v", err)
+	}
+
+	// Second nack: should move to DLQ (retryCount 1 + 1 = 2, > maxRetry 1)
+	msg, err = pq.ConsumeFromTopic(ctx, "nack-dlq-topic", "sub1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume after retry: %v", err)
+	}
+	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.ID, "permanent error")
+	if err != nil {
+		t.Fatalf("second nack failed: %v", err)
+	}
+
+	// Message should no longer be consumable
+	msg, err = pq.ConsumeFromTopic(ctx, "nack-dlq-topic", "sub1", 30*time.Second)
+	if err != nil {
+		t.Fatalf("consume after DLQ failed: %v", err)
+	}
+	if msg != nil {
+		t.Error("expected no message after DLQ move, got one")
+	}
+
+	// Verify DLQ has the message
+	dlqStats, err := pq.GetDLQStats(ctx, "nack-dlq-topic", pgqueue.QueueTypePubSub)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats: %v", err)
+	}
+	if dlqStats.TotalCount != 1 {
+		t.Errorf("expected 1 message in DLQ, got %d", dlqStats.TotalCount)
+	}
+}
