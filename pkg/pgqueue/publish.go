@@ -157,20 +157,22 @@ func (pq *PGQueue) publishToPubSub(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := pq.checkDuplicateMessage(ctx, tx, tableName, messageID); err != nil {
-		return err
-	}
-
-	// Insert message
+	// Insert message atomically with conflict detection
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	insertMsg := fmt.Sprintf(`
 		INSERT INTO pgqueue_msg_%s (id, payload, metadata)
 		VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO NOTHING
 	`, tableName)
 
-	_, err = tx.ExecContext(ctx, insertMsg, messageID, payload, metadata)
+	result, err := tx.ExecContext(ctx, insertMsg, messageID, payload, metadata)
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
 	}
 
 	if err := pq.createSubscriptionRecords(
@@ -182,28 +184,6 @@ func (pq *PGQueue) publishToPubSub(
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
-}
-
-func (pq *PGQueue) checkDuplicateMessage(
-	ctx context.Context,
-	tx *sql.Tx,
-	tableName string,
-	messageID uuid.UUID,
-) error {
-	//nolint:gosec // G201: table name validated by queueNameRegex
-	checkQuery := fmt.Sprintf(
-		`SELECT id FROM pgqueue_msg_%s WHERE id = $1`, tableName,
-	)
-	var existingID uuid.UUID
-	err := tx.QueryRowContext(ctx, checkQuery, messageID).Scan(&existingID)
-	if err == nil {
-		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("failed to check for duplicate: %w", err)
 	}
 
 	return nil
@@ -259,32 +239,24 @@ func (pq *PGQueue) publishToChannel(
 	metadata []byte,
 	maxRetries int,
 ) error {
-	// Check for duplicate message ID (deduplication)
-	//nolint:gosec // G201: table name validated by queueNameRegex
-	checkQuery := fmt.Sprintf(
-		`SELECT id FROM pgqueue_msg_%s WHERE id = $1`, tableName,
-	)
-	var existingID uuid.UUID
-	err := pq.db.QueryRowContext(ctx, checkQuery, messageID).Scan(&existingID)
-	if err == nil {
-		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("failed to check for duplicate: %w", err)
-	}
-
-	// Insert message
+	// Insert message atomically with conflict detection
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	insertMsg := fmt.Sprintf(`
 		INSERT INTO pgqueue_msg_%s (id, payload, status, metadata, max_retries)
 		VALUES ($1, $2, 'pending', $3, $4)
+		ON CONFLICT (id) DO NOTHING
 	`, tableName)
 
-	_, err = pq.db.ExecContext(
+	result, err := pq.db.ExecContext(
 		ctx, insertMsg, messageID, payload, metadata, maxRetries,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
 	}
 
 	return nil
