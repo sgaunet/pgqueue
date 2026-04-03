@@ -229,6 +229,15 @@ func (pq *PGQueue) buildReplayFromQuery(
 	limit int,
 ) string {
 	if queueType == QueueTypeChannel {
+		return pq.buildChannelReplayQuery(tableName, limit)
+	}
+
+	return pq.buildPubSubReplayQuery(tableName, limit)
+}
+
+func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
+	if limit > 0 {
+		//nolint:gosec // G201: table name validated by queueNameRegex
 		return fmt.Sprintf(`
 			UPDATE pgqueue_msg_%s
 			SET status = 'pending',
@@ -237,11 +246,47 @@ func (pq *PGQueue) buildReplayFromQuery(
 			    ack_deadline = NULL,
 			    processed_at = NULL,
 			    error_message = NULL
-			WHERE created_at >= $1
-			AND status != 'pending'
-		`, tableName) + buildLimitSuffix(limit)
+			WHERE id IN (
+				SELECT id FROM pgqueue_msg_%s
+				WHERE created_at >= $1 AND status != 'pending'
+				LIMIT %d
+			)
+		`, tableName, tableName, limit)
 	}
 
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	return fmt.Sprintf(`
+		UPDATE pgqueue_msg_%s
+		SET status = 'pending',
+		    retry_count = 0,
+		    visibility_timeout = NULL,
+		    ack_deadline = NULL,
+		    processed_at = NULL,
+		    error_message = NULL
+		WHERE created_at >= $1
+		AND status != 'pending'
+	`, tableName)
+}
+
+func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
+	if limit > 0 {
+		//nolint:gosec // G201: table name validated by queueNameRegex
+		return fmt.Sprintf(`
+			UPDATE pgqueue_sub_%s
+			SET status = 'pending',
+			    retry_count = 0,
+			    visibility_timeout = NULL,
+			    acked_at = NULL,
+			    error_message = NULL
+			WHERE id IN (
+				SELECT id FROM pgqueue_sub_%s
+				WHERE created_at >= $1 AND status != 'pending'
+				LIMIT %d
+			)
+		`, tableName, tableName, limit)
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
 	return fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = 'pending',
@@ -251,15 +296,7 @@ func (pq *PGQueue) buildReplayFromQuery(
 		    error_message = NULL
 		WHERE created_at >= $1
 		AND status != 'pending'
-	`, tableName) + buildLimitSuffix(limit)
-}
-
-func buildLimitSuffix(limit int) string {
-	if limit > 0 {
-		return fmt.Sprintf(" LIMIT %d", limit)
-	}
-
-	return ""
+	`, tableName)
 }
 
 func (pq *PGQueue) checkMessageExists(

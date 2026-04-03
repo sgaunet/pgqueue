@@ -102,6 +102,60 @@ func TestReplayFrom(t *testing.T) {
 	}
 }
 
+func TestReplayFromWithLimit(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "replay-limit", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	startTime := time.Now()
+	time.Sleep(10 * time.Millisecond)
+
+	// Publish and complete 5 messages
+	for i := 0; i < 5; i++ {
+		if _, err := pq.Publish(ctx, "replay-limit", []byte("msg")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		msg, err := pq.ConsumeFromChannel(ctx, "replay-limit", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if err := pq.AckChannel(ctx, "replay-limit", msg.ID); err != nil {
+			t.Fatalf("failed to ack: %v", err)
+		}
+	}
+
+	// Replay with limit=2 — only 2 of the 5 completed messages should be replayed
+	count, err := pq.ReplayFrom(ctx, "replay-limit", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
+		Confirm: true,
+		Limit:   2,
+	})
+	if err != nil {
+		t.Fatalf("replay with limit failed: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 replayed messages, got %d", count)
+	}
+
+	stats, err := pq.GetStats(ctx, "replay-limit", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats: %v", err)
+	}
+	if stats.PendingCount != 2 {
+		t.Errorf("expected 2 pending messages, got %d", stats.PendingCount)
+	}
+	if stats.CompletedCount != 3 {
+		t.Errorf("expected 3 completed messages, got %d", stats.CompletedCount)
+	}
+}
+
 func TestReplayMessage(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
