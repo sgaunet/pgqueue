@@ -465,3 +465,45 @@ func TestPurgeQueue(t *testing.T) {
 		t.Errorf("expected 0 messages after purge, got %d", depth)
 	}
 }
+
+func TestGarbageCollectorDoubleStop(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		Interval: 100 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go gc.Start(ctx)
+
+	// Let it run briefly
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	// First Stop should work
+	gc.Stop()
+	// Second Stop must not panic
+	gc.Stop()
+}
+
+func TestGarbageCollectorStopWithoutStart(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+
+	// Stop without Start must not block or panic
+	done := make(chan struct{})
+	go func() {
+		gc.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// OK
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() blocked without Start() being called")
+	}
+}

@@ -17,7 +17,8 @@ type GarbageCollector struct {
 	pq       *PGQueue
 	config   GarbageCollectorConfig
 	stopChan chan struct{}
-	doneChan chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // NewGarbageCollector creates a new garbage collector instance.
@@ -40,15 +41,16 @@ func NewGarbageCollector(
 		pq:       pq,
 		config:   config,
 		stopChan: make(chan struct{}),
-		doneChan: make(chan struct{}),
 	}
 }
 
 // Start begins the garbage collection loop.
 func (gc *GarbageCollector) Start(ctx context.Context) {
+	gc.wg.Add(1)
+	defer gc.wg.Done()
+
 	ticker := time.NewTicker(gc.config.Interval)
 	defer ticker.Stop()
-	defer close(gc.doneChan)
 
 	for {
 		select {
@@ -65,9 +67,10 @@ func (gc *GarbageCollector) Start(ctx context.Context) {
 }
 
 // Stop gracefully stops the garbage collector.
+// Safe to call multiple times or before Start().
 func (gc *GarbageCollector) Stop() {
-	close(gc.stopChan)
-	<-gc.doneChan
+	gc.stopOnce.Do(func() { close(gc.stopChan) })
+	gc.wg.Wait()
 }
 
 // PurgeQueue immediately purges all messages from a queue (dangerous operation).
