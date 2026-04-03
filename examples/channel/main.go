@@ -120,7 +120,7 @@ func printStats(
 	fmt.Printf("  Pending: %d\n", stats.PendingCount)
 	fmt.Printf("  Processing: %d\n", stats.ProcessingCount)
 	fmt.Printf("  Completed: %d\n", stats.CompletedCount)
-	fmt.Printf("  Failed (DLQ): %d\n", stats.FailedCount)
+	fmt.Printf("  DLQ: %d\n", stats.DLQCount)
 }
 
 func consumeOrders(

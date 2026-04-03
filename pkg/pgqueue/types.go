@@ -28,8 +28,6 @@ const (
 	MessageStatusProcessing MessageStatus = "processing"
 	// MessageStatusCompleted indicates a message has been successfully processed.
 	MessageStatusCompleted MessageStatus = "completed"
-	// MessageStatusFailed indicates a message has failed processing.
-	MessageStatusFailed MessageStatus = "failed"
 )
 
 // Config holds the configuration for PGQueue.
@@ -124,7 +122,6 @@ type QueueStats struct {
 	PendingCount      int64
 	ProcessingCount   int64
 	CompletedCount    int64
-	FailedCount       int64
 	DLQCount          int64
 	AvgProcessingTime *time.Duration
 	OldestPendingAge  *time.Duration

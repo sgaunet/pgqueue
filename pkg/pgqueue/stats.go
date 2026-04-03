@@ -225,7 +225,6 @@ func (pq *PGQueue) getChannelStats(
 			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
 			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
 			COUNT(*) FILTER (WHERE status = 'completed') AS completed,
-			COUNT(*) FILTER (WHERE status = 'failed') AS failed,
 			AVG(EXTRACT(EPOCH FROM (processed_at - created_at)))
 				FILTER (WHERE processed_at IS NOT NULL) AS avg_processing_time,
 			MIN(created_at)
@@ -240,7 +239,6 @@ func (pq *PGQueue) getChannelStats(
 		&stats.PendingCount,
 		&stats.ProcessingCount,
 		&stats.CompletedCount,
-		&stats.FailedCount,
 		&avgSeconds,
 		&oldestPending,
 	)
@@ -273,7 +271,6 @@ func (pq *PGQueue) getPubSubStats(
 			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
 			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
 			COUNT(*) FILTER (WHERE status = 'acked') AS completed,
-			COUNT(*) FILTER (WHERE status = 'nacked') AS failed,
 			AVG(EXTRACT(EPOCH FROM (acked_at - created_at)))
 				FILTER (WHERE acked_at IS NOT NULL) AS avg_processing_time,
 			MIN(created_at)
@@ -288,7 +285,6 @@ func (pq *PGQueue) getPubSubStats(
 		&stats.PendingCount,
 		&stats.ProcessingCount,
 		&stats.CompletedCount,
-		&stats.FailedCount,
 		&avgSeconds,
 		&oldestPending,
 	)
