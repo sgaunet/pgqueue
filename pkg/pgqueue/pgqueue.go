@@ -204,11 +204,9 @@ func (pq *PGQueue) ListChannels(
 }
 
 // Close closes the database connection.
+// Close releases internal resources held by PGQueue.
+// It does NOT close the underlying *sql.DB, which is owned by the caller.
 func (pq *PGQueue) Close() error {
-	if err := pq.db.Close(); err != nil {
-		return fmt.Errorf("failed to close database: %w", err)
-	}
-
 	return nil
 }
 

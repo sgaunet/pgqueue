@@ -16,7 +16,7 @@ import (
 
 // TestPublishAfterConnectionLoss tests behavior when connection is lost during publish
 func TestPublishAfterConnectionLoss(t *testing.T) {
-	pq, _, cleanup := setupTestDB(t)
+	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -33,8 +33,8 @@ func TestPublishAfterConnectionLoss(t *testing.T) {
 		t.Fatalf("failed to publish message: %v", err)
 	}
 
-	// Close the database connection
-	if err := pq.Close(); err != nil {
+	// Close the database connection directly (caller owns the DB)
+	if err := db.Close(); err != nil {
 		t.Fatalf("failed to close database: %v", err)
 	}
 
