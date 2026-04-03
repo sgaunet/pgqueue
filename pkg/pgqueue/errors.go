@@ -32,6 +32,9 @@ var (
 	// ErrPurgeNotConfirmed is returned when PurgeQueue is called without confirm=true.
 	ErrPurgeNotConfirmed = errors.New("purge operation requires explicit confirmation")
 
+	// ErrDeleteNotConfirmed is returned when DeleteChannel/DeleteTopic is called without confirm=true.
+	ErrDeleteNotConfirmed = errors.New("delete operation requires explicit confirmation")
+
 	// ErrDuplicateMessageID is returned when publishing a message with an ID that already exists.
 	ErrDuplicateMessageID = errors.New("duplicate message ID")
 

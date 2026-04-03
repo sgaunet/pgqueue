@@ -159,6 +159,26 @@ func (pq *PGQueue) CreateChannel(
 	return pq.createQueue(ctx, QueueTypeChannel, name, opts)
 }
 
+// DeleteTopic deletes a pub/sub topic and all associated resources.
+// Requires confirm=true as a safety measure to prevent accidental deletion.
+func (pq *PGQueue) DeleteTopic(
+	ctx context.Context,
+	name string,
+	confirm bool,
+) error {
+	return pq.deleteQueue(ctx, QueueTypePubSub, name, confirm)
+}
+
+// DeleteChannel deletes a point-to-point channel and all associated resources.
+// Requires confirm=true as a safety measure to prevent accidental deletion.
+func (pq *PGQueue) DeleteChannel(
+	ctx context.Context,
+	name string,
+	confirm bool,
+) error {
+	return pq.deleteQueue(ctx, QueueTypeChannel, name, confirm)
+}
+
 // ListTopics returns all pub/sub topics.
 func (pq *PGQueue) ListTopics(
 	ctx context.Context,
@@ -250,6 +270,80 @@ func (pq *PGQueue) createQueue(
 	}
 
 	return nil
+}
+
+// deleteQueue is the internal implementation for deleting queues.
+func (pq *PGQueue) deleteQueue(
+	ctx context.Context,
+	queueType QueueType,
+	name string,
+	confirm bool,
+) error {
+	if !confirm {
+		return ErrDeleteNotConfirmed
+	}
+
+	if err := pq.validateQueueName(name); err != nil {
+		return err
+	}
+
+	// Verify queue exists
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%s/%s: %w", queueType, name, ErrQueueNotFound)
+		}
+
+		return fmt.Errorf("failed to get queue metadata: %w", err)
+	}
+
+	// Begin transaction
+	tx, err := pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Drop queue-specific tables and clean up global tables
+	if err := pq.executeDelete(ctx, tx, queueType, name, metadata.TableName); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+func (pq *PGQueue) executeDelete(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueType QueueType,
+	name, tableName string,
+) error {
+	// For pub/sub, drop subscription table first (has FK to msg table)
+	if queueType == QueueTypePubSub {
+		dropSub := "DROP TABLE IF EXISTS pgqueue_sub_" + tableName //nolint:gosec // G201: table name validated
+		if _, err := tx.ExecContext(ctx, dropSub); err != nil {
+			return fmt.Errorf("failed to drop subscription table: %w", err)
+		}
+	}
+
+	// Drop DLQ table
+	dropDLQ := "DROP TABLE IF EXISTS pgqueue_dlq_" + tableName //nolint:gosec // G201: table name validated
+	if _, err := tx.ExecContext(ctx, dropDLQ); err != nil {
+		return fmt.Errorf("failed to drop DLQ table: %w", err)
+	}
+
+	// Drop message table
+	dropMsg := "DROP TABLE IF EXISTS pgqueue_msg_" + tableName //nolint:gosec // G201: table name validated
+	if _, err := tx.ExecContext(ctx, dropMsg); err != nil {
+		return fmt.Errorf("failed to drop message table: %w", err)
+	}
+
+	// Clean up global tables (metadata, subscribers, replay log)
+	return pq.deleteQueueMetadata(ctx, tx, string(queueType), name)
 }
 
 func (pq *PGQueue) validateQueueName(name string) error {

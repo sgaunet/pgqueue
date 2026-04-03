@@ -3,6 +3,7 @@ package pgqueue_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -427,4 +428,199 @@ func TestMessageOrdering(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestDeleteChannel(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	pq, err := pgqueue.Init(ctx, pgqueue.Config{
+		DB: db,
+	})
+	if err != nil {
+		t.Fatalf("failed to init pgqueue: %v", err)
+	}
+
+	// Create a channel and publish a message
+	err = pq.CreateChannel(ctx, "delete-me", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	_, err = pq.Publish(ctx, "delete-me", []byte(`{"test": true}`))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Delete the channel
+	err = pq.DeleteChannel(ctx, "delete-me", true)
+	if err != nil {
+		t.Fatalf("failed to delete channel: %v", err)
+	}
+
+	// Verify channel no longer appears in list
+	channels, err := pq.ListChannels(ctx)
+	if err != nil {
+		t.Fatalf("failed to list channels: %v", err)
+	}
+
+	if len(channels) != 0 {
+		t.Fatalf("expected 0 channels after delete, got %d", len(channels))
+	}
+
+	// Verify tables are dropped
+	var tableCount int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = 'public'
+		AND table_name IN ('pgqueue_msg_delete_me', 'pgqueue_dlq_delete_me')
+	`).Scan(&tableCount)
+	if err != nil {
+		t.Fatalf("failed to check tables: %v", err)
+	}
+
+	if tableCount != 0 {
+		t.Fatalf("expected 0 queue tables after delete, got %d", tableCount)
+	}
+
+	// Verify we can recreate the same channel
+	err = pq.CreateChannel(ctx, "delete-me", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to recreate channel after delete: %v", err)
+	}
+}
+
+func TestDeleteTopic(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	pq, err := pgqueue.Init(ctx, pgqueue.Config{
+		DB: db,
+	})
+	if err != nil {
+		t.Fatalf("failed to init pgqueue: %v", err)
+	}
+
+	// Create a topic with a subscriber
+	err = pq.CreateTopic(ctx, "delete-topic", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	err = pq.Subscribe(ctx, "delete-topic", "sub1")
+	if err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	_, err = pq.Publish(ctx, "delete-topic", []byte(`{"event": "test"}`))
+	if err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Delete the topic
+	err = pq.DeleteTopic(ctx, "delete-topic", true)
+	if err != nil {
+		t.Fatalf("failed to delete topic: %v", err)
+	}
+
+	// Verify topic no longer appears in list
+	topics, err := pq.ListTopics(ctx)
+	if err != nil {
+		t.Fatalf("failed to list topics: %v", err)
+	}
+
+	if len(topics) != 0 {
+		t.Fatalf("expected 0 topics after delete, got %d", len(topics))
+	}
+
+	// Verify all tables are dropped (msg, sub, dlq)
+	var tableCount int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = 'public'
+		AND table_name IN ('pgqueue_msg_delete_topic', 'pgqueue_sub_delete_topic', 'pgqueue_dlq_delete_topic')
+	`).Scan(&tableCount)
+	if err != nil {
+		t.Fatalf("failed to check tables: %v", err)
+	}
+
+	if tableCount != 0 {
+		t.Fatalf("expected 0 queue tables after delete, got %d", tableCount)
+	}
+
+	// Verify subscriber registrations are cleaned up
+	var subCount int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM pgqueue_subscribers WHERE topic_name = 'delete-topic'
+	`).Scan(&subCount)
+	if err != nil {
+		t.Fatalf("failed to check subscribers: %v", err)
+	}
+
+	if subCount != 0 {
+		t.Fatalf("expected 0 subscribers after delete, got %d", subCount)
+	}
+}
+
+func TestDeleteChannelNotConfirmed(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	pq, err := pgqueue.Init(ctx, pgqueue.Config{
+		DB: db,
+	})
+	if err != nil {
+		t.Fatalf("failed to init pgqueue: %v", err)
+	}
+
+	err = pq.CreateChannel(ctx, "no-delete", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Attempt delete without confirmation
+	err = pq.DeleteChannel(ctx, "no-delete", false)
+	if !errors.Is(err, pgqueue.ErrDeleteNotConfirmed) {
+		t.Fatalf("expected ErrDeleteNotConfirmed, got: %v", err)
+	}
+
+	// Verify channel still exists
+	channels, err := pq.ListChannels(ctx)
+	if err != nil {
+		t.Fatalf("failed to list channels: %v", err)
+	}
+
+	if len(channels) != 1 {
+		t.Fatalf("expected channel to still exist, got %d channels", len(channels))
+	}
+}
+
+func TestDeleteNonExistentQueue(t *testing.T) {
+	db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	pq, err := pgqueue.Init(ctx, pgqueue.Config{
+		DB: db,
+	})
+	if err != nil {
+		t.Fatalf("failed to init pgqueue: %v", err)
+	}
+
+	err = pq.DeleteChannel(ctx, "ghost-queue", true)
+	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
+		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
+	}
+
+	err = pq.DeleteTopic(ctx, "ghost-topic", true)
+	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
+		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
+	}
 }

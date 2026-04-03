@@ -217,6 +217,36 @@ func (pq *PGQueue) getActiveSubscribers(
 	return items, nil
 }
 
+// Delete query methods
+
+func (pq *PGQueue) deleteQueueMetadata(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueType, queueName string,
+) error {
+	// Delete replay log entries for this queue
+	replayQuery := `DELETE FROM pgqueue_replay_log WHERE queue_type = $1 AND queue_name = $2`
+	if _, err := tx.ExecContext(ctx, replayQuery, queueType, queueName); err != nil {
+		return fmt.Errorf("failed to delete replay log entries: %w", err)
+	}
+
+	// For pub/sub, delete subscriber registrations
+	if queueType == string(QueueTypePubSub) {
+		subQuery := `DELETE FROM pgqueue_subscribers WHERE topic_name = $1`
+		if _, err := tx.ExecContext(ctx, subQuery, queueName); err != nil {
+			return fmt.Errorf("failed to delete subscriber registrations: %w", err)
+		}
+	}
+
+	// Delete metadata entry
+	metaQuery := `DELETE FROM pgqueue_metadata WHERE queue_type = $1 AND queue_name = $2`
+	if _, err := tx.ExecContext(ctx, metaQuery, queueType, queueName); err != nil {
+		return fmt.Errorf("failed to delete queue metadata: %w", err)
+	}
+
+	return nil
+}
+
 // Replay log query methods
 
 func (pq *PGQueue) createReplayLog(
