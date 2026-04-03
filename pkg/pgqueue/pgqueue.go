@@ -286,8 +286,12 @@ func (pq *PGQueue) createQueue(
 		return fmt.Errorf("failed to check queue existence: %w", err)
 	}
 
-	// Sanitize table name
+	// Sanitize table name and check for collisions
 	tableName := sanitizeTableName(name)
+
+	if err := pq.checkTableNameNotExists(ctx, tableName); err != nil {
+		return fmt.Errorf("failed to check table name collision: %w", err)
+	}
 
 	// Marshal options to JSON
 	configJSON, err := json.Marshal(opts)
@@ -311,6 +315,24 @@ func (pq *PGQueue) createQueue(
 	}
 
 	// Create queue tables based on type
+	if err := pq.createQueueTables(ctx, tx, queueType, tableName); err != nil {
+		return err
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+func (pq *PGQueue) createQueueTables(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueType QueueType,
+	tableName string,
+) error {
 	if queueType == QueueTypePubSub {
 		if err := pq.createPubSubTables(ctx, tx, tableName); err != nil {
 			return fmt.Errorf("failed to create pub/sub tables: %w", err)
@@ -319,11 +341,6 @@ func (pq *PGQueue) createQueue(
 		if err := pq.createChannelTables(ctx, tx, tableName); err != nil {
 			return fmt.Errorf("failed to create channel tables: %w", err)
 		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil

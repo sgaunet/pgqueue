@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -99,6 +100,29 @@ func (pq *PGQueue) createQueueMetadata(
 	}
 
 	return &meta, nil
+}
+
+func (pq *PGQueue) checkTableNameNotExists(
+	ctx context.Context,
+	tableName string,
+) error {
+	query := `SELECT queue_name FROM pgqueue_metadata WHERE table_name = $1 LIMIT 1`
+
+	var existingName string
+
+	err := pq.db.QueryRowContext(ctx, query, tableName).Scan(&existingName)
+	if err == nil {
+		return fmt.Errorf(
+			"table name %q conflicts with existing queue %q: %w",
+			tableName, existingName, ErrQueueAlreadyExists,
+		)
+	}
+
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check table name: %w", err)
+	}
+
+	return nil
 }
 
 func (pq *PGQueue) listQueuesRaw(

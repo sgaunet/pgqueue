@@ -118,6 +118,31 @@ func TestDuplicateQueueCreation(t *testing.T) {
 	}
 }
 
+func TestTableNameCollision(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel with a hyphenated name
+	err := pq.CreateChannel(ctx, "my-queue", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Creating a channel whose sanitized table name collides should fail
+	err = pq.CreateChannel(ctx, "my_queue", pgqueue.ChannelOptions{})
+	if !errors.Is(err, pgqueue.ErrQueueAlreadyExists) {
+		t.Errorf("expected ErrQueueAlreadyExists, got %v", err)
+	}
+
+	// Also test cross-type collision: topic with colliding table name
+	err = pq.CreateTopic(ctx, "my_queue", pgqueue.TopicOptions{})
+	if !errors.Is(err, pgqueue.ErrQueueAlreadyExists) {
+		t.Errorf("expected cross-type ErrQueueAlreadyExists, got %v", err)
+	}
+}
+
 // TestInvalidQueueNames tests creating queues with invalid names
 func TestInvalidQueueNames(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
