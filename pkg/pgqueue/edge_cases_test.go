@@ -386,3 +386,107 @@ func TestPublishWithID_ConcurrentDuplicates(t *testing.T) {
 		t.Errorf("expected queue depth 1, got %d", depth)
 	}
 }
+
+// TestBinaryAndEmptyPayload verifies that BYTEA storage handles arbitrary binary
+// data and empty payloads with bit-perfect integrity.
+func TestBinaryAndEmptyPayload(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	t.Run("binary_null_bytes", func(t *testing.T) {
+		err := pq.CreateChannel(ctx, "binary-null", pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		payload := []byte{0x00, 0x01, 0x02, 0xFF, 0x00, 0xFE}
+		if _, err := pq.Publish(ctx, "binary-null", payload); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		msg, err := pq.ConsumeFromChannel(ctx, "binary-null", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if !bytes.Equal(msg.Payload, payload) {
+			t.Errorf("payload mismatch: expected %x, got %x", payload, msg.Payload)
+		}
+	})
+
+	t.Run("non_utf8", func(t *testing.T) {
+		err := pq.CreateChannel(ctx, "binary-nonutf8", pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		payload := []byte{0x80, 0x81, 0xFE, 0xFF, 0xC0, 0xC1}
+		if _, err := pq.Publish(ctx, "binary-nonutf8", payload); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		msg, err := pq.ConsumeFromChannel(ctx, "binary-nonutf8", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if !bytes.Equal(msg.Payload, payload) {
+			t.Errorf("payload mismatch: expected %x, got %x", payload, msg.Payload)
+		}
+	})
+
+	t.Run("empty_payload", func(t *testing.T) {
+		err := pq.CreateChannel(ctx, "binary-empty", pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		payload := []byte{}
+		if _, err := pq.Publish(ctx, "binary-empty", payload); err != nil {
+			t.Fatalf("failed to publish empty payload: %v", err)
+		}
+
+		msg, err := pq.ConsumeFromChannel(ctx, "binary-empty", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if msg.Payload == nil {
+			t.Error("expected empty []byte, got nil")
+		}
+		if len(msg.Payload) != 0 {
+			t.Errorf("expected empty payload, got %d bytes", len(msg.Payload))
+		}
+	})
+
+	t.Run("mixed_binary_text", func(t *testing.T) {
+		err := pq.CreateChannel(ctx, "binary-mixed", pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		payload := append([]byte("hello\x00world"), 0xFF, 0x00)
+		if _, err := pq.Publish(ctx, "binary-mixed", payload); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		msg, err := pq.ConsumeFromChannel(ctx, "binary-mixed", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if !bytes.Equal(msg.Payload, payload) {
+			t.Errorf("payload mismatch: expected %x, got %x", payload, msg.Payload)
+		}
+	})
+}

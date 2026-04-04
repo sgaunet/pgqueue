@@ -67,6 +67,6 @@ var (
 
 	// ErrInvalidVisibilityTimeout is returned when the visibility timeout is out of bounds.
 	ErrInvalidVisibilityTimeout = errors.New(
-		"visibility timeout must be between 1s and 24h",
+		"visibility timeout must be between 1ms and 24h",
 	)
 )

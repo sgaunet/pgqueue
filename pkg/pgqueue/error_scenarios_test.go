@@ -457,10 +457,10 @@ func TestVisibilityTimeoutBounds(t *testing.T) {
 		t.Errorf("zero timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
 	}
 
-	// Sub-second timeout should be rejected
-	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 500*time.Millisecond)
+	// Sub-millisecond timeout should be rejected
+	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 500*time.Microsecond)
 	if !errors.Is(err, pgqueue.ErrInvalidVisibilityTimeout) {
-		t.Errorf("500ms timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
+		t.Errorf("500µs timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
 	}
 
 	// Over 24h should be rejected

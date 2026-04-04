@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 	"github.com/testcontainers/testcontainers-go"
@@ -934,5 +936,448 @@ func TestNackTopicMovesToDLQ(t *testing.T) {
 	}
 	if dlqStats.TotalCount != 1 {
 		t.Errorf("expected 1 message in DLQ, got %d", dlqStats.TotalCount)
+	}
+}
+
+func TestConcurrentConsumeExactlyOnce(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "concurrent-consume", pgqueue.ChannelOptions{})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	const messageCount = 50
+	const workerCount = 10
+
+	// Publish messages with distinct payloads
+	for i := range messageCount {
+		_, err := pq.Publish(ctx, "concurrent-consume", fmt.Appendf(nil, "msg-%d", i))
+		if err != nil {
+			t.Fatalf("failed to publish message %d: %v", i, err)
+		}
+	}
+
+	// Spawn concurrent consumers
+	var mu sync.Mutex
+	consumed := make(map[uuid.UUID]int)
+	var wg sync.WaitGroup
+
+	wg.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wg.Done()
+			for {
+				msg, err := pq.ConsumeFromChannel(ctx, "concurrent-consume", 30*time.Second)
+				if err != nil {
+					t.Errorf("consume error: %v", err)
+					return
+				}
+				if msg == nil {
+					return // Queue empty
+				}
+				if err := pq.AckChannel(ctx, "concurrent-consume", msg.ID); err != nil {
+					t.Errorf("ack error: %v", err)
+					return
+				}
+				mu.Lock()
+				consumed[msg.ID]++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify exactly-once: all messages consumed, no duplicates
+	if len(consumed) != messageCount {
+		t.Errorf("expected %d unique messages, got %d", messageCount, len(consumed))
+	}
+	for id, count := range consumed {
+		if count != 1 {
+			t.Errorf("message %s consumed %d times (expected 1)", id, count)
+		}
+	}
+}
+
+func TestUnsubscribe(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	t.Run("unsubscribe_stops_new_deliveries", func(t *testing.T) {
+		err := pq.CreateTopic(ctx, "unsub-test", pgqueue.TopicOptions{})
+		if err != nil {
+			t.Fatalf("failed to create topic: %v", err)
+		}
+
+		if err := pq.Subscribe(ctx, "unsub-test", "sub-active"); err != nil {
+			t.Fatalf("failed to subscribe sub-active: %v", err)
+		}
+		if err := pq.Subscribe(ctx, "unsub-test", "sub-leaving"); err != nil {
+			t.Fatalf("failed to subscribe sub-leaving: %v", err)
+		}
+
+		// Publish before unsubscribe — both get subscription records
+		if _, err := pq.Publish(ctx, "unsub-test", []byte("before-unsub")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		if err := pq.Unsubscribe(ctx, "unsub-test", "sub-leaving"); err != nil {
+			t.Fatalf("failed to unsubscribe: %v", err)
+		}
+
+		// Publish after unsubscribe — only sub-active gets subscription
+		if _, err := pq.Publish(ctx, "unsub-test", []byte("after-unsub")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		// sub-active should get both messages
+		for i := range 2 {
+			msg, err := pq.ConsumeFromTopic(ctx, "unsub-test", "sub-active", 30*time.Second)
+			if err != nil {
+				t.Fatalf("sub-active consume %d failed: %v", i, err)
+			}
+			if msg == nil {
+				t.Fatalf("sub-active expected message %d, got nil", i)
+			}
+			if err := pq.AckTopic(ctx, "unsub-test", "sub-active", msg.ID); err != nil {
+				t.Fatalf("sub-active ack failed: %v", err)
+			}
+		}
+
+		// sub-leaving should only get the one published before unsubscribe
+		msg, err := pq.ConsumeFromTopic(ctx, "unsub-test", "sub-leaving", 30*time.Second)
+		if err != nil {
+			t.Fatalf("sub-leaving consume failed: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("sub-leaving expected 1 message, got nil")
+		}
+		if string(msg.Payload) != "before-unsub" {
+			t.Errorf("sub-leaving expected 'before-unsub', got '%s'", msg.Payload)
+		}
+		if err := pq.AckTopic(ctx, "unsub-test", "sub-leaving", msg.ID); err != nil {
+			t.Fatalf("sub-leaving ack failed: %v", err)
+		}
+
+		// No more messages for sub-leaving
+		msg, err = pq.ConsumeFromTopic(ctx, "unsub-test", "sub-leaving", 30*time.Second)
+		if err != nil {
+			t.Fatalf("sub-leaving second consume failed: %v", err)
+		}
+		if msg != nil {
+			t.Error("sub-leaving should have no more messages")
+		}
+	})
+
+	t.Run("unsubscribed_can_ack_pending", func(t *testing.T) {
+		err := pq.CreateTopic(ctx, "unsub-ack", pgqueue.TopicOptions{})
+		if err != nil {
+			t.Fatalf("failed to create topic: %v", err)
+		}
+		if err := pq.Subscribe(ctx, "unsub-ack", "sub-x"); err != nil {
+			t.Fatalf("failed to subscribe: %v", err)
+		}
+
+		if _, err := pq.Publish(ctx, "unsub-ack", []byte("pending-msg")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		// Consume (sets processing)
+		msg, err := pq.ConsumeFromTopic(ctx, "unsub-ack", "sub-x", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+
+		// Unsubscribe while processing
+		if err := pq.Unsubscribe(ctx, "unsub-ack", "sub-x"); err != nil {
+			t.Fatalf("failed to unsubscribe: %v", err)
+		}
+
+		// Ack should still work
+		if err := pq.AckTopic(ctx, "unsub-ack", "sub-x", msg.ID); err != nil {
+			t.Fatalf("ack after unsubscribe should succeed: %v", err)
+		}
+	})
+
+	t.Run("resubscribe_reactivates", func(t *testing.T) {
+		err := pq.CreateTopic(ctx, "unsub-resub", pgqueue.TopicOptions{})
+		if err != nil {
+			t.Fatalf("failed to create topic: %v", err)
+		}
+		if err := pq.Subscribe(ctx, "unsub-resub", "sub-r"); err != nil {
+			t.Fatalf("failed to subscribe: %v", err)
+		}
+
+		if err := pq.Unsubscribe(ctx, "unsub-resub", "sub-r"); err != nil {
+			t.Fatalf("failed to unsubscribe: %v", err)
+		}
+
+		// Verify inactive
+		var active bool
+		err = db.QueryRowContext(ctx,
+			"SELECT active FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
+			"unsub-resub", "sub-r",
+		).Scan(&active)
+		if err != nil {
+			t.Fatalf("failed to query active state: %v", err)
+		}
+		if active {
+			t.Error("expected subscriber to be inactive after unsubscribe")
+		}
+
+		// Re-subscribe
+		if err := pq.Subscribe(ctx, "unsub-resub", "sub-r"); err != nil {
+			t.Fatalf("failed to re-subscribe: %v", err)
+		}
+
+		// Publish and consume
+		if _, err := pq.Publish(ctx, "unsub-resub", []byte("after-resub")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+		msg, err := pq.ConsumeFromTopic(ctx, "unsub-resub", "sub-r", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume after re-subscribe: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message after re-subscribe, got nil")
+		}
+	})
+}
+
+func TestMessageMetadataRoundTrip(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	t.Run("channel_metadata", func(t *testing.T) {
+		err := pq.CreateChannel(ctx, "meta-ch", pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		metadata := map[string]any{
+			"key":   "value",
+			"count": float64(42),
+			"nested": map[string]any{
+				"a": "b",
+			},
+			"tags": []any{"x", "y"},
+		}
+
+		_, err = pq.PublishWithID(ctx, "meta-ch", uuid.UUID{}, []byte("meta-payload"), metadata)
+		if err != nil {
+			t.Fatalf("failed to publish with metadata: %v", err)
+		}
+
+		msg, err := pq.ConsumeFromChannel(ctx, "meta-ch", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if msg.Metadata == nil {
+			t.Fatal("expected metadata, got nil")
+		}
+		if msg.Metadata["key"] != "value" {
+			t.Errorf("expected key='value', got %v", msg.Metadata["key"])
+		}
+		if msg.Metadata["count"] != float64(42) {
+			t.Errorf("expected count=42, got %v", msg.Metadata["count"])
+		}
+		nested, ok := msg.Metadata["nested"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected nested to be map, got %T", msg.Metadata["nested"])
+		}
+		if nested["a"] != "b" {
+			t.Errorf("expected nested.a='b', got %v", nested["a"])
+		}
+		tags, ok := msg.Metadata["tags"].([]any)
+		if !ok {
+			t.Fatalf("expected tags to be slice, got %T", msg.Metadata["tags"])
+		}
+		if len(tags) != 2 || tags[0] != "x" || tags[1] != "y" {
+			t.Errorf("expected tags=[x,y], got %v", tags)
+		}
+	})
+
+	t.Run("topic_metadata", func(t *testing.T) {
+		err := pq.CreateTopic(ctx, "meta-topic", pgqueue.TopicOptions{})
+		if err != nil {
+			t.Fatalf("failed to create topic: %v", err)
+		}
+		if err := pq.Subscribe(ctx, "meta-topic", "sub-m"); err != nil {
+			t.Fatalf("failed to subscribe: %v", err)
+		}
+
+		metadata := map[string]any{"source": "test", "priority": float64(1)}
+		_, err = pq.PublishWithID(ctx, "meta-topic", uuid.UUID{}, []byte("topic-meta"), metadata)
+		if err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		msg, err := pq.ConsumeFromTopic(ctx, "meta-topic", "sub-m", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if msg.Metadata["source"] != "test" {
+			t.Errorf("expected source='test', got %v", msg.Metadata["source"])
+		}
+		if msg.Metadata["priority"] != float64(1) {
+			t.Errorf("expected priority=1, got %v", msg.Metadata["priority"])
+		}
+	})
+
+	t.Run("nil_metadata", func(t *testing.T) {
+		err := pq.CreateChannel(ctx, "meta-nil", pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		_, err = pq.Publish(ctx, "meta-nil", []byte("no-meta"))
+		if err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+
+		msg, err := pq.ConsumeFromChannel(ctx, "meta-nil", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if msg == nil {
+			t.Fatal("expected message, got nil")
+		}
+		if msg.Metadata != nil {
+			t.Errorf("expected nil metadata, got %v", msg.Metadata)
+		}
+	})
+}
+
+func TestPublishToTopicNoSubscribers(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "no-subs-topic", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	// Publish with zero subscribers — should succeed
+	msgID, err := pq.Publish(ctx, "no-subs-topic", []byte("orphan-message"))
+	if err != nil {
+		t.Fatalf("failed to publish to topic with no subscribers: %v", err)
+	}
+	if msgID == (uuid.UUID{}) {
+		t.Error("expected non-zero message ID")
+	}
+
+	// Message should exist in message table
+	var msgCount int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_msg_no_subs_topic",
+	).Scan(&msgCount)
+	if err != nil {
+		t.Fatalf("failed to count messages: %v", err)
+	}
+	if msgCount != 1 {
+		t.Errorf("expected 1 message in table, got %d", msgCount)
+	}
+
+	// No subscription records should exist
+	var subCount int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_sub_no_subs_topic",
+	).Scan(&subCount)
+	if err != nil {
+		t.Fatalf("failed to count subscriptions: %v", err)
+	}
+	if subCount != 0 {
+		t.Errorf("expected 0 subscription records, got %d", subCount)
+	}
+
+	// Late subscriber only sees messages published after subscribing
+	if err := pq.Subscribe(ctx, "no-subs-topic", "late-sub"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, "no-subs-topic", []byte("visible-message")); err != nil {
+		t.Fatalf("failed to publish second message: %v", err)
+	}
+
+	msg, err := pq.ConsumeFromTopic(ctx, "no-subs-topic", "late-sub", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected message for late subscriber, got nil")
+	}
+	if string(msg.Payload) != "visible-message" {
+		t.Errorf("expected 'visible-message', got '%s'", msg.Payload)
+	}
+
+	// No more messages — the orphan message has no subscription record
+	if err := pq.AckTopic(ctx, "no-subs-topic", "late-sub", msg.ID); err != nil {
+		t.Fatalf("failed to ack: %v", err)
+	}
+	msg, err = pq.ConsumeFromTopic(ctx, "no-subs-topic", "late-sub", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume again: %v", err)
+	}
+	if msg != nil {
+		t.Error("expected no more messages for late subscriber")
+	}
+}
+
+func TestAckTopicWithoutConsume(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "ack-no-consume", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "ack-no-consume", "sub-eager"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	msgID, err := pq.Publish(ctx, "ack-no-consume", []byte("not-yet-consumed"))
+	if err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Try to ack without consuming — subscription is in 'pending' state, not 'processing'.
+	// AckTopic requires status='processing', so rows=0 and it returns ErrMessageAlreadyAcked
+	// (this sentinel covers both "never consumed" and "already acked" cases).
+	err = pq.AckTopic(ctx, "ack-no-consume", "sub-eager", msgID)
+	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
+		t.Fatalf("expected ErrMessageAlreadyAcked, got: %v", err)
+	}
+
+	// Message should still be consumable
+	msg, err := pq.ConsumeFromTopic(ctx, "ack-no-consume", "sub-eager", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected message to still be consumable after failed ack")
+	}
+	if msg.ID != msgID {
+		t.Errorf("expected message ID %s, got %s", msgID, msg.ID)
 	}
 }

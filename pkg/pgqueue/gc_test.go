@@ -2,6 +2,7 @@ package pgqueue_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -505,5 +506,303 @@ func TestGarbageCollectorStopWithoutStart(t *testing.T) {
 		// OK
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop() blocked without Start() being called")
+	}
+}
+
+func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "gc-pubsub-vt", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "gc-pubsub-vt", "sub-vt"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, "gc-pubsub-vt", []byte("timeout-msg")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Consume with minimum visibility timeout (1s)
+	msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-vt", "sub-vt", 1*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected message, got nil")
+	}
+
+	// Wait for visibility timeout to expire
+	time.Sleep(1100 * time.Millisecond)
+
+	// GC should reset timed-out subscription back to pending
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	// Verify message is consumable again via subscriber lag
+	lag, err := pq.GetSubscriberLag(ctx, "gc-pubsub-vt", "sub-vt")
+	if err != nil {
+		t.Fatalf("failed to get subscriber lag: %v", err)
+	}
+	if lag.PendingCount != 1 {
+		t.Errorf("expected 1 pending after timeout reset, got %d", lag.PendingCount)
+	}
+
+	// Re-consume should return the same message
+	msg2, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-vt", "sub-vt", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to re-consume: %v", err)
+	}
+	if msg2 == nil {
+		t.Fatal("expected message after timeout reset, got nil")
+	}
+	if msg2.ID != msg.ID {
+		t.Errorf("expected same message ID after reset, got different")
+	}
+}
+
+func TestGarbageCollectorMaxPendingAge(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	t.Run("channel", func(t *testing.T) {
+		err := pq.CreateChannel(ctx, "gc-maxage-ch", pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		// Publish 3 messages that will be backdated
+		for i := range 3 {
+			if _, err := pq.Publish(ctx, "gc-maxage-ch", fmt.Appendf(nil, "old-%d", i)); err != nil {
+				t.Fatalf("failed to publish: %v", err)
+			}
+		}
+
+		// Backdate created_at to 2 hours ago
+		_, err = db.ExecContext(ctx,
+			"UPDATE pgqueue_msg_gc_maxage_ch SET created_at = NOW() - INTERVAL '2 hours'")
+		if err != nil {
+			t.Fatalf("failed to backdate messages: %v", err)
+		}
+
+		// Publish 2 recent messages
+		for i := range 2 {
+			if _, err := pq.Publish(ctx, "gc-maxage-ch", fmt.Appendf(nil, "new-%d", i)); err != nil {
+				t.Fatalf("failed to publish: %v", err)
+			}
+		}
+
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+			DefaultPolicy: pgqueue.RetentionPolicy{
+				MaxPendingAge: 1 * time.Hour,
+			},
+		})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("garbage collection failed: %v", err)
+		}
+
+		depth, err := pq.GetQueueDepth(ctx, "gc-maxage-ch", pgqueue.QueueTypeChannel)
+		if err != nil {
+			t.Fatalf("failed to get queue depth: %v", err)
+		}
+		if depth != 2 {
+			t.Errorf("expected 2 messages after MaxPendingAge purge, got %d", depth)
+		}
+	})
+
+	t.Run("pubsub", func(t *testing.T) {
+		err := pq.CreateTopic(ctx, "gc-maxage-ps", pgqueue.TopicOptions{})
+		if err != nil {
+			t.Fatalf("failed to create topic: %v", err)
+		}
+		if err := pq.Subscribe(ctx, "gc-maxage-ps", "sub-pa"); err != nil {
+			t.Fatalf("failed to subscribe: %v", err)
+		}
+
+		for i := range 3 {
+			if _, err := pq.Publish(ctx, "gc-maxage-ps", fmt.Appendf(nil, "old-%d", i)); err != nil {
+				t.Fatalf("failed to publish: %v", err)
+			}
+		}
+
+		_, err = db.ExecContext(ctx,
+			"UPDATE pgqueue_msg_gc_maxage_ps SET created_at = NOW() - INTERVAL '2 hours'")
+		if err != nil {
+			t.Fatalf("failed to backdate messages: %v", err)
+		}
+
+		for i := range 2 {
+			if _, err := pq.Publish(ctx, "gc-maxage-ps", fmt.Appendf(nil, "new-%d", i)); err != nil {
+				t.Fatalf("failed to publish: %v", err)
+			}
+		}
+
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+			DefaultPolicy: pgqueue.RetentionPolicy{
+				MaxPendingAge: 1 * time.Hour,
+			},
+		})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("garbage collection failed: %v", err)
+		}
+
+		var msgCount int
+		err = db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pgqueue_msg_gc_maxage_ps").Scan(&msgCount)
+		if err != nil {
+			t.Fatalf("failed to count messages: %v", err)
+		}
+		if msgCount != 2 {
+			t.Errorf("expected 2 messages after MaxPendingAge purge, got %d", msgCount)
+		}
+	})
+}
+
+func TestGarbageCollectorDLQRetention(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "gc-dlq-ret", pgqueue.ChannelOptions{
+		MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish 3 messages and move them all to DLQ
+	for i := range 3 {
+		if _, err := pq.Publish(ctx, "gc-dlq-ret", fmt.Appendf(nil, "dlq-msg-%d", i)); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+	}
+	for range 3 {
+		// First consume + nack: retry
+		msg, err := pq.ConsumeFromChannel(ctx, "gc-dlq-ret", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.ID, "fail"); err != nil {
+			t.Fatalf("first nack failed: %v", err)
+		}
+		// Second consume + nack: exceeds max retries -> DLQ
+		msg, err = pq.ConsumeFromChannel(ctx, "gc-dlq-ret", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume for DLQ: %v", err)
+		}
+		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.ID, "fail again"); err != nil {
+			t.Fatalf("second nack failed: %v", err)
+		}
+	}
+
+	dlqStats, err := pq.GetDLQStats(ctx, "gc-dlq-ret", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats: %v", err)
+	}
+	if dlqStats.TotalCount != 3 {
+		t.Fatalf("expected 3 DLQ messages, got %d", dlqStats.TotalCount)
+	}
+
+	// Backdate DLQ moved_at
+	_, err = db.ExecContext(ctx,
+		"UPDATE pgqueue_dlq_gc_dlq_ret SET moved_at = NOW() - INTERVAL '2 hours'")
+	if err != nil {
+		t.Fatalf("failed to backdate DLQ: %v", err)
+	}
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			DLQRetention: 1 * time.Hour,
+		},
+	})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	dlqStats, err = pq.GetDLQStats(ctx, "gc-dlq-ret", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats after GC: %v", err)
+	}
+	if dlqStats.TotalCount != 0 {
+		t.Errorf("expected 0 DLQ messages after retention purge, got %d", dlqStats.TotalCount)
+	}
+}
+
+func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create two channels
+	for _, name := range []string{"gc-policy-a", "gc-policy-b"} {
+		err := pq.CreateChannel(ctx, name, pgqueue.ChannelOptions{})
+		if err != nil {
+			t.Fatalf("failed to create channel %s: %v", name, err)
+		}
+
+		// Publish and ack 3 messages each
+		for i := range 3 {
+			if _, err := pq.Publish(ctx, name, fmt.Appendf(nil, "msg-%d", i)); err != nil {
+				t.Fatalf("failed to publish to %s: %v", name, err)
+			}
+		}
+		for range 3 {
+			msg, err := pq.ConsumeFromChannel(ctx, name, 30*time.Second)
+			if err != nil {
+				t.Fatalf("failed to consume from %s: %v", name, err)
+			}
+			if err := pq.AckChannel(ctx, name, msg.ID); err != nil {
+				t.Fatalf("failed to ack in %s: %v", name, err)
+			}
+		}
+	}
+
+	// Backdate processed_at for both queues
+	for _, table := range []string{"gc_policy_a", "gc_policy_b"} {
+		_, err := db.ExecContext(ctx,
+			fmt.Sprintf("UPDATE pgqueue_msg_%s SET processed_at = NOW() - INTERVAL '2 hours' WHERE status = 'completed'", table))
+		if err != nil {
+			t.Fatalf("failed to backdate %s: %v", table, err)
+		}
+	}
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			CompletedMessageTTL: 24 * time.Hour, // Retains all
+		},
+		Policies: map[string]pgqueue.RetentionPolicy{
+			"gc-policy-a": {CompletedMessageTTL: 1 * time.Hour}, // Purges old
+		},
+	})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	// gc-policy-a should have 0 completed (override policy purged them)
+	statsA, err := pq.GetStats(ctx, "gc-policy-a", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats for gc-policy-a: %v", err)
+	}
+	if statsA.CompletedCount != 0 {
+		t.Errorf("gc-policy-a: expected 0 completed after GC, got %d", statsA.CompletedCount)
+	}
+
+	// gc-policy-b should still have 3 completed (default 24h policy retains them)
+	statsB, err := pq.GetStats(ctx, "gc-policy-b", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats for gc-policy-b: %v", err)
+	}
+	if statsB.CompletedCount != 3 {
+		t.Errorf("gc-policy-b: expected 3 completed retained, got %d", statsB.CompletedCount)
 	}
 }

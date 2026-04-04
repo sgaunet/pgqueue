@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	minVisibilityTimeout = 1 * time.Second
+	minVisibilityTimeout = 1 * time.Millisecond
 	maxVisibilityTimeout = 24 * time.Hour
 )
 
