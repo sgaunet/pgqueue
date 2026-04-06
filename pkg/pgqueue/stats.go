@@ -305,6 +305,194 @@ func (pq *PGQueue) getPubSubStats(
 	return nil
 }
 
+// GetSubscriberHealth returns detailed health information for a specific subscriber on a topic.
+func (pq *PGQueue) GetSubscriberHealth(
+	ctx context.Context,
+	topicName string,
+	subscriberID string,
+) (*SubscriberHealth, error) {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return nil, err
+	}
+
+	metadata, err := pq.getQueueMetadata(
+		ctx, string(QueueTypePubSub), topicName,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = '%s') AS pending_messages,
+			COUNT(*) FILTER (
+				WHERE status = '%s'
+				AND visibility_timeout IS NOT NULL
+				AND visibility_timeout < NOW()
+			) AS stuck_messages,
+			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending,
+			MAX(acked_at) AS last_activity
+		FROM pgqueue_sub_%s
+		WHERE subscriber_id = $1
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, metadata.TableName)
+
+	health := &SubscriberHealth{
+		TopicName:    topicName,
+		SubscriberID: subscriberID,
+	}
+
+	var oldestPending, lastActivity sql.NullTime
+
+	err = pq.db.QueryRowContext(ctx, query, subscriberID).Scan(
+		&health.PendingMessages,
+		&health.StuckMessages,
+		&oldestPending,
+		&lastActivity,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get subscriber health: %w", err)
+	}
+
+	if oldestPending.Valid {
+		health.OldestPending = &oldestPending.Time
+	}
+
+	if lastActivity.Valid {
+		health.LastActivity = &lastActivity.Time
+	}
+
+	return health, nil
+}
+
+// GetUnhealthySubscribers returns subscribers with health issues across all topics.
+// A subscriber is unhealthy if it has messages stuck in processing (visibility timeout
+// expired) or pending messages older than the given threshold.
+func (pq *PGQueue) GetUnhealthySubscribers(
+	ctx context.Context,
+	threshold time.Duration,
+) ([]SubscriberHealth, error) {
+	// Get all pub/sub topics
+	rows, err := pq.db.QueryContext(ctx,
+		"SELECT queue_name, table_name FROM pgqueue_metadata WHERE queue_type = $1",
+		string(QueueTypePubSub),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list topics: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	type topicInfo struct {
+		queueName string
+		tableName string
+	}
+
+	var topics []topicInfo
+	for rows.Next() {
+		var t topicInfo
+		if err := rows.Scan(&t.queueName, &t.tableName); err != nil {
+			return nil, fmt.Errorf("failed to scan topic: %w", err)
+		}
+		topics = append(topics, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate topics: %w", err)
+	}
+
+	cutoff := time.Now().Add(-threshold)
+	var unhealthy []SubscriberHealth
+
+	for _, topic := range topics {
+		subs, err := pq.findUnhealthyForTopic(ctx, topic.queueName, topic.tableName, cutoff)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check topic %s: %w", topic.queueName, err)
+		}
+		unhealthy = append(unhealthy, subs...)
+	}
+
+	return unhealthy, nil
+}
+
+func (pq *PGQueue) findUnhealthyForTopic(
+	ctx context.Context,
+	topicName, tableName string,
+	cutoff time.Time,
+) ([]SubscriberHealth, error) {
+	query := buildUnhealthySubscribersQuery(tableName)
+
+	rows, err := pq.db.QueryContext(ctx, query, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query unhealthy subscribers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []SubscriberHealth
+	for rows.Next() {
+		h := SubscriberHealth{TopicName: topicName}
+		var oldestPending, lastActivity sql.NullTime
+
+		if err := rows.Scan(
+			&h.SubscriberID, &h.PendingMessages, &h.StuckMessages,
+			&oldestPending, &lastActivity,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan subscriber health: %w", err)
+		}
+
+		if oldestPending.Valid {
+			h.OldestPending = &oldestPending.Time
+		}
+		if lastActivity.Valid {
+			h.LastActivity = &lastActivity.Time
+		}
+
+		results = append(results, h)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate subscriber health rows: %w", err)
+	}
+
+	return results, nil
+}
+
+func buildUnhealthySubscribersQuery(tableName string) string {
+	return fmt.Sprintf(`
+		SELECT
+			subscriber_id,
+			COUNT(*) FILTER (WHERE status = '%s') AS pending_messages,
+			COUNT(*) FILTER (
+				WHERE status = '%s'
+				AND visibility_timeout IS NOT NULL
+				AND visibility_timeout < NOW()
+			) AS stuck_messages,
+			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending,
+			MAX(acked_at) AS last_activity
+		FROM pgqueue_sub_%s
+		GROUP BY subscriber_id
+		HAVING
+			COUNT(*) FILTER (
+				WHERE status = '%s'
+				AND visibility_timeout IS NOT NULL
+				AND visibility_timeout < NOW()
+			) > 0
+			OR MIN(created_at) FILTER (WHERE status = '%s') < $1
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, tableName,
+		MessageStatusProcessing, MessageStatusPending)
+}
+
+// SubscriberHealth holds health information for a subscriber.
+type SubscriberHealth struct {
+	TopicName       string
+	SubscriberID    string
+	PendingMessages int64
+	StuckMessages   int64
+	OldestPending   *time.Time
+	LastActivity    *time.Time
+}
+
 // SubscriberLag holds lag information for a subscriber.
 type SubscriberLag struct {
 	SubscriberID     string

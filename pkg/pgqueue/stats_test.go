@@ -250,6 +250,234 @@ func TestGetDLQStats(t *testing.T) {
 	}
 }
 
+func TestGetSubscriberHealth(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "health-test", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	if err := pq.Subscribe(ctx, "health-test", "sub-healthy"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "health-test", "sub-lagging"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	// Publish messages
+	for i := 0; i < 5; i++ {
+		if _, err := pq.Publish(ctx, "health-test", []byte("test message")); err != nil {
+			t.Fatalf("failed to publish message: %v", err)
+		}
+	}
+
+	// sub-healthy consumes and acks all messages
+	for i := 0; i < 5; i++ {
+		msg, err := pq.ConsumeFromTopic(ctx, "health-test", "sub-healthy", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume message: %v", err)
+		}
+		if err := pq.AckTopic(ctx, "health-test", "sub-healthy", msg.ID); err != nil {
+			t.Fatalf("failed to ack message: %v", err)
+		}
+	}
+
+	// sub-lagging does nothing — all messages stay pending
+
+	// Check healthy subscriber
+	health, err := pq.GetSubscriberHealth(ctx, "health-test", "sub-healthy")
+	if err != nil {
+		t.Fatalf("failed to get subscriber health: %v", err)
+	}
+	if health.PendingMessages != 0 {
+		t.Errorf("expected 0 pending for healthy sub, got %d", health.PendingMessages)
+	}
+	if health.StuckMessages != 0 {
+		t.Errorf("expected 0 stuck for healthy sub, got %d", health.StuckMessages)
+	}
+	if health.LastActivity == nil {
+		t.Error("expected last activity to be set for healthy sub")
+	}
+
+	// Check lagging subscriber
+	health, err = pq.GetSubscriberHealth(ctx, "health-test", "sub-lagging")
+	if err != nil {
+		t.Fatalf("failed to get subscriber health: %v", err)
+	}
+	if health.PendingMessages != 5 {
+		t.Errorf("expected 5 pending for lagging sub, got %d", health.PendingMessages)
+	}
+	if health.StuckMessages != 0 {
+		t.Errorf("expected 0 stuck (nothing consumed), got %d", health.StuckMessages)
+	}
+	if health.OldestPending == nil {
+		t.Error("expected oldest pending to be set for lagging sub")
+	}
+	if health.LastActivity != nil {
+		t.Error("expected no last activity for lagging sub")
+	}
+}
+
+func TestGetSubscriberHealthStuckMessages(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateTopic(ctx, "stuck-test", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	if err := pq.Subscribe(ctx, "stuck-test", "sub-stuck"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := pq.Publish(ctx, "stuck-test", []byte("test message")); err != nil {
+			t.Fatalf("failed to publish message: %v", err)
+		}
+	}
+
+	// Consume messages with a short visibility timeout
+	for i := 0; i < 3; i++ {
+		_, err := pq.ConsumeFromTopic(ctx, "stuck-test", "sub-stuck", 1*time.Millisecond)
+		if err != nil {
+			t.Fatalf("failed to consume message: %v", err)
+		}
+	}
+
+	// Backdate visibility timeouts so they appear expired
+	_, err = db.ExecContext(ctx,
+		"UPDATE pgqueue_sub_stuck_test SET visibility_timeout = NOW() - INTERVAL '1 hour' WHERE status = 'processing'")
+	if err != nil {
+		t.Fatalf("failed to backdate visibility timeouts: %v", err)
+	}
+
+	health, err := pq.GetSubscriberHealth(ctx, "stuck-test", "sub-stuck")
+	if err != nil {
+		t.Fatalf("failed to get subscriber health: %v", err)
+	}
+
+	if health.StuckMessages != 3 {
+		t.Errorf("expected 3 stuck messages, got %d", health.StuckMessages)
+	}
+}
+
+func TestGetUnhealthySubscribers(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create two topics
+	err := pq.CreateTopic(ctx, "unhealthy-a", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	err = pq.CreateTopic(ctx, "unhealthy-b", pgqueue.TopicOptions{})
+	if err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	// Subscribe
+	if err := pq.Subscribe(ctx, "unhealthy-a", "sub-ok"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "unhealthy-a", "sub-stuck"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "unhealthy-b", "sub-lagging"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	// Publish to both topics
+	for i := 0; i < 3; i++ {
+		if _, err := pq.Publish(ctx, "unhealthy-a", []byte("msg")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := pq.Publish(ctx, "unhealthy-b", []byte("msg")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+	}
+
+	// sub-ok acks all its messages on topic-a
+	for i := 0; i < 3; i++ {
+		msg, err := pq.ConsumeFromTopic(ctx, "unhealthy-a", "sub-ok", 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if err := pq.AckTopic(ctx, "unhealthy-a", "sub-ok", msg.ID); err != nil {
+			t.Fatalf("failed to ack: %v", err)
+		}
+	}
+
+	// sub-stuck consumes on topic-a but doesn't ack — force expired visibility
+	for i := 0; i < 3; i++ {
+		_, err := pq.ConsumeFromTopic(ctx, "unhealthy-a", "sub-stuck", 1*time.Millisecond)
+		if err != nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+	}
+	_, err = db.ExecContext(ctx,
+		"UPDATE pgqueue_sub_unhealthy_a SET visibility_timeout = NOW() - INTERVAL '1 hour' WHERE subscriber_id = 'sub-stuck' AND status = 'processing'")
+	if err != nil {
+		t.Fatalf("failed to backdate: %v", err)
+	}
+
+	// sub-lagging on topic-b: backdate pending messages to make them old
+	_, err = db.ExecContext(ctx,
+		"UPDATE pgqueue_sub_unhealthy_b SET created_at = NOW() - INTERVAL '1 hour'")
+	if err != nil {
+		t.Fatalf("failed to backdate: %v", err)
+	}
+
+	// With a 30-minute threshold, sub-stuck (stuck msgs) and sub-lagging (old pending) should be unhealthy
+	unhealthy, err := pq.GetUnhealthySubscribers(ctx, 30*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to get unhealthy subscribers: %v", err)
+	}
+
+	if len(unhealthy) != 2 {
+		t.Fatalf("expected 2 unhealthy subscribers, got %d", len(unhealthy))
+	}
+
+	// Verify we find both expected subscribers
+	found := map[string]bool{}
+	for _, h := range unhealthy {
+		found[h.TopicName+"/"+h.SubscriberID] = true
+	}
+
+	if !found["unhealthy-a/sub-stuck"] {
+		t.Error("expected sub-stuck on unhealthy-a to be unhealthy")
+	}
+	if !found["unhealthy-b/sub-lagging"] {
+		t.Error("expected sub-lagging on unhealthy-b to be unhealthy")
+	}
+}
+
+func TestGetUnhealthySubscribersNoTopics(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	unhealthy, err := pq.GetUnhealthySubscribers(ctx, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("failed to get unhealthy subscribers: %v", err)
+	}
+
+	if len(unhealthy) != 0 {
+		t.Errorf("expected 0 unhealthy subscribers, got %d", len(unhealthy))
+	}
+}
+
 func TestPubSubStats(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
