@@ -73,8 +73,8 @@ func (pq *PGQueue) GetQueueDepth(
 	if queueType == QueueTypeChannel {
 		//nolint:gosec // G201: table name validated by queueNameRegex
 		query := fmt.Sprintf(
-			"SELECT COUNT(*) FROM pgqueue_msg_%s WHERE status = 'pending'",
-			tableName,
+			"SELECT COUNT(*) FROM pgqueue_msg_%s WHERE status = '%s'",
+			tableName, MessageStatusPending,
 		)
 		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			return 0, fmt.Errorf("failed to get queue depth: %w", err)
@@ -82,8 +82,8 @@ func (pq *PGQueue) GetQueueDepth(
 	} else {
 		//nolint:gosec // G201: table name validated by queueNameRegex
 		query := fmt.Sprintf(
-			"SELECT COUNT(*) FROM pgqueue_sub_%s WHERE status = 'pending'",
-			tableName,
+			"SELECT COUNT(*) FROM pgqueue_sub_%s WHERE status = '%s'",
+			tableName, MessageStatusPending,
 		)
 		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			return 0, fmt.Errorf("failed to get queue depth: %w", err)
@@ -119,13 +119,13 @@ func (pq *PGQueue) GetSubscriberLag(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
-			COUNT(*) FILTER (WHERE status = 'processing') AS processing_count,
-			COUNT(*) FILTER (WHERE status = 'acked') AS acked_count,
-			MIN(created_at) FILTER (WHERE status = 'pending') AS oldest_pending
+			COUNT(*) FILTER (WHERE status = '%s') AS pending_count,
+			COUNT(*) FILTER (WHERE status = '%s') AS processing_count,
+			COUNT(*) FILTER (WHERE status = '%s') AS acked_count,
+			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending
 		FROM pgqueue_sub_%s
 		WHERE subscriber_id = $1
-	`, tableName)
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, tableName)
 
 	lag := &SubscriberLag{
 		SubscriberID: subscriberID,
@@ -222,15 +222,15 @@ func (pq *PGQueue) getChannelStats(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
-			COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+			COUNT(*) FILTER (WHERE status = '%s') AS pending,
+			COUNT(*) FILTER (WHERE status = '%s') AS processing,
+			COUNT(*) FILTER (WHERE status = '%s') AS completed,
 			AVG(EXTRACT(EPOCH FROM (processed_at - created_at)))
 				FILTER (WHERE processed_at IS NOT NULL) AS avg_processing_time,
 			MIN(created_at)
-				FILTER (WHERE status = 'pending') AS oldest_pending
+				FILTER (WHERE status = '%s') AS oldest_pending
 		FROM pgqueue_msg_%s
-	`, tableName)
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusCompleted, MessageStatusPending, tableName)
 
 	var avgSeconds sql.NullFloat64
 	var oldestPending sql.NullTime
@@ -268,15 +268,15 @@ func (pq *PGQueue) getPubSubStats(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
-			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-			COUNT(*) FILTER (WHERE status = 'processing') AS processing,
-			COUNT(*) FILTER (WHERE status = 'acked') AS completed,
+			COUNT(*) FILTER (WHERE status = '%s') AS pending,
+			COUNT(*) FILTER (WHERE status = '%s') AS processing,
+			COUNT(*) FILTER (WHERE status = '%s') AS completed,
 			AVG(EXTRACT(EPOCH FROM (acked_at - created_at)))
 				FILTER (WHERE acked_at IS NOT NULL) AS avg_processing_time,
 			MIN(created_at)
-				FILTER (WHERE status = 'pending') AS oldest_pending
+				FILTER (WHERE status = '%s') AS oldest_pending
 		FROM pgqueue_sub_%s
-	`, tableName)
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, tableName)
 
 	var avgSeconds sql.NullFloat64
 	var oldestPending sql.NullTime

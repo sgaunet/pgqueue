@@ -181,14 +181,14 @@ func (pq *PGQueue) countReplayableMessages(
 		countQuery = fmt.Sprintf(`
 			SELECT COUNT(*) FROM pgqueue_sub_%s
 			WHERE created_at >= $1
-			AND status != 'pending'
-		`, tableName)
+			AND status != '%s'
+		`, tableName, MessageStatusPending)
 	} else {
 		countQuery = fmt.Sprintf(`
 			SELECT COUNT(*) FROM pgqueue_msg_%s
 			WHERE created_at >= $1
-			AND status != 'pending'
-		`, tableName)
+			AND status != '%s'
+		`, tableName, MessageStatusPending)
 	}
 
 	var count int
@@ -239,7 +239,7 @@ func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 	if limit > 0 {
 		return fmt.Sprintf(`
 			UPDATE pgqueue_msg_%s
-			SET status = 'pending',
+			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
 			    ack_deadline = NULL,
@@ -247,52 +247,52 @@ func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 			    error_message = NULL
 			WHERE id IN (
 				SELECT id FROM pgqueue_msg_%s
-				WHERE created_at >= $1 AND status != 'pending'
+				WHERE created_at >= $1 AND status != '%s'
 				LIMIT %d
 			)
-		`, tableName, tableName, limit)
+		`, tableName, MessageStatusPending, tableName, MessageStatusPending, limit)
 	}
 
 	return fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
 		    ack_deadline = NULL,
 		    processed_at = NULL,
 		    error_message = NULL
 		WHERE created_at >= $1
-		AND status != 'pending'
-	`, tableName)
+		AND status != '%s'
+	`, tableName, MessageStatusPending, MessageStatusPending)
 }
 
 func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
 	if limit > 0 {
 		return fmt.Sprintf(`
 			UPDATE pgqueue_sub_%s
-			SET status = 'pending',
+			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
 			    acked_at = NULL,
 			    error_message = NULL
 			WHERE id IN (
 				SELECT id FROM pgqueue_sub_%s
-				WHERE created_at >= $1 AND status != 'pending'
+				WHERE created_at >= $1 AND status != '%s'
 				LIMIT %d
 			)
-		`, tableName, tableName, limit)
+		`, tableName, MessageStatusPending, tableName, MessageStatusPending, limit)
 	}
 
 	return fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
 		    acked_at = NULL,
 		    error_message = NULL
 		WHERE created_at >= $1
-		AND status != 'pending'
-	`, tableName)
+		AND status != '%s'
+	`, tableName, MessageStatusPending, MessageStatusPending)
 }
 
 func (pq *PGQueue) checkMessageExists(
@@ -326,14 +326,14 @@ func (pq *PGQueue) executeReplayMessage(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
 		    ack_deadline = NULL,
 		    processed_at = NULL,
 		    error_message = NULL
 		WHERE id = $1
-	`, tableName)
+	`, tableName, MessageStatusPending)
 
 	result, err := pq.db.ExecContext(ctx, query, messageID)
 	if err != nil {
@@ -473,9 +473,9 @@ func (pq *PGQueue) reinsertDLQChannel(
 	insertQuery := fmt.Sprintf(`
 		INSERT INTO pgqueue_msg_%s
 			(id, payload, created_at, status, retry_count, metadata)
-		VALUES ($1, $2, NOW(), 'pending', 0, $3)
+		VALUES ($1, $2, NOW(), '%s', 0, $3)
 		ON CONFLICT (id) DO NOTHING
-	`, tableName)
+	`, tableName, MessageStatusPending)
 
 	count := 0
 	for _, msg := range dlqMessages {

@@ -131,11 +131,11 @@ func (pq *PGQueue) AckTopic(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = 'acked', acked_at = NOW()
+		SET status = '%s', acked_at = NOW()
 		WHERE message_id = $1
 		  AND subscriber_id = $2
-		  AND status = 'processing'
-	`, queueMeta.TableName)
+		  AND status = '%s'
+	`, queueMeta.TableName, MessageStatusAcked, MessageStatusProcessing)
 
 	result, err := pq.db.ExecContext(ctx, query, messageID, subscriberID)
 	if err != nil {
@@ -229,9 +229,9 @@ func (pq *PGQueue) getProcessingSubState(
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
 		WHERE s.message_id = $1
 		  AND s.subscriber_id = $2
-		  AND s.status = 'processing'
+		  AND s.status = '%s'
 		FOR UPDATE OF s
-	`, tableName, tableName)
+	`, tableName, tableName, MessageStatusProcessing)
 
 	var state subState
 
@@ -295,13 +295,13 @@ func (pq *PGQueue) retrySubscription(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $3
 		WHERE message_id = $1
 		  AND subscriber_id = $2
-	`, tableName)
+	`, tableName, MessageStatusPending)
 
 	_, err := tx.ExecContext(ctx, query, messageID, subscriberID, errorMsg)
 	if err != nil {
@@ -333,14 +333,14 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 		FROM pgqueue_sub_%s s
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
-		  AND s.status = 'pending'
+		  AND s.status = '%s'
 		  AND (s.visibility_timeout IS NULL
 		       OR s.visibility_timeout < NOW())
 		  %s
 		ORDER BY m.id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED
-	`, tableName, tableName, ttlClause)
+	`, tableName, tableName, MessageStatusPending, ttlClause)
 
 	var subID uuid.UUID
 	var msgID uuid.UUID
@@ -382,9 +382,9 @@ func (pq *PGQueue) claimTopicSubscription(
 
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = 'processing', visibility_timeout = $1
+		SET status = '%s', visibility_timeout = $1
 		WHERE id = $2
-	`, tableName)
+	`, tableName, MessageStatusProcessing)
 
 	_, err := tx.ExecContext(ctx, updateQuery, visTimeout, subID)
 	if err != nil {

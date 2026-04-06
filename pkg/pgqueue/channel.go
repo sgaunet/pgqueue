@@ -92,9 +92,9 @@ func (pq *PGQueue) AckChannel(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'completed', processed_at = NOW()
-		WHERE id = $1 AND status = 'processing'
-	`, queueMeta.TableName)
+		SET status = '%s', processed_at = NOW()
+		WHERE id = $1 AND status = '%s'
+	`, queueMeta.TableName, MessageStatusCompleted, MessageStatusProcessing)
 
 	result, err := pq.db.ExecContext(ctx, query, messageID)
 	if err != nil {
@@ -181,13 +181,13 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 	query := fmt.Sprintf(`
 		SELECT id, payload, created_at, retry_count, max_retries, metadata
 		FROM pgqueue_msg_%s
-		WHERE status = 'pending'
+		WHERE status = '%s'
 		  AND (visibility_timeout IS NULL OR visibility_timeout < NOW())
 		  %s
 		ORDER BY id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, tableName, ttlClause)
+	`, tableName, MessageStatusPending, ttlClause)
 
 	var msgID uuid.UUID
 	var payload []byte
@@ -230,9 +230,9 @@ func (pq *PGQueue) claimChannelMessage(
 
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'processing', visibility_timeout = $1
+		SET status = '%s', visibility_timeout = $1
 		WHERE id = $2
-	`, tableName)
+	`, tableName, MessageStatusProcessing)
 
 	_, err := tx.ExecContext(ctx, updateQuery, visTimeout, msgID)
 	if err != nil {
@@ -265,9 +265,9 @@ func (pq *PGQueue) getProcessingMessageState(
 	query := fmt.Sprintf(`
 		SELECT retry_count, max_retries, payload, metadata
 		FROM pgqueue_msg_%s
-		WHERE id = $1 AND status = 'processing'
+		WHERE id = $1 AND status = '%s'
 		FOR UPDATE
-	`, tableName)
+	`, tableName, MessageStatusProcessing)
 
 	var state messageState
 	err := tx.QueryRowContext(ctx, query, messageID).Scan(
@@ -358,12 +358,12 @@ func (pq *PGQueue) retryMessage(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $2
 		WHERE id = $1
-	`, tableName)
+	`, tableName, MessageStatusPending)
 
 	_, err := tx.ExecContext(ctx, updateQuery, messageID, errorMsg)
 	if err != nil {

@@ -490,7 +490,7 @@ func (pq *PGQueue) createPubSubTables(
 			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			message_id UUID NOT NULL,
 			subscriber_id TEXT NOT NULL,
-			status TEXT NOT NULL DEFAULT 'pending',
+			status TEXT NOT NULL DEFAULT '%s',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			acked_at TIMESTAMPTZ,
 			visibility_timeout TIMESTAMPTZ,
@@ -498,7 +498,7 @@ func (pq *PGQueue) createPubSubTables(
 			error_message TEXT,
 			FOREIGN KEY (message_id)
 				REFERENCES pgqueue_msg_%s(id) ON DELETE CASCADE
-		)`, tableName, tableName)
+		)`, tableName, MessageStatusPending, tableName)
 
 	if _, err := tx.ExecContext(ctx, subscriptionTable); err != nil {
 		return fmt.Errorf("failed to create subscription table: %w", err)
@@ -530,8 +530,8 @@ func (pq *PGQueue) createPubSubIndexes(
 		),
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_status
-			 ON pgqueue_sub_%s(status) WHERE status = 'pending'`,
-			tableName, tableName,
+			 ON pgqueue_sub_%s(status) WHERE status = '%s'`,
+			tableName, tableName, MessageStatusPending,
 		),
 		// Consumption-optimized indexes: split the OR condition on
 		// visibility_timeout into two partial indexes for efficient
@@ -539,14 +539,14 @@ func (pq *PGQueue) createPubSubIndexes(
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_null
 			 ON pgqueue_sub_%s(subscriber_id, message_id)
-			 WHERE status = 'pending' AND visibility_timeout IS NULL`,
-			tableName, tableName,
+			 WHERE status = '%s' AND visibility_timeout IS NULL`,
+			tableName, tableName, MessageStatusPending,
 		),
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
 			 ON pgqueue_sub_%s(subscriber_id, visibility_timeout, message_id)
-			 WHERE status = 'pending' AND visibility_timeout IS NOT NULL`,
-			tableName, tableName,
+			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
+			tableName, tableName, MessageStatusPending,
 		),
 	}
 
@@ -571,7 +571,7 @@ func (pq *PGQueue) createChannelTables(
 			id UUID PRIMARY KEY,
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			status TEXT NOT NULL DEFAULT 'pending',
+			status TEXT NOT NULL DEFAULT '%s',
 			retry_count INT NOT NULL DEFAULT 0,
 			max_retries INT,
 			visibility_timeout TIMESTAMPTZ,
@@ -579,7 +579,7 @@ func (pq *PGQueue) createChannelTables(
 			processed_at TIMESTAMPTZ,
 			error_message TEXT,
 			metadata JSONB
-		)`, tableName)
+		)`, tableName, MessageStatusPending)
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
 		return fmt.Errorf("failed to create message table: %w", err)
@@ -602,8 +602,8 @@ func (pq *PGQueue) createChannelIndexes(
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_status_created
 			 ON pgqueue_msg_%s(status, created_at)
-			 WHERE status = 'pending'`,
-			tableName, tableName,
+			 WHERE status = '%s'`,
+			tableName, tableName, MessageStatusPending,
 		),
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_visibility
@@ -623,14 +623,14 @@ func (pq *PGQueue) createChannelIndexes(
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_null
 			 ON pgqueue_msg_%s(id)
-			 WHERE status = 'pending' AND visibility_timeout IS NULL`,
-			tableName, tableName,
+			 WHERE status = '%s' AND visibility_timeout IS NULL`,
+			tableName, tableName, MessageStatusPending,
 		),
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_timeout
 			 ON pgqueue_msg_%s(visibility_timeout, id)
-			 WHERE status = 'pending' AND visibility_timeout IS NOT NULL`,
-			tableName, tableName,
+			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
+			tableName, tableName, MessageStatusPending,
 		),
 	}
 

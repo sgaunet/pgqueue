@@ -208,8 +208,8 @@ func (pq *PGQueue) createSubscriptionRecords(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	insertSub := fmt.Sprintf(`
 		INSERT INTO pgqueue_sub_%s (message_id, subscriber_id, status)
-		VALUES ($1, $2, 'pending')
-	`, tableName)
+		VALUES ($1, $2, '%s')
+	`, tableName, MessageStatusPending)
 
 	stmt, err := tx.PrepareContext(ctx, insertSub)
 	if err != nil {
@@ -249,9 +249,9 @@ func (pq *PGQueue) publishToChannel(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	insertMsg := fmt.Sprintf(`
 		INSERT INTO pgqueue_msg_%s (id, payload, status, metadata, max_retries)
-		VALUES ($1, $2, 'pending', $3, $4)
+		VALUES ($1, $2, '%s', $3, $4)
 		ON CONFLICT (id) DO NOTHING
-	`, tableName)
+	`, tableName, MessageStatusPending)
 
 	result, err := tx.ExecContext(
 		ctx, insertMsg, messageID, payload, metadata, maxRetries,

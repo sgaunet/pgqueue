@@ -88,10 +88,10 @@ func (pq *PGQueue) AckChannelBatch(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'completed', processed_at = NOW()
+		SET status = '%s', processed_at = NOW()
 		WHERE id = ANY($1::uuid[])
-		  AND status = 'processing'
-	`, queueMeta.TableName)
+		  AND status = '%s'
+	`, queueMeta.TableName, MessageStatusCompleted, MessageStatusProcessing)
 
 	result, err := pq.db.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs))
 	if err != nil {
@@ -136,11 +136,11 @@ func (pq *PGQueue) AckTopicBatch(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = 'acked', acked_at = NOW()
+		SET status = '%s', acked_at = NOW()
 		WHERE message_id = ANY($1::uuid[])
 		  AND subscriber_id = $2
-		  AND status = 'processing'
-	`, queueMeta.TableName)
+		  AND status = '%s'
+	`, queueMeta.TableName, MessageStatusAcked, MessageStatusProcessing)
 
 	result, err := pq.db.ExecContext(
 		ctx, query, uuidSliceToStringSlice(messageIDs), subscriberID,
@@ -312,8 +312,8 @@ func (pq *PGQueue) publishBatchToChannel(
 			sb.WriteString(", ")
 		}
 		base := i * channelInsertParams
-		fmt.Fprintf(&sb, "($%d, $%d, 'pending', $%d, $%d)",
-			base+1, base+2, base+3, base+4, //nolint:mnd // SQL placeholder arithmetic
+		fmt.Fprintf(&sb, "($%d, $%d, '%s', $%d, $%d)",
+			base+1, base+2, MessageStatusPending, base+3, base+4, //nolint:mnd // SQL placeholder arithmetic
 		)
 		args = append(args, ids[i], messages[i].Payload, metadataJSONs[i], maxRetries)
 	}
@@ -457,7 +457,7 @@ func (pq *PGQueue) batchCreateSubscriptionRecords(
 				sb.WriteString(", ")
 			}
 			base := i * subInsertParams
-			fmt.Fprintf(&sb, "($%d, $%d, 'pending')", base+1, base+2) //nolint:mnd // SQL placeholder arithmetic
+			fmt.Fprintf(&sb, "($%d, $%d, '%s')", base+1, base+2, MessageStatusPending) //nolint:mnd // SQL placeholder arithmetic
 			args = append(args, rec.messageID, rec.subscriberID)
 		}
 
@@ -495,9 +495,9 @@ func (pq *PGQueue) fetchBatchMessageStates(
 		SELECT id, retry_count, max_retries, payload, metadata
 		FROM pgqueue_msg_%s
 		WHERE id = ANY($1::uuid[])
-		  AND status = 'processing'
+		  AND status = '%s'
 		FOR UPDATE
-	`, tableName)
+	`, tableName, MessageStatusProcessing)
 
 	rows, err := tx.QueryContext(ctx, query, uuidSliceToStringSlice(messageIDs))
 	if err != nil {
@@ -533,12 +533,12 @@ func (pq *PGQueue) batchRetryMessages(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $2
 		WHERE id = ANY($1::uuid[])
-	`, tableName)
+	`, tableName, MessageStatusPending)
 
 	_, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs), errorMsg)
 	if err != nil {

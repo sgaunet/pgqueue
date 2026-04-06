@@ -283,15 +283,15 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 			WHERE m.created_at < $1
 			AND NOT EXISTS (
 				SELECT 1 FROM pgqueue_sub_%s s
-				WHERE s.message_id = m.id AND s.status != 'acked'
+				WHERE s.message_id = m.id AND s.status != '%s'
 			)
-		`, tableName, tableName)
+		`, tableName, tableName, MessageStatusAcked)
 	} else {
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s
-			WHERE status = 'completed'
+			WHERE status = '%s'
 			AND processed_at < $1
-		`, tableName)
+		`, tableName, MessageStatusCompleted)
 	}
 
 	result, err := gc.pq.db.ExecContext(ctx, query, cutoff)
@@ -322,15 +322,15 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 			WHERE m.created_at < $1
 			AND EXISTS (
 				SELECT 1 FROM pgqueue_sub_%s s
-				WHERE s.message_id = m.id AND s.status = 'pending'
+				WHERE s.message_id = m.id AND s.status = '%s'
 			)
-		`, tableName, tableName)
+		`, tableName, tableName, MessageStatusPending)
 	} else {
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s
-			WHERE status = 'pending'
+			WHERE status = '%s'
 			AND created_at < $1
-		`, tableName)
+		`, tableName, MessageStatusPending)
 	}
 
 	result, err := gc.pq.db.ExecContext(ctx, query, cutoff)
@@ -380,12 +380,12 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    visibility_timeout = NULL
-		WHERE status = 'processing'
+		WHERE status = '%s'
 		AND visibility_timeout IS NOT NULL
 		AND visibility_timeout < $1
-	`, tableName)
+	`, tableName, MessageStatusPending, MessageStatusProcessing)
 
 	result, err := gc.pq.db.ExecContext(ctx, query, time.Now())
 	if err != nil {
@@ -408,12 +408,12 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = 'pending',
+		SET status = '%s',
 		    visibility_timeout = NULL
-		WHERE status = 'processing'
+		WHERE status = '%s'
 		AND visibility_timeout IS NOT NULL
 		AND visibility_timeout < $1
-	`, tableName)
+	`, tableName, MessageStatusPending, MessageStatusProcessing)
 
 	result, err := gc.pq.db.ExecContext(ctx, query, time.Now())
 	if err != nil {

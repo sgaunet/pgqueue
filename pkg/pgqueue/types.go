@@ -28,6 +28,8 @@ const (
 	MessageStatusProcessing MessageStatus = "processing"
 	// MessageStatusCompleted indicates a message has been successfully processed.
 	MessageStatusCompleted MessageStatus = "completed"
+	// MessageStatusAcked indicates a pub/sub subscription has been acknowledged.
+	MessageStatusAcked MessageStatus = "acked"
 )
 
 // Config holds the configuration for PGQueue.

@@ -770,7 +770,7 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 	// Backdate processed_at for both queues
 	for _, table := range []string{"gc_policy_a", "gc_policy_b"} {
 		_, err := db.ExecContext(ctx,
-			fmt.Sprintf("UPDATE pgqueue_msg_%s SET processed_at = NOW() - INTERVAL '2 hours' WHERE status = 'completed'", table))
+			fmt.Sprintf("UPDATE pgqueue_msg_%s SET processed_at = NOW() - INTERVAL '2 hours' WHERE status = '%s'", table, pgqueue.MessageStatusCompleted))
 		if err != nil {
 			t.Fatalf("failed to backdate %s: %v", table, err)
 		}

@@ -572,7 +572,7 @@ func TestChannelTTLEnforcedOnConsume(t *testing.T) {
 	// Verify the message still exists in the table (not deleted, just filtered)
 	var count int
 	err = db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM pgqueue_msg_ttl_test WHERE status = 'pending'",
+		fmt.Sprintf("SELECT COUNT(*) FROM pgqueue_msg_ttl_test WHERE status = '%s'", pgqueue.MessageStatusPending),
 	).Scan(&count)
 	if err != nil {
 		t.Fatalf("failed to count messages: %v", err)
