@@ -1,0 +1,17 @@
+[tools]
+task = "latest"
+go = "1.26.1"
+"github:BurntSushi/ripgrep" = "latest"
+"github:go-task/task" = "latest"
+"github:golangci/golangci-lint" = "2.11.4"
+
+[tasks.lint]
+run = "golangci-lint run ./..."
+
+[tasks.test-unit]
+depends = ["lint"]
+run = "task tests"
+
+[tasks.build]
+depends = ["test-unit", "test-integration"]
+run = "go build ./..."
