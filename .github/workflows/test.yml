@@ -1,11 +1,14 @@
 name: test
 on:
-  pull_request:
-    branches:
-      - main
   push:
-    branches:
-      - main
+    # Optionally ignore documentation changes
+    # paths-ignore:
+    #   - '**.md'
+    #   - 'docs/**'
+  # Optionally run on pull requests
+  # pull_request:
+  #   branches: [main]
+
 jobs:
   lint:
     runs-on: ubuntu-latest
