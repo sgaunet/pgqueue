@@ -1,0 +1,27 @@
+name: tests-with-mise
+on:
+  push:
+    # Optionally ignore documentation changes
+    # paths-ignore:
+    #   - '**.md'
+    #   - 'docs/**'
+  # Optionally run on pull requests
+  # pull_request:
+  #   branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Setup Go environment
+      # Uses Go version from go.mod for consistency
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+      - uses: jdx/mise-action@v3
+        with:
+          install: true # [default: true] run `mise install`
+          cache: true # [default: true] cache mise using GitHub's cache
+      - run: mise run lint

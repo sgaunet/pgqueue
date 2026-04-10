@@ -1,15 +1,16 @@
 [tools]
-task = "latest"
 go = "1.26.1"
-"github:BurntSushi/ripgrep" = "latest"
 "github:go-task/task" = "latest"
 "github:golangci/golangci-lint" = "2.11.4"
+"aqua:docker/buildx" = "latest"
+docker-cli = "latest"
+docker-slim = "latest"
 
 [tasks.lint]
 run = "golangci-lint run ./..."
 
 [tasks.test-unit]
-depends = ["lint"]
+# depends = ["lint"]
 run = "task tests"
 
 [tasks.build]
