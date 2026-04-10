@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -103,7 +104,7 @@ var queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 //	}
 func InitSchema(ctx context.Context, db *sql.DB) error {
 	if db == nil {
-		return ErrDBNil
+		return ErrDBRequired
 	}
 
 	_, err := db.ExecContext(ctx, baseSchemaSQL)
@@ -136,9 +137,13 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 	// Check PostgreSQL version (18+ required for uuidv7())
 	const minPGVersionNum = 180000 // PostgreSQL 18
 
-	var versionNum int
-	if err := cfg.DB.QueryRowContext(ctx, "SHOW server_version_num").Scan(&versionNum); err != nil {
+	var versionStr string
+	if err := cfg.DB.QueryRowContext(ctx, "SHOW server_version_num").Scan(&versionStr); err != nil {
 		return nil, fmt.Errorf("failed to check PostgreSQL version: %w", err)
+	}
+	versionNum, err := strconv.Atoi(versionStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PostgreSQL version number %q: %w", versionStr, err)
 	}
 	if versionNum < minPGVersionNum {
 		return nil, fmt.Errorf("%w: got %d", ErrUnsupportedPGVersion, versionNum)
@@ -205,44 +210,47 @@ func (pq *PGQueue) ListChannels(
 	return pq.listQueues(ctx, QueueTypeChannel)
 }
 
-// Close closes the database connection.
-// Close releases internal resources held by PGQueue.
+// Close is a no-op placeholder for future resource cleanup.
 // It does NOT close the underlying *sql.DB, which is owned by the caller.
+// If a GarbageCollector is running, the caller must stop it before closing
+// the database connection. Example:
+//
+//	gc.Stop()       // stop GC first
+//	pq.Close()      // then close pgqueue
+//	db.Close()      // then close the database
 func (pq *PGQueue) Close() error {
 	return nil
 }
 
 // PauseQueue prevents new messages from being consumed from the specified queue.
-// Publishing is still allowed while paused. Works for both channels and topics.
-func (pq *PGQueue) PauseQueue(ctx context.Context, queueName string) error {
-	return pq.setQueuePaused(ctx, queueName, true)
+// Publishing is still allowed while paused.
+func (pq *PGQueue) PauseQueue(ctx context.Context, queueName string, queueType QueueType) error {
+	return pq.setQueuePaused(ctx, queueName, queueType, true)
 }
 
 // ResumeQueue allows message consumption again for the specified queue.
-func (pq *PGQueue) ResumeQueue(ctx context.Context, queueName string) error {
-	return pq.setQueuePaused(ctx, queueName, false)
+func (pq *PGQueue) ResumeQueue(ctx context.Context, queueName string, queueType QueueType) error {
+	return pq.setQueuePaused(ctx, queueName, queueType, false)
 }
 
 // IsQueuePaused returns whether the specified queue is currently paused.
-func (pq *PGQueue) IsQueuePaused(ctx context.Context, queueName string) (bool, error) {
-	meta, err := pq.resolveQueueMetadata(ctx, queueName)
+func (pq *PGQueue) IsQueuePaused(ctx context.Context, queueName string, queueType QueueType) (bool, error) {
+	meta, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err != nil {
-		return false, err
+		if errors.Is(err, ErrQueueNotFound) {
+			return false, fmt.Errorf("%s/%s: %w", queueType, queueName, ErrQueueNotFound)
+		}
+		return false, fmt.Errorf("failed to get queue metadata: %w", err)
 	}
 
 	return meta.Paused, nil
 }
 
-func (pq *PGQueue) setQueuePaused(ctx context.Context, queueName string, paused bool) error {
-	meta, err := pq.resolveQueueMetadata(ctx, queueName)
-	if err != nil {
-		return err
-	}
-
+func (pq *PGQueue) setQueuePaused(ctx context.Context, queueName string, queueType QueueType, paused bool) error {
 	result, err := pq.db.ExecContext(ctx,
 		`UPDATE pgqueue_metadata SET paused = $1, updated_at = NOW()
 		 WHERE queue_type = $2 AND queue_name = $3`,
-		paused, meta.QueueType, meta.QueueName,
+		paused, string(queueType), queueName,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update queue paused state: %w", err)
@@ -253,7 +261,7 @@ func (pq *PGQueue) setQueuePaused(ctx context.Context, queueName string, paused 
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return ErrQueueNotFound
+		return fmt.Errorf("%s/%s: %w", queueType, queueName, ErrQueueNotFound)
 	}
 
 	return nil
@@ -364,7 +372,7 @@ func (pq *PGQueue) deleteQueue(
 	// Verify queue exists
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), name)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, ErrQueueNotFound) {
 			return fmt.Errorf("%s/%s: %w", queueType, name, ErrQueueNotFound)
 		}
 
@@ -420,7 +428,14 @@ func (pq *PGQueue) executeDelete(
 	return pq.deleteQueueMetadata(ctx, tx, string(queueType), name)
 }
 
+// maxQueueNameLength limits queue names to avoid PostgreSQL's 63-byte identifier truncation
+// (prefix "pgqueue_msg_" is 12 chars, leaving 48 for the name).
+const maxQueueNameLength = 48
+
 func (pq *PGQueue) validateQueueName(name string) error {
+	if len(name) == 0 || len(name) > maxQueueNameLength {
+		return fmt.Errorf("queue name must be 1-%d characters: %w", maxQueueNameLength, ErrInvalidQueueName)
+	}
 	if !queueNameRegex.MatchString(name) {
 		return ErrInvalidQueueName
 	}
@@ -448,7 +463,7 @@ func (pq *PGQueue) checkQueueNotExists(
 	if err == nil && existing != nil {
 		return fmt.Errorf("%s/%s: %w", queueType, name, ErrQueueAlreadyExists)
 	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err != nil && !errors.Is(err, ErrQueueNotFound) {
 		return fmt.Errorf("failed to check existing queue: %w", err)
 	}
 
@@ -496,6 +511,7 @@ func (pq *PGQueue) createPubSubTables(
 			visibility_timeout TIMESTAMPTZ,
 			retry_count INT NOT NULL DEFAULT 0,
 			error_message TEXT,
+			UNIQUE(message_id, subscriber_id),
 			FOREIGN KEY (message_id)
 				REFERENCES pgqueue_msg_%s(id) ON DELETE CASCADE
 		)`, tableName, MessageStatusPending, tableName)
@@ -575,7 +591,6 @@ func (pq *PGQueue) createChannelTables(
 			retry_count INT NOT NULL DEFAULT 0,
 			max_retries INT,
 			visibility_timeout TIMESTAMPTZ,
-			ack_deadline TIMESTAMPTZ,
 			processed_at TIMESTAMPTZ,
 			error_message TEXT,
 			metadata JSONB
@@ -609,12 +624,6 @@ func (pq *PGQueue) createChannelIndexes(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_visibility
 			 ON pgqueue_msg_%s(visibility_timeout)
 			 WHERE visibility_timeout IS NOT NULL`,
-			tableName, tableName,
-		),
-		fmt.Sprintf(
-			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_ack_deadline
-			 ON pgqueue_msg_%s(ack_deadline)
-			 WHERE ack_deadline IS NOT NULL`,
 			tableName, tableName,
 		),
 		// Consumption-optimized indexes: split the OR condition on
@@ -688,11 +697,6 @@ func (pq *PGQueue) listQueues(
 
 	result := make([]QueueMetadata, 0, len(rows))
 	for _, row := range rows {
-		var config map[string]any
-		if err := json.Unmarshal(row.Config, &config); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal config: %w", err)
-		}
-
 		result = append(result, QueueMetadata{
 			ID:        row.ID,
 			QueueType: row.QueueType,

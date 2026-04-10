@@ -476,7 +476,7 @@ func TestGarbageCollectorDoubleStop(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go gc.Start(ctx)
+	gc.Start(ctx)
 
 	// Let it run briefly
 	time.Sleep(50 * time.Millisecond)
@@ -527,8 +527,8 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 		t.Fatalf("failed to publish: %v", err)
 	}
 
-	// Consume with minimum visibility timeout (1s)
-	msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-vt", "sub-vt", 1*time.Second)
+	// Consume with minimum visibility timeout
+	msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-vt", "sub-vt", 1*time.Millisecond)
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
@@ -537,7 +537,7 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 	}
 
 	// Wait for visibility timeout to expire
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	// GC should reset timed-out subscription back to pending
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})

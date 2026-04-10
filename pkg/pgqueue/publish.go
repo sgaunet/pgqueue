@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -21,7 +20,8 @@ func (pq *PGQueue) Publish(
 }
 
 // PublishWithID publishes a message with a specific ID for deduplication.
-// If messageID is nil/zero, a new UUIDv7 will be generated.
+// If messageID is the zero value (uuid.Nil), a new UUIDv7 will be generated.
+// payload must not be nil (use []byte{} for an empty payload).
 // metadata is optional and can be nil.
 func (pq *PGQueue) PublishWithID(
 	ctx context.Context,
@@ -30,6 +30,10 @@ func (pq *PGQueue) PublishWithID(
 	payload []byte,
 	metadata map[string]any,
 ) (uuid.UUID, error) {
+	if payload == nil {
+		return uuid.UUID{}, ErrNilPayload
+	}
+
 	queueMeta, err := pq.resolveQueueMetadata(ctx, queueName)
 	if err != nil {
 		return uuid.UUID{}, err
@@ -61,7 +65,7 @@ func (pq *PGQueue) PublishWithID(
 	}
 
 	// Publish based on queue type
-	queueType := QueueType(queueMeta.QueueType)
+	queueType := queueMeta.QueueType
 	if queueType == QueueTypePubSub {
 		return messageID, pq.publishToPubSub(
 			ctx, queueMeta.QueueName, queueMeta.TableName,
@@ -81,26 +85,43 @@ func (pq *PGQueue) resolveQueueMetadata(
 	ctx context.Context,
 	queueName string,
 ) (*QueueMetadata, error) {
-	// Try pub/sub first
-	queueMeta, err := pq.getQueueMetadata(
-		ctx, string(QueueTypePubSub), queueName,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		// Try channel
-		queueMeta, err = pq.getQueueMetadata(
-			ctx, string(QueueTypeChannel), queueName,
-		)
-	}
+	query := `
+		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
+		FROM pgqueue_metadata
+		WHERE queue_name = $1
+	`
+	rows, err := pq.db.QueryContext(ctx, query, queueName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf(
-				"%s: %w", queueName, ErrQueueNotFound,
-			)
+		return nil, fmt.Errorf("failed to query queue metadata: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []QueueMetadata
+	for rows.Next() {
+		var meta QueueMetadata
+		if err := rows.Scan(
+			&meta.ID, &meta.QueueType, &meta.QueueName,
+			&meta.TableName, &meta.Config, &meta.Paused,
+			&meta.CreatedAt, &meta.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan queue metadata: %w", err)
 		}
-		return nil, fmt.Errorf("failed to get queue metadata: %w", err)
+		results = append(results, meta)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate queue metadata: %w", err)
 	}
 
-	return queueMeta, nil
+	switch len(results) {
+	case 0:
+		return nil, fmt.Errorf("%s: %w", queueName, ErrQueueNotFound)
+	case 1:
+		return &results[0], nil
+	default:
+		return nil, fmt.Errorf(
+			"%s: %w", queueName, ErrAmbiguousQueueName,
+		)
+	}
 }
 
 func (pq *PGQueue) validatePayloadSize(
@@ -209,6 +230,7 @@ func (pq *PGQueue) createSubscriptionRecords(
 	insertSub := fmt.Sprintf(`
 		INSERT INTO pgqueue_sub_%s (message_id, subscriber_id, status)
 		VALUES ($1, $2, '%s')
+		ON CONFLICT (message_id, subscriber_id) DO NOTHING
 	`, tableName, MessageStatusPending)
 
 	stmt, err := tx.PrepareContext(ctx, insertSub)

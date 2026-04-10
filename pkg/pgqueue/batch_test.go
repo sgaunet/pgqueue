@@ -395,8 +395,8 @@ func TestAckChannelBatchNoneProcessing(t *testing.T) {
 
 	// Not consumed → still pending, not processing
 	err = pq.AckChannelBatch(ctx, "ack-none", ids)
-	if !errors.Is(err, pgqueue.ErrMessageNotFound) {
-		t.Errorf("expected ErrMessageNotFound, got: %v", err)
+	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
+		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
 	}
 }
 

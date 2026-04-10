@@ -15,11 +15,15 @@ Key Features:
 
 Basic Usage:
 
-	pq, _ := pgqueue.Init(ctx, pgqueue.Config{DB: db})
-	pq.CreateChannel(ctx, "orders", pgqueue.ChannelOptions{})
-	msgID, _ := pq.Publish(ctx, "orders", []byte("order-123"))
-	msg, _ := pq.ConsumeFromChannel(ctx, "orders", 30*time.Second)
-	pq.AckChannel(ctx, "orders", msg.ID)
+	_ = pgqueue.InitSchema(ctx, db) // once per database
+	pq, err := pgqueue.Init(ctx, pgqueue.Config{DB: db})
+	// handle err
+	_ = pq.CreateChannel(ctx, "orders", pgqueue.ChannelOptions{})
+	msgID, err := pq.Publish(ctx, "orders", []byte("order-123"))
+	// handle err
+	msg, err := pq.ConsumeFromChannel(ctx, "orders", 30*time.Second)
+	// handle err
+	_ = pq.AckChannel(ctx, "orders", msg.ID)
 
 For complete examples, see the examples/ directory.
 */

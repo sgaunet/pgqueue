@@ -16,7 +16,7 @@ func (pq *PGQueue) GetStats(
 ) (*QueueStats, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, ErrQueueNotFound) {
 		return nil, fmt.Errorf(
 			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
 		)
@@ -58,7 +58,7 @@ func (pq *PGQueue) GetQueueDepth(
 ) (int64, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, ErrQueueNotFound) {
 		return 0, fmt.Errorf(
 			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
 		)
@@ -107,7 +107,7 @@ func (pq *PGQueue) GetSubscriberLag(
 	metadata, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,
 	)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, ErrQueueNotFound) {
 		return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
 	}
 	if err != nil {
@@ -160,7 +160,7 @@ func (pq *PGQueue) GetDLQStats(
 ) (*DLQStats, error) {
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, ErrQueueNotFound) {
 		return nil, fmt.Errorf(
 			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
 		)
@@ -318,7 +318,7 @@ func (pq *PGQueue) GetSubscriberHealth(
 	metadata, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,
 	)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, ErrQueueNotFound) {
 		return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
 	}
 	if err != nil {
@@ -371,6 +371,7 @@ func (pq *PGQueue) GetSubscriberHealth(
 // GetUnhealthySubscribers returns subscribers with health issues across all topics.
 // A subscriber is unhealthy if it has messages stuck in processing (visibility timeout
 // expired) or pending messages older than the given threshold.
+// Note: this executes one query per topic due to the table-per-queue design.
 func (pq *PGQueue) GetUnhealthySubscribers(
 	ctx context.Context,
 	threshold time.Duration,
@@ -481,33 +482,4 @@ func buildUnhealthySubscribersQuery(tableName string) string {
 			OR MIN(created_at) FILTER (WHERE status = '%s') < $1
 	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, tableName,
 		MessageStatusProcessing, MessageStatusPending)
-}
-
-// SubscriberHealth holds health information for a subscriber.
-type SubscriberHealth struct {
-	TopicName       string
-	SubscriberID    string
-	PendingMessages int64
-	StuckMessages   int64
-	OldestPending   *time.Time
-	LastActivity    *time.Time
-}
-
-// SubscriberLag holds lag information for a subscriber.
-type SubscriberLag struct {
-	SubscriberID     string
-	TopicName        string
-	PendingCount     int64
-	ProcessingCount  int64
-	AckedCount       int64
-	OldestPendingAge *time.Duration
-}
-
-// DLQStats holds statistics about the dead letter queue.
-type DLQStats struct {
-	QueueName     string
-	TotalCount    int64
-	OldestMovedAt *time.Time
-	NewestMovedAt *time.Time
-	AvgRetryCount float64
 }

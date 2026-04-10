@@ -10,7 +10,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// Subscribe registers a subscriber for a topic and returns a channel to consume messages.
+// Subscribe registers a subscriber for a topic.
+// The subscriberID must be 1-128 characters containing only alphanumeric characters,
+// underscores, and dashes (matching the pattern [a-zA-Z0-9_-]+).
 func (pq *PGQueue) Subscribe(
 	ctx context.Context,
 	topicName, subscriberID string,
@@ -22,7 +24,7 @@ func (pq *PGQueue) Subscribe(
 	// Verify topic exists
 	_, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, ErrQueueNotFound) {
 			return fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
 		}
 		return fmt.Errorf("failed to get topic metadata: %w", err)
@@ -46,7 +48,16 @@ func (pq *PGQueue) Unsubscribe(
 		return err
 	}
 
-	err := pq.unregisterSubscriber(ctx, topicName, subscriberID)
+	// Verify topic exists
+	_, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName)
+	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
+		return fmt.Errorf("failed to get topic metadata: %w", err)
+	}
+
+	err = pq.unregisterSubscriber(ctx, topicName, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to unsubscribe: %w", err)
 	}
@@ -74,6 +85,9 @@ func (pq *PGQueue) ConsumeFromTopic(
 		ctx, string(QueueTypePubSub), topicName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
 		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
@@ -89,15 +103,15 @@ func (pq *PGQueue) ConsumeFromTopic(
 	defer func() { _ = tx.Rollback() }()
 
 	ttl := pq.getQueueTTL(queueMeta.Config)
+	maxRetries := pq.resolveMaxRetries(queueMeta)
 
 	msg, visTimeout, err := pq.fetchPendingTopicMessage(
-		ctx, tx, queueMeta.TableName, subscriberID, visibilityTimeout, ttl,
+		ctx, tx, queueMeta.TableName, subscriberID, visibilityTimeout, ttl, maxRetries,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending topic message: %w", err)
 	}
 	if msg == nil {
-		_ = tx.Rollback()
 		return nil, nil //nolint:nilnil // nil message indicates no messages available
 	}
 
@@ -125,6 +139,9 @@ func (pq *PGQueue) AckTopic(
 		ctx, string(QueueTypePubSub), topicName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
@@ -154,12 +171,15 @@ func (pq *PGQueue) AckTopic(
 }
 
 // NackTopic negatively acknowledges a message for a subscriber (retry or move to DLQ).
+// The errorMsg is truncated to 1024 characters if it exceeds that length.
 func (pq *PGQueue) NackTopic(
 	ctx context.Context,
 	topicName, subscriberID string,
 	messageID uuid.UUID,
 	errorMsg string,
 ) error {
+	errorMsg = truncateErrorMsg(errorMsg)
+
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return err
 	}
@@ -168,6 +188,9 @@ func (pq *PGQueue) NackTopic(
 		ctx, string(QueueTypePubSub), topicName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
@@ -317,6 +340,7 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 	tableName, subscriberID string,
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
+	maxRetries int,
 ) (*Message, *time.Time, error) {
 	ttlClause := ""
 	args := []any{subscriberID}
@@ -329,7 +353,7 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT s.id, s.message_id, m.payload, m.created_at,
-		       s.retry_count, m.metadata
+		       s.retry_count, m.metadata, s.error_message
 		FROM pgqueue_sub_%s s
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
@@ -348,10 +372,11 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 	var createdAt time.Time
 	var retryCount int
 	var metadataJSON sql.NullString
+	var errorMessage sql.NullString
 
 	err := tx.QueryRowContext(ctx, query, args...).Scan(
 		&subID, &msgID, &payload, &createdAt,
-		&retryCount, &metadataJSON,
+		&retryCount, &metadataJSON, &errorMessage,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil
@@ -362,7 +387,8 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 
 	return pq.claimTopicSubscription(
 		ctx, tx, tableName, visibilityTimeout,
-		subID, msgID, payload, createdAt, retryCount, metadataJSON,
+		subID, msgID, payload, createdAt, retryCount, metadataJSON, errorMessage,
+		maxRetries,
 	)
 }
 
@@ -377,6 +403,8 @@ func (pq *PGQueue) claimTopicSubscription(
 	createdAt time.Time,
 	retryCount int,
 	metadataJSON sql.NullString,
+	errorMessage sql.NullString,
+	maxRetries int,
 ) (*Message, *time.Time, error) {
 	visTimeout := time.Now().Add(visibilityTimeout)
 
@@ -397,7 +425,12 @@ func (pq *PGQueue) claimTopicSubscription(
 		CreatedAt:  createdAt,
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
+		MaxRetries: maxRetries,
 		Metadata:   parseMetadataJSON(metadataJSON),
+	}
+
+	if errorMessage.Valid {
+		msg.ErrorMessage = &errorMessage.String
 	}
 
 	return msg, &visTimeout, nil

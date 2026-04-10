@@ -3,6 +3,7 @@ package pgqueue_test
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -98,7 +99,7 @@ func TestInitSchemaNilDB(t *testing.T) {
 		t.Fatal("InitSchema should fail with nil database")
 	}
 
-	expectedMsg := "database connection cannot be nil"
+	expectedMsg := "database connection is required"
 	if err.Error() != expectedMsg {
 		t.Errorf("expected error message %q, got %q", expectedMsg, err.Error())
 	}
@@ -118,7 +119,7 @@ func TestInitSchemaInvalidConnection(t *testing.T) {
 		t.Fatal("InitSchema should fail with invalid connection")
 	}
 
-	if err.Error()[:30] != "failed to initialize base sche" {
+	if !strings.Contains(err.Error(), "failed to initialize base schema") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }

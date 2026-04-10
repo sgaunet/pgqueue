@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -17,7 +18,9 @@ func (pq *PGQueue) getQueueTTL(configJSON []byte) time.Duration {
 	}
 
 	if len(configJSON) > 0 {
-		if err := json.Unmarshal(configJSON, &cfg); err == nil && cfg.TTL > 0 {
+		if err := json.Unmarshal(configJSON, &cfg); err != nil {
+			pq.logError("failed to unmarshal queue config for TTL", "error", err)
+		} else if cfg.TTL > 0 {
 			return cfg.TTL
 		}
 	}
@@ -64,6 +67,9 @@ func (pq *PGQueue) getQueueMetadata(
 		&meta.UpdatedAt,
 	)
 
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrQueueNotFound
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan queue metadata: %w", err)
 	}
@@ -96,10 +102,25 @@ func (pq *PGQueue) createQueueMetadata(
 	)
 
 	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, fmt.Errorf("%s/%s: %w", queueType, queueName, ErrQueueAlreadyExists)
+		}
 		return nil, fmt.Errorf("failed to insert queue metadata: %w", err)
 	}
 
 	return &meta, nil
+}
+
+// isUniqueViolation checks if a database error is a PostgreSQL unique constraint violation (SQLSTATE 23505).
+// Works with both pgx and lib/pq drivers by checking the error string.
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Both pgx (pgconn.PgError) and lib/pq (pq.Error) include "23505" or
+	// "unique constraint" in their error strings when a unique violation occurs.
+	errStr := err.Error()
+	return strings.Contains(errStr, "23505") || strings.Contains(errStr, "unique constraint")
 }
 
 func (pq *PGQueue) checkTableNameNotExists(
@@ -204,11 +225,19 @@ func (pq *PGQueue) unregisterSubscriber(
 	query := `
 		UPDATE pgqueue_subscribers
 		SET active = FALSE
-		WHERE topic_name = $1 AND subscriber_id = $2
+		WHERE topic_name = $1 AND subscriber_id = $2 AND active = TRUE
 	`
-	_, err := pq.db.ExecContext(ctx, query, topicName, subscriberID)
+	result, err := pq.db.ExecContext(ctx, query, topicName, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to unregister subscriber: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return ErrSubscriberNotFound
 	}
 
 	return nil

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,7 +53,8 @@ func (pq *PGQueue) ReplayFrom(
 	return count, nil
 }
 
-// ReplayMessage resets a specific message to pending status.
+// ReplayMessage resets a specific channel message to pending status.
+// Not supported for pub/sub queues (use ReplayFrom or ReplayDLQ instead).
 func (pq *PGQueue) ReplayMessage(
 	ctx context.Context,
 	queueName string,
@@ -60,6 +62,10 @@ func (pq *PGQueue) ReplayMessage(
 	messageID uuid.UUID,
 	opts ReplayOptions,
 ) error {
+	if queueType == QueueTypePubSub {
+		return ErrReplayNotSupported
+	}
+
 	if err := validateReplayOpts(opts); err != nil {
 		return fmt.Errorf("failed to validate replay options: %w", err)
 	}
@@ -91,6 +97,12 @@ func (pq *PGQueue) ReplayMessage(
 }
 
 // ReplayDLQ moves messages from DLQ back to the main queue.
+// When opts.Limit is 0, up to 10,000 messages are replayed in a single transaction.
+//
+// For pub/sub topics: the original message must still exist in the message table.
+// If CompletedMessageTTL is shorter than DLQRetention in your GC policy, the message
+// row may be garbage-collected before the DLQ entry, causing a foreign key error on replay.
+// Ensure DLQRetention does not exceed CompletedMessageTTL for pub/sub topics.
 func (pq *PGQueue) ReplayDLQ(
 	ctx context.Context,
 	queueName string,
@@ -158,7 +170,7 @@ func (pq *PGQueue) getReplayQueueMetadata(
 	metadata, err := pq.getQueueMetadata(
 		ctx, string(queueType), queueName,
 	)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, ErrQueueNotFound) {
 		return nil, fmt.Errorf(
 			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
 		)
@@ -182,13 +194,15 @@ func (pq *PGQueue) countReplayableMessages(
 			SELECT COUNT(*) FROM pgqueue_sub_%s
 			WHERE created_at >= $1
 			AND status != '%s'
-		`, tableName, MessageStatusPending)
+			AND status != '%s'
+		`, tableName, MessageStatusPending, MessageStatusProcessing)
 	} else {
 		countQuery = fmt.Sprintf(`
 			SELECT COUNT(*) FROM pgqueue_msg_%s
 			WHERE created_at >= $1
 			AND status != '%s'
-		`, tableName, MessageStatusPending)
+			AND status != '%s'
+		`, tableName, MessageStatusPending, MessageStatusProcessing)
 	}
 
 	var count int
@@ -242,15 +256,14 @@ func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
-			    ack_deadline = NULL,
 			    processed_at = NULL,
 			    error_message = NULL
 			WHERE id IN (
 				SELECT id FROM pgqueue_msg_%s
-				WHERE created_at >= $1 AND status != '%s'
+				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
 				LIMIT %d
 			)
-		`, tableName, MessageStatusPending, tableName, MessageStatusPending, limit)
+		`, tableName, MessageStatusPending, tableName, MessageStatusPending, MessageStatusProcessing, limit)
 	}
 
 	return fmt.Sprintf(`
@@ -258,12 +271,12 @@ func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
-		    ack_deadline = NULL,
 		    processed_at = NULL,
 		    error_message = NULL
 		WHERE created_at >= $1
 		AND status != '%s'
-	`, tableName, MessageStatusPending, MessageStatusPending)
+		AND status != '%s'
+	`, tableName, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 }
 
 func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
@@ -277,10 +290,10 @@ func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
 			    error_message = NULL
 			WHERE id IN (
 				SELECT id FROM pgqueue_sub_%s
-				WHERE created_at >= $1 AND status != '%s'
+				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
 				LIMIT %d
 			)
-		`, tableName, MessageStatusPending, tableName, MessageStatusPending, limit)
+		`, tableName, MessageStatusPending, tableName, MessageStatusPending, MessageStatusProcessing, limit)
 	}
 
 	return fmt.Sprintf(`
@@ -292,7 +305,8 @@ func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
 		    error_message = NULL
 		WHERE created_at >= $1
 		AND status != '%s'
-	`, tableName, MessageStatusPending, MessageStatusPending)
+		AND status != '%s'
+	`, tableName, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 }
 
 func (pq *PGQueue) checkMessageExists(
@@ -301,18 +315,20 @@ func (pq *PGQueue) checkMessageExists(
 	messageID uuid.UUID,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
-	checkQuery := fmt.Sprintf(`
-		SELECT EXISTS(SELECT 1 FROM pgqueue_msg_%s WHERE id = $1)
-	`, tableName)
+	checkQuery := fmt.Sprintf(
+		`SELECT status FROM pgqueue_msg_%s WHERE id = $1`, tableName,
+	)
 
-	var exists bool
-	if err := pq.db.QueryRowContext(
-		ctx, checkQuery, messageID,
-	).Scan(&exists); err != nil {
+	var status string
+	err := pq.db.QueryRowContext(ctx, checkQuery, messageID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%s: %w", messageID, ErrReplayMessageNotFound)
+	}
+	if err != nil {
 		return fmt.Errorf("failed to check message: %w", err)
 	}
-	if !exists {
-		return fmt.Errorf("%s: %w", messageID, ErrReplayMessageNotFound)
+	if MessageStatus(status) == MessageStatusProcessing {
+		return fmt.Errorf("%s: %w", messageID, ErrMessageInProcessing)
 	}
 
 	return nil
@@ -329,11 +345,10 @@ func (pq *PGQueue) executeReplayMessage(
 		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
-		    ack_deadline = NULL,
 		    processed_at = NULL,
 		    error_message = NULL
-		WHERE id = $1
-	`, tableName, MessageStatusPending)
+		WHERE id = $1 AND status != '%s'
+	`, tableName, MessageStatusPending, MessageStatusProcessing)
 
 	result, err := pq.db.ExecContext(ctx, query, messageID)
 	if err != nil {
@@ -346,6 +361,15 @@ func (pq *PGQueue) executeReplayMessage(
 	}
 
 	if rows == 0 {
+		// Distinguish "not found" from "currently being processed"
+		var status string
+		checkQuery := fmt.Sprintf( //nolint:gosec // G201: table name validated by queueNameRegex
+			`SELECT status FROM pgqueue_msg_%s WHERE id = $1`, tableName,
+		)
+		err := pq.db.QueryRowContext(ctx, checkQuery, messageID).Scan(&status)
+		if err == nil && MessageStatus(status) == MessageStatusProcessing {
+			return fmt.Errorf("%s: %w", messageID, ErrMessageInProcessing)
+		}
 		return fmt.Errorf("%s: %w", messageID, ErrReplayMessageNotFound)
 	}
 
@@ -404,21 +428,25 @@ type dlqRow struct {
 	metadata          []byte
 }
 
+// defaultDLQReplayLimit prevents unbounded memory usage when replaying DLQ messages.
+const defaultDLQReplayLimit = 10000
+
 func (pq *PGQueue) fetchDLQMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	limit int,
 ) ([]dlqRow, error) {
+	if limit <= 0 {
+		limit = defaultDLQReplayLimit
+	}
+
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	selectQuery := fmt.Sprintf(`
 		SELECT id, original_message_id, payload, metadata
 		FROM pgqueue_dlq_%s
-	`, tableName)
-
-	if limit > 0 {
-		selectQuery += fmt.Sprintf(" LIMIT %d", limit)
-	}
+		LIMIT %d
+	`, tableName, limit)
 
 	rows, err := tx.QueryContext(ctx, selectQuery)
 	if err != nil {
@@ -440,10 +468,6 @@ func (pq *PGQueue) fetchDLQMessages(
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating DLQ messages: %w", err)
-	}
-
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close rows: %w", err)
 	}
 
 	return dlqMessages, nil
@@ -469,35 +493,87 @@ func (pq *PGQueue) reinsertDLQChannel(
 	tableName string,
 	dlqMessages []dlqRow,
 ) (int, error) {
-	//nolint:gosec // G201: table name validated by queueNameRegex
-	insertQuery := fmt.Sprintf(`
-		INSERT INTO pgqueue_msg_%s
-			(id, payload, created_at, status, retry_count, metadata)
-		VALUES ($1, $2, NOW(), '%s', 0, $3)
-		ON CONFLICT (id) DO NOTHING
-	`, tableName, MessageStatusPending)
+	if len(dlqMessages) == 0 {
+		return 0, nil
+	}
 
-	count := 0
+	// Insert messages and collect which IDs were actually inserted (ON CONFLICT skips dupes).
+	insertedIDs, err := pq.insertDLQChannelMessages(ctx, tx, tableName, dlqMessages)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(insertedIDs) == 0 {
+		return 0, nil
+	}
+
+	// Only delete DLQ entries whose messages were actually reinserted
+	dlqIDs := make([]uuid.UUID, 0, len(insertedIDs))
 	for _, msg := range dlqMessages {
-		result, err := tx.ExecContext(
-			ctx, insertQuery,
-			msg.originalMessageID, msg.payload, msg.metadata,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("failed to insert message: %w", err)
-		}
-
-		affected, _ := result.RowsAffected()
-		if affected > 0 {
-			count++
-
-			if err := pq.deleteDLQEntry(ctx, tx, tableName, msg.id); err != nil {
-				return 0, err
-			}
+		if _, ok := insertedIDs[msg.originalMessageID]; ok {
+			dlqIDs = append(dlqIDs, msg.id)
 		}
 	}
 
-	return count, nil
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	deleteQuery := fmt.Sprintf(
+		`DELETE FROM pgqueue_dlq_%s WHERE id = ANY($1::uuid[])`, tableName,
+	)
+	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
+		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
+	}
+
+	return len(insertedIDs), nil
+}
+
+// insertDLQChannelMessages batch-inserts DLQ messages back into the channel message table.
+// Returns the set of message IDs that were actually inserted (ON CONFLICT skips duplicates).
+func (pq *PGQueue) insertDLQChannelMessages(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	dlqMessages []dlqRow,
+) (map[uuid.UUID]struct{}, error) {
+	const paramsPerRow = 3 // id, payload, metadata
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb,
+		"INSERT INTO pgqueue_msg_%s (id, payload, created_at, status, retry_count, metadata) VALUES ",
+		tableName,
+	)
+
+	args := make([]any, 0, len(dlqMessages)*paramsPerRow)
+	for i, msg := range dlqMessages {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		base := i * paramsPerRow
+		fmt.Fprintf(&sb, "($%d, $%d, NOW(), '%s', 0, $%d)",
+			base+1, base+2, MessageStatusPending, base+3, //nolint:mnd // SQL placeholder arithmetic
+		)
+		args = append(args, msg.originalMessageID, msg.payload, msg.metadata)
+	}
+	sb.WriteString(" ON CONFLICT (id) DO NOTHING RETURNING id")
+
+	rows, err := tx.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert messages: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	insertedIDs := make(map[uuid.UUID]struct{})
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan inserted message ID: %w", err)
+		}
+		insertedIDs[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate inserted messages: %w", err)
+	}
+
+	return insertedIDs, nil
 }
 
 // reinsertDLQPubSub re-creates subscription records for pub/sub DLQ messages.
@@ -509,67 +585,45 @@ func (pq *PGQueue) reinsertDLQPubSub(
 	queueName, tableName string,
 	dlqMessages []dlqRow,
 ) (int, error) {
-	count := 0
-	for _, msg := range dlqMessages {
-		if err := pq.createSubscriptionRecords(
-			ctx, tx, queueName, tableName, msg.originalMessageID,
-		); err != nil {
-			return 0, fmt.Errorf(
-				"failed to create subscription records: %w", err,
-			)
+	if len(dlqMessages) == 0 {
+		return 0, nil
+	}
+
+	// Get active subscribers once for all messages
+	subscribers, err := pq.getActiveSubscribers(ctx, tx, queueName)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get active subscribers: %w", err)
+	}
+
+	// Batch create subscription records for all messages
+	if len(subscribers) > 0 {
+		messageIDs := make([]uuid.UUID, len(dlqMessages))
+		for i, msg := range dlqMessages {
+			messageIDs[i] = msg.originalMessageID
 		}
 
-		count++
-
-		if err := pq.deleteDLQEntry(ctx, tx, tableName, msg.id); err != nil {
-			return 0, err
+		if err := pq.batchCreateSubscriptionRecords(
+			ctx, tx, tableName, messageIDs, subscribers,
+		); err != nil {
+			return 0, fmt.Errorf("failed to create subscription records: %w", err)
 		}
 	}
 
-	return count, nil
-}
+	// Batch delete DLQ entries
+	dlqIDs := make([]uuid.UUID, len(dlqMessages))
+	for i, msg := range dlqMessages {
+		dlqIDs[i] = msg.id
+	}
 
-func (pq *PGQueue) deleteDLQEntry(
-	ctx context.Context,
-	tx *sql.Tx,
-	tableName string,
-	dlqID uuid.UUID,
-) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM pgqueue_dlq_%s WHERE id = $1`, tableName,
+		`DELETE FROM pgqueue_dlq_%s WHERE id = ANY($1::uuid[])`, tableName,
 	)
-
-	if _, err := tx.ExecContext(ctx, deleteQuery, dlqID); err != nil {
-		return fmt.Errorf("failed to delete from DLQ: %w", err)
+	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
+		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
 	}
 
-	return nil
-}
-
-// logReplay logs a replay operation to the audit log.
-func (pq *PGQueue) logReplay(
-	ctx context.Context,
-	queueName string,
-	queueType QueueType,
-	operation string,
-	messageCount int,
-	performedBy, details string,
-) error {
-	params, err := json.Marshal(map[string]string{"details": details})
-	if err != nil {
-		return fmt.Errorf("failed to marshal replay params: %w", err)
-	}
-
-	var createdBy *string
-	if performedBy != "" {
-		createdBy = &performedBy
-	}
-
-	return pq.createReplayLog(
-		ctx, string(queueType), queueName,
-		operation, params, messageCount, createdBy,
-	)
+	return len(dlqMessages), nil
 }
 
 func (pq *PGQueue) logReplayIfNeeded(
@@ -580,13 +634,20 @@ func (pq *PGQueue) logReplayIfNeeded(
 	count int,
 	performedBy, details string,
 ) {
-	if performedBy == "" {
+	params, err := json.Marshal(map[string]string{"details": details})
+	if err != nil {
+		pq.logError("failed to marshal replay params", "error", err)
 		return
 	}
 
-	if err := pq.logReplay(
-		ctx, queueName, queueType,
-		operation, count, performedBy, details,
+	var createdBy *string
+	if performedBy != "" {
+		createdBy = &performedBy
+	}
+
+	if err := pq.createReplayLog(
+		ctx, string(queueType), queueName,
+		operation, params, count, createdBy,
 	); err != nil {
 		pq.logError("failed to log replay operation", "error", err)
 	}

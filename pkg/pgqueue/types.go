@@ -2,6 +2,7 @@ package pgqueue
 
 import (
 	"database/sql"
+	"encoding/json"
 	"log/slog"
 	"time"
 
@@ -46,18 +47,13 @@ type TopicOptions struct {
 	MaxMessageSize int           // Maximum message size (0 = use default)
 	TTL            time.Duration // Message time-to-live (0 = no expiration)
 	MaxRetries     int           // Maximum retry attempts per subscriber (0 = use default)
-	RetentionTTL   time.Duration // How long to retain completed messages (0 = immediate cleanup)
 }
 
 // ChannelOptions holds configuration for a point-to-point channel.
 type ChannelOptions struct {
-	MaxMessageSize       int           // Maximum message size (0 = use default)
-	TTL                  time.Duration // Message time-to-live (0 = no expiration)
-	MaxRetries           int           // Maximum retry attempts (0 = use default)
-	RetentionTTL         time.Duration // How long to retain completed messages (0 = immediate cleanup)
-	MaxConcurrency       int           // Maximum concurrent consumers (0 = unlimited)
-	VisibilityTimeout    time.Duration // How long a message is invisible after being consumed (default: 30s)
-	AcknowledgmentTimeout time.Duration // Maximum time to acknowledge a message (0 = no deadline)
+	MaxMessageSize int           // Maximum message size (0 = use default)
+	TTL            time.Duration // Message time-to-live (0 = no expiration)
+	MaxRetries     int           // Maximum retry attempts (0 = use default)
 }
 
 // Message represents a message in the queue.
@@ -69,35 +65,24 @@ type Message struct {
 	RetryCount        int
 	MaxRetries        int
 	VisibilityTimeout *time.Time
-	AckDeadline       *time.Time
 	ProcessedAt       *time.Time
 	ErrorMessage      *string
 	Metadata          map[string]any
 }
 
-// Subscription represents a pub/sub subscription record.
-type Subscription struct {
-	ID           uuid.UUID
-	MessageID    uuid.UUID
-	SubscriberID string
-	Status       MessageStatus
-	CreatedAt    time.Time
-	AckedAt      *time.Time
-}
-
-// QueueMetadata holds information about a queue (database model).
+// QueueMetadata holds information about a queue.
 type QueueMetadata struct {
 	ID        uuid.UUID
-	QueueType string
+	QueueType QueueType
 	QueueName string
 	TableName string
-	Config    []byte // json.RawMessage from database
+	Config    json.RawMessage
 	Paused    bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
-// Subscriber represents a pub/sub subscriber registration (database model).
+// Subscriber represents a pub/sub subscriber registration.
 type Subscriber struct {
 	ID           uuid.UUID
 	TopicName    string
@@ -106,7 +91,7 @@ type Subscriber struct {
 	Active       bool
 }
 
-// ReplayLog represents an audit log entry for replay operations (database model).
+// ReplayLog represents an audit log entry for replay operations.
 type ReplayLog struct {
 	ID           uuid.UUID
 	QueueType    string
@@ -141,9 +126,14 @@ type DLQMessage struct {
 }
 
 // RetentionPolicy defines how messages should be garbage collected.
+//
+// WARNING for pub/sub topics: MaxPendingAge deletes the parent message row, which
+// cascades to ALL subscription records for that message — including those already
+// acked by other subscribers. Use with caution on pub/sub topics where subscribers
+// process at different speeds.
 type RetentionPolicy struct {
 	CompletedMessageTTL time.Duration // How long to keep completed messages (0 = forever)
-	MaxPendingAge       time.Duration // Maximum age for pending messages (0 = no limit)
+	MaxPendingAge       time.Duration // Maximum age for pending messages (0 = no limit; see WARNING above for pub/sub)
 	DLQRetention        time.Duration // How long to keep DLQ messages (0 = forever)
 }
 
@@ -170,4 +160,33 @@ type ReplayOptions struct {
 	Limit       int    // Maximum number of messages to replay (0 = no limit)
 	Confirm     bool   // Explicit confirmation required
 	PerformedBy string // Who initiated the replay (for audit log)
+}
+
+// SubscriberHealth holds health information for a subscriber.
+type SubscriberHealth struct {
+	TopicName       string
+	SubscriberID    string
+	PendingMessages int64
+	StuckMessages   int64
+	OldestPending   *time.Time
+	LastActivity    *time.Time
+}
+
+// SubscriberLag holds lag information for a subscriber.
+type SubscriberLag struct {
+	SubscriberID     string
+	TopicName        string
+	PendingCount     int64
+	ProcessingCount  int64
+	AckedCount       int64
+	OldestPendingAge *time.Duration
+}
+
+// DLQStats holds statistics about the dead letter queue.
+type DLQStats struct {
+	QueueName     string
+	TotalCount    int64
+	OldestMovedAt *time.Time
+	NewestMovedAt *time.Time
+	AvgRetryCount float64
 }

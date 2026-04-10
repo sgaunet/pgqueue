@@ -2,15 +2,18 @@ package pgqueue
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const defaultGCInterval   = 5 * time.Minute
-const defaultGCMaxWorkers = 10
+const (
+	defaultGCInterval         = 5 * time.Minute
+	defaultGCMaxWorkers       = 10
+	gcSlowCollectThreshold    = 100 * time.Millisecond // L5: named constant for slow GC logging
+)
 
 // GarbageCollector handles automatic cleanup of old messages.
 type GarbageCollector struct {
@@ -18,6 +21,7 @@ type GarbageCollector struct {
 	config   GarbageCollectorConfig
 	stopChan chan struct{}
 	stopOnce sync.Once
+	started  atomic.Bool
 	wg       sync.WaitGroup
 }
 
@@ -44,26 +48,17 @@ func NewGarbageCollector(
 	}
 }
 
-// Start begins the garbage collection loop.
+// Start begins the garbage collection loop in a background goroutine.
+// Safe to call multiple times; only the first call starts the loop.
+// Stop() can be called at any time after Start() returns.
+// A GarbageCollector cannot be restarted after Stop() or context cancellation;
+// create a new instance via NewGarbageCollector instead.
 func (gc *GarbageCollector) Start(ctx context.Context) {
-	gc.wg.Add(1)
-	defer gc.wg.Done()
-
-	ticker := time.NewTicker(gc.config.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-gc.stopChan:
-			return
-		case <-ticker.C:
-			if err := gc.Collect(ctx); err != nil {
-				gc.pq.logError("garbage collection error", "error", err)
-			}
-		}
+	if !gc.started.CompareAndSwap(false, true) {
+		return
 	}
+	gc.wg.Add(1)
+	go gc.run(ctx)
 }
 
 // Stop gracefully stops the garbage collector.
@@ -88,7 +83,7 @@ func (gc *GarbageCollector) PurgeQueue(
 	metadata, err := gc.pq.getQueueMetadata(
 		ctx, string(queueType), queueName,
 	)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, ErrQueueNotFound) {
 		return fmt.Errorf(
 			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
 		)
@@ -123,6 +118,9 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, gc.config.MaxWorkers)
 
+	var mu sync.Mutex
+	var errs []error
+
 	for _, queue := range allQueues {
 		select {
 		case <-ctx.Done():
@@ -140,7 +138,10 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 						"queue", q.QueueName, "error", err,
 						"duration", time.Since(start),
 					)
-				} else if d := time.Since(start); d > 100*time.Millisecond {
+					mu.Lock()
+					errs = append(errs, fmt.Errorf("queue %s: %w", q.QueueName, err))
+					mu.Unlock()
+				} else if d := time.Since(start); d > gcSlowCollectThreshold {
 					gc.pq.logInfo("collected queue",
 						"queue", q.QueueName, "duration", d,
 					)
@@ -150,7 +151,27 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	}
 
 	wg.Wait()
-	return nil
+	return errors.Join(errs...)
+}
+
+func (gc *GarbageCollector) run(ctx context.Context) {
+	defer gc.wg.Done()
+
+	ticker := time.NewTicker(gc.config.Interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-gc.stopChan:
+			return
+		case <-ticker.C:
+			if err := gc.Collect(ctx); err != nil {
+				gc.pq.logError("garbage collection error", "error", err)
+			}
+		}
+	}
 }
 
 func (gc *GarbageCollector) executePurge(
@@ -164,6 +185,15 @@ func (gc *GarbageCollector) executePurge(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// For pub/sub, delete subscriptions first (before messages, to avoid FK issues
+	// if CASCADE is not relied upon). For channels, this table does not exist.
+	if queueType == QueueTypePubSub {
+		deleteSub := "DELETE FROM pgqueue_sub_" + tableName //nolint:gosec // G201: table name validated
+		if _, err := tx.ExecContext(ctx, deleteSub); err != nil {
+			return fmt.Errorf("failed to delete subscriptions: %w", err)
+		}
+	}
+
 	// Delete all messages
 	deleteMsg := "DELETE FROM pgqueue_msg_" + tableName //nolint:gosec // G201: table name validated
 	if _, err := tx.ExecContext(ctx, deleteMsg); err != nil {
@@ -174,14 +204,6 @@ func (gc *GarbageCollector) executePurge(
 	deleteDLQ := "DELETE FROM pgqueue_dlq_" + tableName //nolint:gosec // G201: table name validated
 	if _, err := tx.ExecContext(ctx, deleteDLQ); err != nil {
 		return fmt.Errorf("failed to delete DLQ messages: %w", err)
-	}
-
-	// For pub/sub, delete subscriptions
-	if queueType == QueueTypePubSub {
-		deleteSub := "DELETE FROM pgqueue_sub_" + tableName //nolint:gosec // G201: table name validated
-		if _, err := tx.ExecContext(ctx, deleteSub); err != nil {
-			return fmt.Errorf("failed to delete subscriptions: %w", err)
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -210,7 +232,7 @@ func (gc *GarbageCollector) applyRetentionPolicy(
 	queue QueueMetadata,
 	policy RetentionPolicy,
 ) error {
-	queueType := QueueType(queue.QueueType)
+	queueType := queue.QueueType
 
 	if policy.CompletedMessageTTL > 0 {
 		if err := gc.purgeCompletedMessages(
@@ -243,13 +265,13 @@ func (gc *GarbageCollector) resetTimedOutEntries(
 	ctx context.Context,
 	queue QueueMetadata,
 ) error {
-	if queue.QueueType == string(QueueTypeChannel) {
+	if queue.QueueType == QueueTypeChannel {
 		if err := gc.resetTimedOutMessages(ctx, queue.TableName); err != nil {
 			return fmt.Errorf("failed to reset timed-out messages: %w", err)
 		}
 	}
 
-	if queue.QueueType == string(QueueTypePubSub) {
+	if queue.QueueType == QueueTypePubSub {
 		if err := gc.resetTimedOutSubscriptions(ctx, queue.TableName); err != nil {
 			return fmt.Errorf(
 				"failed to reset timed-out subscriptions: %w", err,
@@ -307,6 +329,11 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 	return nil
 }
 
+// purgeOldPendingMessages deletes messages that have been pending longer than maxAge.
+// For pub/sub, a message is deleted if ANY subscriber still has it pending past the cutoff.
+// WARNING: For pub/sub, deleting the message row cascades to ALL subscription records,
+// including those already acked by other subscribers. This differs from
+// purgeCompletedMessages which requires ALL subscribers to have acked.
 func (gc *GarbageCollector) purgeOldPendingMessages(
 	ctx context.Context,
 	tableName string,

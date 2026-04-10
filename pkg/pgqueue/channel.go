@@ -13,6 +13,9 @@ import (
 const (
 	minVisibilityTimeout = 1 * time.Millisecond
 	maxVisibilityTimeout = 24 * time.Hour
+
+	// maxErrorMessageLength is the maximum stored length for nack error messages.
+	maxErrorMessageLength = 1024
 )
 
 func validateVisibilityTimeout(d time.Duration) error {
@@ -39,6 +42,9 @@ func (pq *PGQueue) ConsumeFromChannel(
 		ctx, string(QueueTypeChannel), channelName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return nil, fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+		}
 		return nil, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
@@ -62,7 +68,6 @@ func (pq *PGQueue) ConsumeFromChannel(
 		return nil, fmt.Errorf("failed to fetch pending channel message: %w", err)
 	}
 	if msg == nil {
-		_ = tx.Rollback()
 		return nil, nil //nolint:nilnil // nil message indicates no messages available
 	}
 
@@ -86,6 +91,9 @@ func (pq *PGQueue) AckChannel(
 		ctx, string(QueueTypeChannel), channelName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+		}
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
@@ -106,23 +114,28 @@ func (pq *PGQueue) AckChannel(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return ErrMessageNotFound
+		return ErrMessageAlreadyAcked
 	}
 
 	return nil
 }
 
 // NackChannel negatively acknowledges a message from a channel (retry or move to DLQ).
+// The errorMsg is truncated to 1024 characters if it exceeds that length.
 func (pq *PGQueue) NackChannel(
 	ctx context.Context,
 	channelName string,
 	messageID uuid.UUID,
 	errorMsg string,
 ) error {
+	errorMsg = truncateErrorMsg(errorMsg)
 	queueMeta, err := pq.getQueueMetadata(
 		ctx, string(QueueTypeChannel), channelName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+		}
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
@@ -179,7 +192,8 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		SELECT id, payload, created_at, retry_count, max_retries, metadata
+		SELECT id, payload, created_at, retry_count, max_retries, metadata,
+		       processed_at, error_message
 		FROM pgqueue_msg_%s
 		WHERE status = '%s'
 		  AND (visibility_timeout IS NULL OR visibility_timeout < NOW())
@@ -195,10 +209,13 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 	var retryCount int
 	var maxRetries sql.NullInt32
 	var metadataJSON sql.NullString
+	var processedAt sql.NullTime
+	var errorMessage sql.NullString
 
 	err := tx.QueryRowContext(ctx, query, args...).Scan(
 		&msgID, &payload, &createdAt,
 		&retryCount, &maxRetries, &metadataJSON,
+		&processedAt, &errorMessage,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil
@@ -210,6 +227,7 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 	return pq.claimChannelMessage(
 		ctx, tx, tableName, visibilityTimeout,
 		msgID, payload, createdAt, retryCount, maxRetries, metadataJSON,
+		processedAt, errorMessage,
 	)
 }
 
@@ -225,6 +243,8 @@ func (pq *PGQueue) claimChannelMessage(
 	retryCount int,
 	maxRetries sql.NullInt32,
 	metadataJSON sql.NullString,
+	processedAt sql.NullTime,
+	errorMessage sql.NullString,
 ) (*Message, *time.Time, error) {
 	visTimeout := time.Now().Add(visibilityTimeout)
 
@@ -251,6 +271,12 @@ func (pq *PGQueue) claimChannelMessage(
 	if maxRetries.Valid {
 		msg.MaxRetries = int(maxRetries.Int32)
 	}
+	if processedAt.Valid {
+		msg.ProcessedAt = &processedAt.Time
+	}
+	if errorMessage.Valid {
+		msg.ErrorMessage = &errorMessage.String
+	}
 
 	return msg, &visTimeout, nil
 }
@@ -275,7 +301,6 @@ func (pq *PGQueue) getProcessingMessageState(
 		&state.payload, &state.metadataJSON,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		_ = tx.Rollback()
 		return nil, ErrMessageNotFound
 	}
 	if err != nil {
@@ -371,4 +396,11 @@ func (pq *PGQueue) retryMessage(
 	}
 
 	return nil
+}
+
+func truncateErrorMsg(msg string) string {
+	if len(msg) > maxErrorMessageLength {
+		return msg[:maxErrorMessageLength]
+	}
+	return msg
 }

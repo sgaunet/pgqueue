@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -20,6 +21,12 @@ const (
 
 // PublishBatch publishes multiple messages to a channel or topic in a single operation.
 // Returns message IDs in the same order as the input messages.
+//
+// The operation is atomic (all-or-nothing): if any message has a duplicate ID,
+// the entire batch is rolled back and ErrDuplicateMessageID is returned.
+//
+// Note: batch ack/nack operations require the pgx driver (jackc/pgx); lib/pq is not
+// supported for operations that use ANY($1::uuid[]) array parameters.
 func (pq *PGQueue) PublishBatch(
 	ctx context.Context,
 	queueName string,
@@ -39,6 +46,9 @@ func (pq *PGQueue) PublishBatch(
 
 	// Validate all payloads upfront before any DB work
 	for i := range messages {
+		if messages[i].Payload == nil {
+			return nil, ErrNilPayload
+		}
 		if err := pq.validatePayloadSize(queueMeta, messages[i].Payload); err != nil {
 			return nil, err
 		}
@@ -49,7 +59,7 @@ func (pq *PGQueue) PublishBatch(
 		return nil, err
 	}
 
-	queueType := QueueType(queueMeta.QueueType)
+	queueType := queueMeta.QueueType
 	if queueType == QueueTypePubSub {
 		return ids, pq.publishBatchToPubSub(
 			ctx, queueMeta.QueueName, queueMeta.TableName,
@@ -66,6 +76,9 @@ func (pq *PGQueue) PublishBatch(
 }
 
 // AckChannelBatch acknowledges multiple messages from a channel in a single operation.
+// Returns ErrMessageAlreadyAcked only if no messages were updated.
+// If some but not all IDs were in processing state, the rest are silently skipped
+// and nil is returned (partial success).
 func (pq *PGQueue) AckChannelBatch(
 	ctx context.Context,
 	channelName string,
@@ -82,6 +95,9 @@ func (pq *PGQueue) AckChannelBatch(
 		ctx, string(QueueTypeChannel), channelName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+		}
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
@@ -103,13 +119,16 @@ func (pq *PGQueue) AckChannelBatch(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return ErrMessageNotFound
+		return ErrMessageAlreadyAcked
 	}
 
 	return nil
 }
 
 // AckTopicBatch acknowledges multiple messages for a subscriber in a single operation.
+// Returns ErrMessageAlreadyAcked only if no messages were updated.
+// If some but not all IDs were in processing state, the rest are silently skipped
+// and nil is returned (partial success).
 func (pq *PGQueue) AckTopicBatch(
 	ctx context.Context,
 	topicName string,
@@ -130,6 +149,9 @@ func (pq *PGQueue) AckTopicBatch(
 		ctx, string(QueueTypePubSub), topicName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
@@ -162,12 +184,15 @@ func (pq *PGQueue) AckTopicBatch(
 
 // NackChannelBatch negatively acknowledges multiple messages from a channel.
 // Messages that exceed max retries are moved to DLQ; others are retried.
+// The errorMsg is truncated to 1024 characters if it exceeds that length.
 func (pq *PGQueue) NackChannelBatch(
 	ctx context.Context,
 	channelName string,
 	messageIDs []uuid.UUID,
 	errorMsg string,
 ) error {
+	errorMsg = truncateErrorMsg(errorMsg)
+
 	if len(messageIDs) == 0 {
 		return nil
 	}
@@ -179,6 +204,9 @@ func (pq *PGQueue) NackChannelBatch(
 		ctx, string(QueueTypeChannel), channelName,
 	)
 	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+		}
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
@@ -207,6 +235,81 @@ func (pq *PGQueue) NackChannelBatch(
 	}
 
 	return nil
+}
+
+// NackTopicBatch negatively acknowledges multiple messages for a subscriber from a topic.
+// Messages that exceed max retries are moved to DLQ; others are retried.
+// The errorMsg is truncated to 1024 characters if it exceeds that length.
+func (pq *PGQueue) NackTopicBatch(
+	ctx context.Context,
+	topicName string,
+	subscriberID string,
+	messageIDs []uuid.UUID,
+	errorMsg string,
+) error {
+	errorMsg = truncateErrorMsg(errorMsg)
+
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return err
+	}
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	if err := validateBatchSize(len(messageIDs)); err != nil {
+		return err
+	}
+
+	queueMeta, err := pq.getTopicMetadata(ctx, topicName)
+	if err != nil {
+		return err
+	}
+
+	tx, err := pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	states, err := pq.fetchBatchSubStates(
+		ctx, tx, queueMeta.TableName, messageIDs, subscriberID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get subscription states: %w", err)
+	}
+	if len(states) == 0 {
+		return ErrMessageNotFound
+	}
+
+	maxRetry := pq.resolveMaxRetries(queueMeta)
+
+	if err := pq.processNackTopicBatch(
+		ctx, tx, queueMeta.TableName, subscriberID, states, maxRetry, errorMsg,
+	); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// getTopicMetadata retrieves topic metadata, translating not-found to ErrTopicNotFound.
+func (pq *PGQueue) getTopicMetadata(
+	ctx context.Context,
+	topicName string,
+) (*QueueMetadata, error) {
+	queueMeta, err := pq.getQueueMetadata(
+		ctx, string(QueueTypePubSub), topicName,
+	)
+	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
+		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
+	}
+	return queueMeta, nil
 }
 
 // processNackBatch partitions messages into retry vs DLQ and processes each group.
@@ -300,6 +403,12 @@ func (pq *PGQueue) publishBatchToChannel(
 	metadataJSONs [][]byte,
 	maxRetries int,
 ) error {
+	tx, err := pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var sb strings.Builder
 	fmt.Fprintf(&sb,
 		"INSERT INTO pgqueue_msg_%s (id, payload, status, metadata, max_retries) VALUES ",
@@ -319,7 +428,7 @@ func (pq *PGQueue) publishBatchToChannel(
 	}
 	sb.WriteString(" ON CONFLICT (id) DO NOTHING")
 
-	result, err := pq.db.ExecContext(ctx, sb.String(), args...)
+	result, err := tx.ExecContext(ctx, sb.String(), args...)
 	if err != nil {
 		return fmt.Errorf("failed to insert messages: %w", err)
 	}
@@ -329,6 +438,10 @@ func (pq *PGQueue) publishBatchToChannel(
 		return fmt.Errorf(
 			"some messages had duplicate IDs: %w", ErrDuplicateMessageID,
 		)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
@@ -460,6 +573,7 @@ func (pq *PGQueue) batchCreateSubscriptionRecords(
 			fmt.Fprintf(&sb, "($%d, $%d, '%s')", base+1, base+2, MessageStatusPending) //nolint:mnd // SQL placeholder arithmetic
 			args = append(args, rec.messageID, rec.subscriberID)
 		}
+		sb.WriteString(" ON CONFLICT (message_id, subscriber_id) DO NOTHING")
 
 		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return fmt.Errorf("failed to insert subscription records: %w", err)
@@ -555,9 +669,12 @@ func (pq *PGQueue) batchMoveToDLQ(
 	messages []batchDLQMessage,
 	errorMsg string,
 ) error {
+	dlqInsert := fmt.Sprintf(
+		`INSERT INTO pgqueue_dlq_%s (original_message_id, payload, failure_reason, retry_count, metadata) VALUES `,
+		tableName,
+	)
+
 	var sb strings.Builder
-	dlqInsert := "INSERT INTO pgqueue_dlq_" + tableName +
-		" (original_message_id, payload, failure_reason, retry_count, metadata) VALUES "
 	sb.WriteString(dlqInsert)
 
 	args := make([]any, 0, len(messages)*dlqInsertParams)
@@ -582,18 +699,188 @@ func (pq *PGQueue) batchMoveToDLQ(
 	}
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
-	deleteQuery := fmt.Sprintf(
+	delQuery := fmt.Sprintf(
 		`DELETE FROM pgqueue_msg_%s WHERE id = ANY($1::uuid[])`,
 		tableName,
 	)
-	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
+	if _, err := tx.ExecContext(ctx, delQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
 		return fmt.Errorf("failed to delete messages: %w", err)
 	}
 
 	return nil
 }
 
+type batchSubState struct {
+	messageID    uuid.UUID
+	retryCount   int
+	payload      []byte
+	metadataJSON sql.NullString
+}
+
+func (pq *PGQueue) fetchBatchSubStates(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	messageIDs []uuid.UUID,
+	subscriberID string,
+) ([]batchSubState, error) {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		SELECT s.message_id, s.retry_count, m.payload, m.metadata
+		FROM pgqueue_sub_%s s
+		JOIN pgqueue_msg_%s m ON s.message_id = m.id
+		WHERE s.message_id = ANY($1::uuid[])
+		  AND s.subscriber_id = $2
+		  AND s.status = '%s'
+		FOR UPDATE OF s
+	`, tableName, tableName, MessageStatusProcessing)
+
+	rows, err := tx.QueryContext(ctx, query, uuidSliceToStringSlice(messageIDs), subscriberID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query subscriptions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var states []batchSubState
+	for rows.Next() {
+		var s batchSubState
+		if err := rows.Scan(
+			&s.messageID, &s.retryCount,
+			&s.payload, &s.metadataJSON,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan subscription: %w", err)
+		}
+		states = append(states, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate subscriptions: %w", err)
+	}
+
+	return states, nil
+}
+
+// processNackTopicBatch partitions subscriptions into retry vs DLQ and processes each group.
+func (pq *PGQueue) processNackTopicBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName, subscriberID string,
+	states []batchSubState,
+	maxRetry int,
+	errorMsg string,
+) error {
+	var retryIDs []uuid.UUID
+	var dlqMessages []batchDLQMessage
+
+	for _, s := range states {
+		if s.retryCount+1 > maxRetry {
+			dlqMessages = append(dlqMessages, batchDLQMessage{
+				id:           s.messageID,
+				payload:      s.payload,
+				retryCount:   s.retryCount + 1,
+				metadataJSON: s.metadataJSON,
+			})
+		} else {
+			retryIDs = append(retryIDs, s.messageID)
+		}
+	}
+
+	if len(retryIDs) > 0 {
+		if err := pq.batchRetrySubscriptions(
+			ctx, tx, tableName, retryIDs, subscriberID, errorMsg,
+		); err != nil {
+			return fmt.Errorf("failed to retry subscriptions: %w", err)
+		}
+	}
+
+	if len(dlqMessages) > 0 {
+		if err := pq.batchMoveSubToDLQ(
+			ctx, tx, tableName, subscriberID, dlqMessages, errorMsg,
+		); err != nil {
+			return fmt.Errorf("failed to move subscriptions to DLQ: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (pq *PGQueue) batchRetrySubscriptions(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	messageIDs []uuid.UUID,
+	subscriberID, errorMsg string,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		UPDATE pgqueue_sub_%s
+		SET status = '%s',
+		    retry_count = retry_count + 1,
+		    visibility_timeout = NULL,
+		    error_message = $3
+		WHERE message_id = ANY($1::uuid[])
+		  AND subscriber_id = $2
+	`, tableName, MessageStatusPending)
+
+	_, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs), subscriberID, errorMsg)
+	if err != nil {
+		return fmt.Errorf("failed to update subscriptions: %w", err)
+	}
+
+	return nil
+}
+
+func (pq *PGQueue) batchMoveSubToDLQ(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName, subscriberID string,
+	messages []batchDLQMessage,
+	errorMsg string,
+) error {
+	// Batch insert into DLQ
+	dlqPrefix := fmt.Sprintf(
+		`INSERT INTO pgqueue_dlq_%s (original_message_id, payload, failure_reason, retry_count, metadata) VALUES `,
+		tableName,
+	)
+
+	var sb strings.Builder
+	sb.WriteString(dlqPrefix)
+
+	args := make([]any, 0, len(messages)*dlqInsertParams)
+	for i, msg := range messages {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		base := i * dlqInsertParams
+		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d)",
+			base+1, base+2, base+3, base+4, base+5, //nolint:mnd // SQL placeholder arithmetic
+		)
+		args = append(args, msg.id, msg.payload, errorMsg, msg.retryCount, msg.metadataJSON)
+	}
+
+	if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+		return fmt.Errorf("failed to insert into DLQ: %w", err)
+	}
+
+	// Delete subscription records
+	dlqIDs := make([]uuid.UUID, len(messages))
+	for i, msg := range messages {
+		dlqIDs[i] = msg.id
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	deleteQuery := fmt.Sprintf(
+		`DELETE FROM pgqueue_sub_%s WHERE message_id = ANY($1::uuid[]) AND subscriber_id = $2`,
+		tableName,
+	)
+	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs), subscriberID); err != nil {
+		return fmt.Errorf("failed to delete subscriptions: %w", err)
+	}
+
+	return nil
+}
+
 // uuidSliceToStringSlice converts UUIDs to a string slice for SQL array parameters.
+// This works with the pgx driver. If using lib/pq, use pq.Array() wrapper instead.
 func uuidSliceToStringSlice(ids []uuid.UUID) []string {
 	result := make([]string, len(ids))
 	for i, id := range ids {

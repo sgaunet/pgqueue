@@ -1,13 +1,13 @@
 package pgqueue
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Sentinel errors returned by pgqueue operations.
 var (
-	// ErrDBNil is returned when a nil database connection is provided to InitSchema.
-	ErrDBNil = errors.New("database connection cannot be nil")
-
-	// ErrDBRequired is returned when Config.DB is nil.
+	// ErrDBRequired is returned when a nil database connection is provided.
 	ErrDBRequired = errors.New("database connection is required")
 
 	// ErrInvalidQueueName is returned when a queue name contains invalid characters.
@@ -25,15 +25,17 @@ var (
 	ErrTopicNotFound = errors.New("topic not found")
 
 	// ErrConfirmationRequired is returned when a destructive operation is attempted without confirmation.
+	// ErrPurgeNotConfirmed and ErrDeleteNotConfirmed wrap this error, so callers can use
+	// errors.Is(err, ErrConfirmationRequired) to catch all confirmation-related errors.
 	ErrConfirmationRequired = errors.New(
 		"operation requires explicit confirmation or dry-run mode",
 	)
 
 	// ErrPurgeNotConfirmed is returned when PurgeQueue is called without confirm=true.
-	ErrPurgeNotConfirmed = errors.New("purge operation requires explicit confirmation")
+	ErrPurgeNotConfirmed = fmt.Errorf("purge operation requires explicit confirmation: %w", ErrConfirmationRequired)
 
 	// ErrDeleteNotConfirmed is returned when DeleteChannel/DeleteTopic is called without confirm=true.
-	ErrDeleteNotConfirmed = errors.New("delete operation requires explicit confirmation")
+	ErrDeleteNotConfirmed = fmt.Errorf("delete operation requires explicit confirmation: %w", ErrConfirmationRequired)
 
 	// ErrDuplicateMessageID is returned when publishing a message with an ID that already exists.
 	ErrDuplicateMessageID = errors.New("duplicate message ID")
@@ -50,11 +52,28 @@ var (
 	// ErrReplayMessageNotFound is returned when a message targeted for replay cannot be found.
 	ErrReplayMessageNotFound = errors.New("message not found")
 
+	// ErrMessageInProcessing is returned when attempting to replay a message
+	// that is currently being processed.
+	ErrMessageInProcessing = errors.New("message is currently being processed and cannot be replayed")
+
+	// ErrAmbiguousQueueName is returned when a queue name exists as both a channel and topic.
+	ErrAmbiguousQueueName = errors.New("ambiguous queue name: exists as both channel and topic")
+
+	// ErrReplayNotSupported is returned when ReplayMessage is called on a pub/sub queue.
+	// Pub/sub message tables do not track status; use ReplayFrom or ReplayDLQ instead.
+	ErrReplayNotSupported = errors.New("ReplayMessage is not supported for pub/sub queues; use ReplayFrom or ReplayDLQ")
+
+	// ErrNilPayload is returned when a nil payload is provided to Publish.
+	ErrNilPayload = errors.New("payload must not be nil")
+
 	// ErrBatchTooLarge is returned when a batch operation exceeds the maximum batch size.
 	ErrBatchTooLarge = errors.New("batch size exceeds maximum allowed")
 
 	// ErrQueuePaused is returned when attempting to consume from a paused queue.
 	ErrQueuePaused = errors.New("queue is paused")
+
+	// ErrSubscriberNotFound is returned when a subscriber cannot be found or is already inactive.
+	ErrSubscriberNotFound = errors.New("subscriber not found or already inactive")
 
 	// ErrInvalidSubscriberID is returned when a subscriber ID is empty, too long,
 	// or contains invalid characters.

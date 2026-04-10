@@ -666,7 +666,7 @@ func TestPauseResumeChannel(t *testing.T) {
 	}
 
 	// Pause the queue
-	err = pq.PauseQueue(ctx, "pause-ch")
+	err = pq.PauseQueue(ctx, "pause-ch", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to pause queue: %v", err)
 	}
@@ -684,7 +684,7 @@ func TestPauseResumeChannel(t *testing.T) {
 	}
 
 	// Resume the queue
-	err = pq.ResumeQueue(ctx, "pause-ch")
+	err = pq.ResumeQueue(ctx, "pause-ch", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to resume queue: %v", err)
 	}
@@ -721,7 +721,7 @@ func TestPauseResumeTopic(t *testing.T) {
 	}
 
 	// Pause
-	err = pq.PauseQueue(ctx, "pause-topic")
+	err = pq.PauseQueue(ctx, "pause-topic", pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("failed to pause: %v", err)
 	}
@@ -733,7 +733,7 @@ func TestPauseResumeTopic(t *testing.T) {
 	}
 
 	// Resume
-	err = pq.ResumeQueue(ctx, "pause-topic")
+	err = pq.ResumeQueue(ctx, "pause-topic", pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("failed to resume: %v", err)
 	}
@@ -760,7 +760,7 @@ func TestIsQueuePaused(t *testing.T) {
 	}
 
 	// Initially not paused
-	paused, err := pq.IsQueuePaused(ctx, "pause-check")
+	paused, err := pq.IsQueuePaused(ctx, "pause-check", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to check paused state: %v", err)
 	}
@@ -769,12 +769,12 @@ func TestIsQueuePaused(t *testing.T) {
 	}
 
 	// Pause
-	err = pq.PauseQueue(ctx, "pause-check")
+	err = pq.PauseQueue(ctx, "pause-check", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to pause: %v", err)
 	}
 
-	paused, err = pq.IsQueuePaused(ctx, "pause-check")
+	paused, err = pq.IsQueuePaused(ctx, "pause-check", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to check paused state: %v", err)
 	}
@@ -783,12 +783,12 @@ func TestIsQueuePaused(t *testing.T) {
 	}
 
 	// Resume
-	err = pq.ResumeQueue(ctx, "pause-check")
+	err = pq.ResumeQueue(ctx, "pause-check", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to resume: %v", err)
 	}
 
-	paused, err = pq.IsQueuePaused(ctx, "pause-check")
+	paused, err = pq.IsQueuePaused(ctx, "pause-check", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to check paused state: %v", err)
 	}
@@ -871,7 +871,7 @@ func TestPauseNonExistentQueue(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.PauseQueue(ctx, "ghost-queue")
+	err := pq.PauseQueue(ctx, "ghost-queue", pgqueue.QueueTypeChannel)
 	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
 		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
 	}
