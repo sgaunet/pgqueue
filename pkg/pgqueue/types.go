@@ -39,6 +39,7 @@ type Config struct {
 	MaxMessageSize    int           // Maximum message size in bytes (default: 1024)
 	DefaultMaxRetries int           // Default maximum retry attempts (default: 3)
 	DefaultTTL        time.Duration // Default message TTL (0 = no expiration)
+	MaxQueues         int           // Maximum number of queues (channels + topics) that may exist (0 = unlimited)
 	Logger            *slog.Logger  // Optional structured logger (nil = silent, the default)
 }
 

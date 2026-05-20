@@ -314,6 +314,18 @@ func (pq *PGQueue) createQueue(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Enforce the optional cap on the total number of queues to guard against
+	// table-space exhaustion when queue creation is exposed to untrusted input.
+	if pq.config.MaxQueues > 0 {
+		count, countErr := pq.countQueues(ctx, tx)
+		if countErr != nil {
+			return countErr
+		}
+		if count >= pq.config.MaxQueues {
+			return fmt.Errorf("limit is %d: %w", pq.config.MaxQueues, ErrMaxQueuesReached)
+		}
+	}
+
 	// Create metadata entry
 	_, err = pq.createQueueMetadata(
 		ctx, tx, string(queueType), name, tableName, configJSON,

@@ -84,6 +84,10 @@ var (
 	// ErrUnsupportedPGVersion is returned when the PostgreSQL server version is below 18.
 	ErrUnsupportedPGVersion = errors.New("pgqueue requires PostgreSQL 18+")
 
+	// ErrMaxQueuesReached is returned when creating a queue would exceed the
+	// configured Config.MaxQueues limit.
+	ErrMaxQueuesReached = errors.New("maximum number of queues reached")
+
 	// ErrInvalidVisibilityTimeout is returned when the visibility timeout is out of bounds.
 	ErrInvalidVisibilityTimeout = errors.New(
 		"visibility timeout must be between 1ms and 24h",

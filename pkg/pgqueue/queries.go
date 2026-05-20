@@ -111,6 +111,18 @@ func (pq *PGQueue) createQueueMetadata(
 	return &meta, nil
 }
 
+// countQueues returns the total number of queues (channels and topics) currently
+// registered in pgqueue_metadata. The count runs inside the supplied transaction
+// so it is consistent with the metadata insert that follows.
+func (pq *PGQueue) countQueues(ctx context.Context, tx *sql.Tx) (int, error) {
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pgqueue_metadata`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count queues: %w", err)
+	}
+
+	return count, nil
+}
+
 // isUniqueViolation checks if a database error is a PostgreSQL unique constraint violation (SQLSTATE 23505).
 // Works with both pgx and lib/pq drivers by checking the error string.
 func isUniqueViolation(err error) bool {
