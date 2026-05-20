@@ -64,25 +64,28 @@ If you have PostgreSQL running locally:
 
 ## Expected Output
 
+The consumer runs in a background goroutine while orders are published, so the
+`Published`, `Processing`, and `Completed` lines interleave. A typical run looks
+like:
+
 ```
-Registering subscribers...
+Starting order processor...
 Publishing orders...
 Published: order-001: 2x Widget A (ID: 019a3c...)
+Processing: order-001: 2x Widget A
 Published: order-002: 1x Widget B (ID: 019a3c...)
+Completed: order-001: 2x Widget A
+Published: order-003: 5x Widget C (ID: 019a3c...)
 ...
 
-Starting order processor...
-Processing: order-001: 2x Widget A
-Completed: order-001: 2x Widget A
-Processing: order-002: 1x Widget B
-Completed: order-002: 1x Widget B
-...
+Waiting for orders to be processed...
+Completed: order-005: 1x Widget D
 
 Queue Statistics:
   Pending: 0
   Processing: 0
   Completed: 5
-  Failed (DLQ): 0
+  DLQ: 0
 
 Example completed successfully!
 ```
