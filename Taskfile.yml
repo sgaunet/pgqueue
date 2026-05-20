@@ -14,7 +14,13 @@ tasks:
       - golangci-lint run
 
   tests:
-    desc: "Run tests"
+    desc: "Run unit tests (root module, no Docker required)"
+    cmds:
+      - go test ./... -v -count=2 -race
+
+  tests-integration:
+    desc: "Run integration tests (separate module, requires Docker)"
+    dir: internal/integration
     cmds:
       - go test ./... -v -count=2 -race
 

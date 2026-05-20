@@ -1,4 +1,4 @@
-package pgqueue_test
+package integration_test
 
 import (
 	"bytes"

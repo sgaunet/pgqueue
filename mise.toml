@@ -13,6 +13,9 @@ run = "golangci-lint run ./..."
 # depends = ["lint"]
 run = "task tests"
 
+[tasks.test-integration]
+run = "task tests-integration"
+
 [tasks.build]
 depends = ["test-unit", "test-integration"]
 run = "go build ./..."

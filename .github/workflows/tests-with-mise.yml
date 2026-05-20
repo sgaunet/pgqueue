@@ -10,7 +10,7 @@ on:
   #   branches: [main]
 
 jobs:
-  lint:
+  test-unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -20,3 +20,16 @@ jobs:
           install: true # [default: true] run `mise install`
           cache: true # [default: true] cache mise using GitHub's cache
       - run: mise run test-unit
+
+  test-integration:
+    # Integration tests live in the internal/integration module and spin up
+    # PostgreSQL via testcontainers; ubuntu-latest provides a Docker daemon.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true # [default: true] run `mise install`
+          cache: true # [default: true] cache mise using GitHub's cache
+      - run: mise run test-integration
