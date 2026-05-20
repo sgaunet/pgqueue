@@ -133,7 +133,7 @@ func main() {
 - **Table-per-queue**: Each channel/topic has dedicated tables for isolation and performance
 - **UUIDv7 for ordering**: Time-ordered identifiers ensure message ordering
 - **Direct SQL**: Parameterized queries via database/sql for type safety
-- **Manual schema initialization**: Base schema created via `InitSchema()` function (no external migration tools required)
+- **Self-migrating schema**: `InitSchema()` creates and version-migrates the schema in-process — no external migration tools required
 
 ## Examples
 

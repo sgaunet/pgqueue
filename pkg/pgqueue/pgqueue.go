@@ -69,16 +69,25 @@ type PGQueue struct {
 // queueNameRegex validates queue names (alphanumeric, underscore, dash).
 var queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
-// InitSchema initializes the base schema tables required by pgqueue.
-// This function must be called once before creating any queues or topics.
+// InitSchema initializes and migrates the base schema required by pgqueue.
+// This function must be called once at startup before creating or using any
+// queues or topics.
 //
-// It creates three tables:
+// It creates four tables:
 //   - pgqueue_metadata: Tracks all queues and topics with their configurations
 //   - pgqueue_subscribers: Tracks pub/sub subscriptions for topics
 //   - pgqueue_replay_log: Audit log for message replay operations
+//   - pgqueue_schema_version: Tracks which schema migrations have been applied
 //
-// The function is idempotent and uses CREATE TABLE IF NOT EXISTS, so it can be
-// safely called multiple times without errors.
+// InitSchema is also the upgrade path: when a newer build of pgqueue introduces
+// schema changes, InitSchema transparently applies the pending migrations to
+// bring the database up to SchemaVersion. Callers do not need to do anything
+// beyond continuing to call InitSchema at startup. See GetSchemaVersion to
+// inspect the applied version.
+//
+// The function is idempotent and safe to run concurrently from multiple
+// processes: migrations are serialized with a PostgreSQL advisory lock, so it
+// can be called on every application instance at startup.
 //
 // Example usage:
 //
@@ -107,8 +116,7 @@ func InitSchema(ctx context.Context, db *sql.DB) error {
 		return ErrDBRequired
 	}
 
-	_, err := db.ExecContext(ctx, baseSchemaSQL)
-	if err != nil {
+	if err := runMigrations(ctx, db); err != nil {
 		return fmt.Errorf("failed to initialize base schema: %w", err)
 	}
 

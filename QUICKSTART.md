@@ -159,12 +159,17 @@ if err := pgqueue.InitSchema(ctx, db); err != nil {
 }
 ```
 
-This creates three base tables:
+This creates four base tables:
 - `pgqueue_metadata` - Tracks all queues and topics
 - `pgqueue_subscribers` - Tracks pub/sub subscriptions
 - `pgqueue_replay_log` - Audit log for message replay operations
+- `pgqueue_schema_version` - Tracks applied schema migrations
 
-The function is idempotent (safe to call multiple times) and uses `CREATE TABLE IF NOT EXISTS`.
+The function is idempotent (safe to call multiple times) and safe to run
+concurrently from multiple processes. It is also the **upgrade path**: when a
+newer release of pgqueue changes the schema, `InitSchema()` transparently
+applies the pending migrations — no external migration tool needed. Call
+`pq.GetSchemaVersion(ctx)` to inspect the applied version.
 
 **Note**: Per-queue tables (`pgqueue_msg_*`, `pgqueue_dlq_*`, etc.) are created automatically when you call `CreateChannel()` or `CreateTopic()`.
 
