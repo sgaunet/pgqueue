@@ -163,6 +163,13 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 		logger: cfg.Logger,
 	}
 
+	// Fail fast with a clear error if InitSchema has not been run, or was run
+	// by an older build, rather than surfacing raw "column does not exist"
+	// errors later from individual operations.
+	if err := pq.checkSchemaReady(ctx); err != nil {
+		return nil, err
+	}
+
 	return pq, nil
 }
 
@@ -275,6 +282,25 @@ func (pq *PGQueue) setQueuePaused(ctx context.Context, queueName string, queueTy
 	return nil
 }
 
+// checkSchemaReady verifies the database schema has been created by InitSchema
+// and is at least at the version this build of pgqueue requires.
+func (pq *PGQueue) checkSchemaReady(ctx context.Context) error {
+	schemaVer, err := pq.GetSchemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check schema version: %w", err)
+	}
+	if schemaVer == 0 {
+		return ErrSchemaNotInitialized
+	}
+	if schemaVer < SchemaVersion {
+		return fmt.Errorf(
+			"%w: database at v%d, this build expects v%d",
+			ErrSchemaOutdated, schemaVer, SchemaVersion)
+	}
+
+	return nil
+}
+
 func (pq *PGQueue) logInfo(msg string, args ...any) {
 	if pq.logger != nil {
 		pq.logger.Info(msg, args...)
@@ -324,14 +350,8 @@ func (pq *PGQueue) createQueue(
 
 	// Enforce the optional cap on the total number of queues to guard against
 	// table-space exhaustion when queue creation is exposed to untrusted input.
-	if pq.config.MaxQueues > 0 {
-		count, countErr := pq.countQueues(ctx, tx)
-		if countErr != nil {
-			return countErr
-		}
-		if count >= pq.config.MaxQueues {
-			return fmt.Errorf("limit is %d: %w", pq.config.MaxQueues, ErrMaxQueuesReached)
-		}
+	if err := pq.enforceMaxQueues(ctx, tx); err != nil {
+		return err
 	}
 
 	// Create metadata entry
@@ -350,6 +370,35 @@ func (pq *PGQueue) createQueue(
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// createQueueAdvisoryLockKey serializes concurrent createQueue calls when a
+// MaxQueues cap is configured, so the SELECT COUNT(*) check cannot race past
+// the limit. The ASCII bytes spell "pgquecq" (pgqueue create-queue).
+const createQueueAdvisoryLockKey int64 = 0x70677175_65_6371
+
+// enforceMaxQueues serializes queue creation and checks the MaxQueues cap
+// within the given transaction. It is a no-op when no cap is configured.
+func (pq *PGQueue) enforceMaxQueues(ctx context.Context, tx *sql.Tx) error {
+	if pq.config.MaxQueues <= 0 {
+		return nil
+	}
+	// Serialize concurrent createQueue calls so the count check cannot race
+	// past the cap. The lock is released automatically when this tx ends.
+	if _, err := tx.ExecContext(ctx,
+		"SELECT pg_advisory_xact_lock($1)", createQueueAdvisoryLockKey,
+	); err != nil {
+		return fmt.Errorf("failed to acquire queue-creation lock: %w", err)
+	}
+	count, err := pq.countQueues(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if count >= pq.config.MaxQueues {
+		return fmt.Errorf("limit is %d: %w", pq.config.MaxQueues, ErrMaxQueuesReached)
 	}
 
 	return nil
@@ -448,9 +497,14 @@ func (pq *PGQueue) executeDelete(
 	return pq.deleteQueueMetadata(ctx, tx, string(queueType), name)
 }
 
-// maxQueueNameLength limits queue names to avoid PostgreSQL's 63-byte identifier truncation
-// (prefix "pgqueue_msg_" is 12 chars, leaving 48 for the name).
-const maxQueueNameLength = 48
+// maxQueueNameLength limits queue names to avoid PostgreSQL's 63-byte identifier
+// truncation. The binding constraint is not the table name ("pgqueue_msg_" + name)
+// but the per-queue index names: the longest pattern is
+// "idx_pgqueue_sub_" + name + "_consumable_timeout" (35 fixed characters), so a
+// name must be at most 63 - 35 = 28 characters. A larger limit would let two
+// distinct queues produce index names that truncate to the same string, causing
+// CREATE INDEX IF NOT EXISTS to silently skip the second queue's index.
+const maxQueueNameLength = 28
 
 func (pq *PGQueue) validateQueueName(name string) error {
 	if len(name) == 0 || len(name) > maxQueueNameLength {
@@ -578,11 +632,13 @@ func (pq *PGQueue) createPubSubIndexes(
 			 WHERE status = '%s' AND visibility_timeout IS NULL`,
 			tableName, tableName, MessageStatusPending,
 		),
+		// Reclaim-optimized index: covers timed-out 'processing' subscriptions
+		// that ConsumeFromTopic redelivers once their visibility timeout expires.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
 			 ON pgqueue_sub_%s(subscriber_id, visibility_timeout, message_id)
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
-			tableName, tableName, MessageStatusPending,
+			tableName, tableName, MessageStatusProcessing,
 		),
 	}
 
@@ -655,11 +711,13 @@ func (pq *PGQueue) createChannelIndexes(
 			 WHERE status = '%s' AND visibility_timeout IS NULL`,
 			tableName, tableName, MessageStatusPending,
 		),
+		// Reclaim-optimized index: covers timed-out 'processing' messages that
+		// ConsumeFromChannel redelivers once their visibility timeout expires.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_timeout
 			 ON pgqueue_msg_%s(visibility_timeout, id)
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
-			tableName, tableName, MessageStatusPending,
+			tableName, tableName, MessageStatusProcessing,
 		),
 	}
 
@@ -678,10 +736,13 @@ func (pq *PGQueue) createDLQTable(
 	tx *sql.Tx,
 	tableName string,
 ) error {
+	// subscriber_id records which subscriber failed for pub/sub DLQ entries;
+	// it is left NULL for channel DLQ entries, which have no subscriber.
 	dlqTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS pgqueue_dlq_%s (
 			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			original_message_id UUID NOT NULL,
+			subscriber_id TEXT,
 			payload BYTEA NOT NULL,
 			failure_reason TEXT NOT NULL,
 			retry_count INT NOT NULL,

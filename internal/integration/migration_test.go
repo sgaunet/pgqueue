@@ -2,8 +2,11 @@ package integration_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
@@ -53,37 +56,106 @@ func TestSchemaVersionTracking(t *testing.T) {
 	}
 }
 
-// TestGetSchemaVersion verifies GetSchemaVersion before and after InitSchema.
+// TestInitRequiresSchema verifies Init fails fast with a clear error when
+// InitSchema has not been run.
+func TestInitRequiresSchema(t *testing.T) {
+	db, cleanup := setupTestContainer(t)
+	defer cleanup()
+
+	_, err := pgqueue.Init(context.Background(), pgqueue.Config{DB: db})
+	if !errors.Is(err, pgqueue.ErrSchemaNotInitialized) {
+		t.Fatalf("expected ErrSchemaNotInitialized, got %v", err)
+	}
+}
+
+// TestGetSchemaVersion verifies GetSchemaVersion reports the applied version.
 func TestGetSchemaVersion(t *testing.T) {
 	db, cleanup := setupTestContainer(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema failed: %v", err)
+	}
+
 	pq, err := pgqueue.Init(ctx, pgqueue.Config{DB: db})
 	if err != nil {
 		t.Fatalf("Init failed: %v", err)
 	}
 
-	// Before InitSchema, no version table exists: must report 0, not error.
 	version, err := pq.GetSchemaVersion(ctx)
 	if err != nil {
-		t.Fatalf("GetSchemaVersion before InitSchema failed: %v", err)
-	}
-	if version != 0 {
-		t.Errorf("expected version 0 before InitSchema, got %d", version)
-	}
-
-	if err := pgqueue.InitSchema(ctx, db); err != nil {
-		t.Fatalf("InitSchema failed: %v", err)
-	}
-
-	version, err = pq.GetSchemaVersion(ctx)
-	if err != nil {
-		t.Fatalf("GetSchemaVersion after InitSchema failed: %v", err)
+		t.Fatalf("GetSchemaVersion failed: %v", err)
 	}
 	if version != pgqueue.SchemaVersion {
-		t.Errorf("expected version %d after InitSchema, got %d", pgqueue.SchemaVersion, version)
+		t.Errorf("expected version %d, got %d", pgqueue.SchemaVersion, version)
+	}
+}
+
+// TestVisibilityTimeoutReclaim verifies that a message whose visibility timeout
+// expired is redelivered by ConsumeFromChannel itself, without any
+// GarbageCollector running.
+func TestVisibilityTimeoutReclaim(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if err := pq.CreateChannel(ctx, "reclaim", pgqueue.ChannelOptions{}); err != nil {
+		t.Fatalf("CreateChannel failed: %v", err)
+	}
+
+	sent, err := pq.Publish(ctx, "reclaim", []byte("payload"))
+	if err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	// Consume but never ack, with a short visibility timeout.
+	first, err := pq.ConsumeFromChannel(ctx, "reclaim", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("first consume failed: %v", err)
+	}
+	if first == nil || first.ID != sent {
+		t.Fatalf("first consume did not return the published message")
+	}
+
+	// Before the timeout expires the message is invisible.
+	if msg, cErr := pq.ConsumeFromChannel(ctx, "reclaim", time.Second); cErr != nil {
+		t.Fatalf("consume during timeout failed: %v", cErr)
+	} else if msg != nil {
+		t.Fatalf("message should be invisible before its visibility timeout expires")
+	}
+
+	// After the timeout expires it is reclaimed by consume — no GC involved.
+	time.Sleep(200 * time.Millisecond)
+	second, err := pq.ConsumeFromChannel(ctx, "reclaim", time.Second)
+	if err != nil {
+		t.Fatalf("reclaim consume failed: %v", err)
+	}
+	if second == nil || second.ID != sent {
+		t.Fatalf("timed-out message was not reclaimed by consume")
+	}
+}
+
+// TestQueueNameLengthLimit verifies queue names that would overflow PostgreSQL's
+// 63-byte identifier limit for index names are rejected.
+func TestQueueNameLengthLimit(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	tooLong := strings.Repeat("a", 29)
+	if err := pq.CreateChannel(ctx, tooLong, pgqueue.ChannelOptions{}); !errors.Is(
+		err, pgqueue.ErrInvalidQueueName,
+	) {
+		t.Fatalf("expected ErrInvalidQueueName for a 29-char name, got %v", err)
+	}
+
+	okName := strings.Repeat("a", 28)
+	if err := pq.CreateChannel(ctx, okName, pgqueue.ChannelOptions{}); err != nil {
+		t.Fatalf("28-char name should be accepted, got %v", err)
 	}
 }
 

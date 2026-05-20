@@ -343,9 +343,12 @@ func TestGetSubscriberHealthStuckMessages(t *testing.T) {
 		}
 	}
 
-	// Consume messages with a short visibility timeout
+	// Consume the messages with a long visibility timeout so all 3 are claimed
+	// as distinct messages; the backdating step below makes them appear stuck.
+	// (A short timeout would let each consume reclaim the previous, now-expired
+	// message instead of a fresh one.)
 	for i := 0; i < 3; i++ {
-		_, err := pq.ConsumeFromTopic(ctx, "stuck-test", "sub-stuck", 1*time.Millisecond)
+		_, err := pq.ConsumeFromTopic(ctx, "stuck-test", "sub-stuck", time.Minute)
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}

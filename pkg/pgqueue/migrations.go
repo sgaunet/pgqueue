@@ -10,8 +10,9 @@ import (
 // produce. InitSchema migrates a database up to this version automatically.
 //
 // IMPORTANT: when adding a new entry to the migrations slice below, bump this
-// constant to match that entry's version number.
-const SchemaVersion = 1
+// constant to match that entry's version number. An init() check enforces that
+// SchemaVersion equals the last migration's version.
+const SchemaVersion = 2
 
 // migrationAdvisoryLockKey is a fixed PostgreSQL advisory-lock key (the ASCII
 // bytes of "pgqueue") used to serialize schema migrations across processes.
@@ -35,45 +36,12 @@ CREATE TABLE IF NOT EXISTS pgqueue_schema_version (
 // apply receives the transaction in which the migration runs. Because it has a
 // full *sql.Tx, a migration is not limited to the static global tables: it can
 // also patch the dynamically-named per-queue tables (pgqueue_msg_*, pgqueue_dlq_*,
-// pgqueue_sub_*) by discovering them from pgqueue_metadata at apply time.
+// pgqueue_sub_*) by discovering them from pgqueue_metadata at apply time. Newly
+// created queues already get the current table shape from createChannelTables /
+// createPubSubTables, so a migration only needs to patch pre-existing tables.
 //
-// Example of a future migration that adds a column to every existing channel
-// message table (newly-created queues already get the current shape from
-// createChannelTables, so a migration only needs to patch pre-existing ones):
-//
-//	{
-//	    version: 2,
-//	    name:    "add priority to channel messages",
-//	    apply: func(ctx context.Context, tx *sql.Tx) error {
-//	        rows, err := tx.QueryContext(ctx,
-//	            `SELECT table_name FROM pgqueue_metadata WHERE queue_type = 'channel'`)
-//	        if err != nil {
-//	            return err
-//	        }
-//	        defer func() { _ = rows.Close() }()
-//	        var tables []string
-//	        for rows.Next() {
-//	            var t string
-//	            if err := rows.Scan(&t); err != nil {
-//	                return err
-//	            }
-//	            tables = append(tables, t)
-//	        }
-//	        if err := rows.Err(); err != nil {
-//	            return err
-//	        }
-//	        for _, t := range tables {
-//	            // t comes from pgqueue_metadata, where it was already validated
-//	            // by queueNameRegex when the queue was created.
-//	            stmt := "ALTER TABLE pgqueue_msg_" + t +
-//	                " ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 0"
-//	            if _, err := tx.ExecContext(ctx, stmt); err != nil {
-//	                return err
-//	            }
-//	        }
-//	        return nil
-//	    },
-//	}
+// migrateV2 is a worked example of this dynamic fan-out: it uses queueTableNames
+// to ALTER every existing per-queue DLQ table.
 type migration struct {
 	version int
 	name    string
@@ -96,6 +64,89 @@ var migrations = []migration{
 			return nil
 		},
 	},
+	{
+		// The last migration's version must equal SchemaVersion (checked by init).
+		version: SchemaVersion,
+		name:    "table-name uniqueness and pub/sub DLQ subscriber tracking",
+		apply:   migrateV2,
+	},
+}
+
+// init enforces that the migrations slice stays contiguous and ascending and
+// that SchemaVersion matches the last migration. A gap or a stale SchemaVersion
+// would silently skip migrations, so this fails fast at process startup.
+func init() {
+	for i := range migrations {
+		if want := i + 1; migrations[i].version != want {
+			panic(fmt.Sprintf(
+				"pgqueue: migrations must be contiguous and ascending; "+
+					"index %d has version %d, want %d",
+				i, migrations[i].version, want))
+		}
+	}
+	if last := migrations[len(migrations)-1].version; last != SchemaVersion {
+		panic(fmt.Sprintf(
+			"pgqueue: SchemaVersion is %d but the last migration is %d",
+			SchemaVersion, last))
+	}
+}
+
+// migrateV2 enforces table-name uniqueness on pgqueue_metadata and adds a
+// subscriber_id column to every existing dead-letter-queue table.
+//
+//   - The UNIQUE(table_name) constraint closes a collision where queue names
+//     differing only by dash vs. underscore (e.g. "a-b" and "a_b") sanitize to
+//     the same physical table name.
+//   - subscriber_id lets pub/sub DLQ entries record which subscriber failed, so
+//     ReplayDLQ can re-deliver to exactly that subscriber. The column is left
+//     NULL for channel DLQ entries, which have no subscriber.
+func migrateV2(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx,
+		`ALTER TABLE pgqueue_metadata
+		 ADD CONSTRAINT pgqueue_metadata_table_name_key UNIQUE (table_name)`,
+	); err != nil {
+		return fmt.Errorf("failed to add table_name unique constraint: %w", err)
+	}
+
+	tables, err := queueTableNames(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, t := range tables {
+		// t was validated by queueNameRegex when the queue was created.
+		stmt := "ALTER TABLE pgqueue_dlq_" + t + //nolint:gosec // G201: validated table name.
+			" ADD COLUMN IF NOT EXISTS subscriber_id TEXT"
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("failed to add subscriber_id to pgqueue_dlq_%s: %w", t, err)
+		}
+	}
+
+	return nil
+}
+
+// queueTableNames returns the sanitized table_name of every queue registered in
+// pgqueue_metadata. Migrations use it to fan schema changes out across the
+// dynamically-created per-queue tables.
+func queueTableNames(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT table_name FROM pgqueue_metadata`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list queue tables: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var tables []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("failed to scan queue table name: %w", err)
+		}
+		tables = append(tables, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate queue tables: %w", err)
+	}
+
+	return tables, nil
 }
 
 // queryRower is satisfied by *sql.DB, *sql.Conn, and *sql.Tx, letting

@@ -282,12 +282,12 @@ func (pq *PGQueue) moveSubToDLQ(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	dlqQuery := fmt.Sprintf(`
 		INSERT INTO pgqueue_dlq_%s
-			(original_message_id, payload, failure_reason, retry_count, metadata)
-		VALUES ($1, $2, $3, $4, $5)
+			(original_message_id, subscriber_id, payload, failure_reason, retry_count, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6)
 	`, tableName)
 
 	_, err := tx.ExecContext(
-		ctx, dlqQuery, messageID, state.payload, errorMsg,
+		ctx, dlqQuery, messageID, subscriberID, state.payload, errorMsg,
 		state.retryCount+1, state.metadataJSON,
 	)
 	if err != nil {
@@ -346,10 +346,12 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 	args := []any{subscriberID}
 
 	if ttl > 0 {
-		ttlClause = "AND m.created_at > $2"
-		args = append(args, time.Now().Add(-ttl))
+		ttlClause = "AND m.created_at > NOW() - make_interval(secs => $2)"
+		args = append(args, ttl.Seconds())
 	}
 
+	// A subscription is consumable when pending, or when still processing but
+	// its visibility timeout has expired — see fetchPendingChannelMessage.
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT s.id, s.message_id, m.payload, m.created_at,
@@ -357,14 +359,13 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 		FROM pgqueue_sub_%s s
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
-		  AND s.status = '%s'
-		  AND (s.visibility_timeout IS NULL
-		       OR s.visibility_timeout < NOW())
+		  AND (s.status = '%s'
+		       OR (s.status = '%s' AND s.visibility_timeout < NOW()))
 		  %s
 		ORDER BY m.id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED
-	`, tableName, tableName, MessageStatusPending, ttlClause)
+	`, tableName, tableName, MessageStatusPending, MessageStatusProcessing, ttlClause)
 
 	var subID uuid.UUID
 	var msgID uuid.UUID
@@ -406,16 +407,18 @@ func (pq *PGQueue) claimTopicSubscription(
 	errorMessage sql.NullString,
 	maxRetries int,
 ) (*Message, *time.Time, error) {
-	visTimeout := time.Now().Add(visibilityTimeout)
-
+	// Visibility deadline computed on the database clock; see claimChannelMessage.
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = '%s', visibility_timeout = $1
+		SET status = '%s', visibility_timeout = NOW() + make_interval(secs => $1)
 		WHERE id = $2
+		RETURNING visibility_timeout
 	`, tableName, MessageStatusProcessing)
 
-	_, err := tx.ExecContext(ctx, updateQuery, visTimeout, subID)
-	if err != nil {
+	var visTimeout time.Time
+	if err := tx.QueryRowContext(
+		ctx, updateQuery, visibilityTimeout.Seconds(), subID,
+	).Scan(&visTimeout); err != nil {
 		return nil, nil, fmt.Errorf("failed to update subscription: %w", err)
 	}
 

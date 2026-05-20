@@ -17,6 +17,7 @@ const (
 	pubsubInsertParams  = 3 // id, payload, metadata
 	subInsertParams     = 2 // message_id, subscriber_id
 	dlqInsertParams     = 5 // original_message_id, payload, failure_reason, retry_count, metadata
+	subDLQInsertParams  = 6 // dlqInsertParams + subscriber_id
 )
 
 // PublishBatch publishes multiple messages to a channel or topic in a single operation.
@@ -527,8 +528,14 @@ func (pq *PGQueue) insertBatchPubSubMessages(
 	return nil
 }
 
-// batchCreateSubscriptionRecords creates subscription records for multiple messages and subscribers.
-// Chunks inserts to stay within PostgreSQL's parameter limit.
+// subRecord is a (message, subscriber) pair to be written to a pgqueue_sub_ table.
+type subRecord struct {
+	messageID    uuid.UUID
+	subscriberID string
+}
+
+// batchCreateSubscriptionRecords creates subscription records for the cross
+// product of the given messages and subscribers.
 func (pq *PGQueue) batchCreateSubscriptionRecords(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -536,14 +543,6 @@ func (pq *PGQueue) batchCreateSubscriptionRecords(
 	messageIDs []uuid.UUID,
 	subscribers []Subscriber,
 ) error {
-	// Each row uses 2 params; PostgreSQL limit is 65535
-	const maxRowsPerInsert = 16000
-
-	type subRecord struct {
-		messageID    uuid.UUID
-		subscriberID string
-	}
-
 	records := make([]subRecord, 0, len(messageIDs)*len(subscribers))
 	for _, msgID := range messageIDs {
 		for _, sub := range subscribers {
@@ -553,6 +552,21 @@ func (pq *PGQueue) batchCreateSubscriptionRecords(
 			})
 		}
 	}
+
+	return pq.insertSubscriptionRecords(ctx, tx, tableName, records)
+}
+
+// insertSubscriptionRecords inserts subscription rows, chunked to stay within
+// PostgreSQL's parameter limit. ON CONFLICT DO NOTHING makes it idempotent and
+// tolerant of duplicate pairs within records.
+func (pq *PGQueue) insertSubscriptionRecords(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	records []subRecord,
+) error {
+	// Each row uses 2 params; PostgreSQL limit is 65535.
+	const maxRowsPerInsert = 16000
 
 	for start := 0; start < len(records); start += maxRowsPerInsert {
 		end := min(start+maxRowsPerInsert, len(records))
@@ -836,25 +850,26 @@ func (pq *PGQueue) batchMoveSubToDLQ(
 	messages []batchDLQMessage,
 	errorMsg string,
 ) error {
-	// Batch insert into DLQ
+	// Batch insert into DLQ, recording which subscriber failed.
 	dlqPrefix := fmt.Sprintf(
-		`INSERT INTO pgqueue_dlq_%s (original_message_id, payload, failure_reason, retry_count, metadata) VALUES `,
+		`INSERT INTO pgqueue_dlq_%s `+
+			`(original_message_id, subscriber_id, payload, failure_reason, retry_count, metadata) VALUES `,
 		tableName,
 	)
 
 	var sb strings.Builder
 	sb.WriteString(dlqPrefix)
 
-	args := make([]any, 0, len(messages)*dlqInsertParams)
+	args := make([]any, 0, len(messages)*subDLQInsertParams)
 	for i, msg := range messages {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		base := i * dlqInsertParams
-		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d)",
-			base+1, base+2, base+3, base+4, base+5, //nolint:mnd // SQL placeholder arithmetic
+		base := i * subDLQInsertParams
+		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, //nolint:mnd // SQL placeholder arithmetic
 		)
-		args = append(args, msg.id, msg.payload, errorMsg, msg.retryCount, msg.metadataJSON)
+		args = append(args, msg.id, subscriberID, msg.payload, errorMsg, msg.retryCount, msg.metadataJSON)
 	}
 
 	if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {

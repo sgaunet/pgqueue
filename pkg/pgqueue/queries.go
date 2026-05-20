@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // getQueueTTL extracts the TTL from queue config JSON, falling back to the
@@ -123,14 +125,19 @@ func (pq *PGQueue) countQueues(ctx context.Context, tx *sql.Tx) (int, error) {
 	return count, nil
 }
 
-// isUniqueViolation checks if a database error is a PostgreSQL unique constraint violation (SQLSTATE 23505).
-// Works with both pgx and lib/pq drivers by checking the error string.
+// isUniqueViolation reports whether err is a PostgreSQL unique-constraint
+// violation (SQLSTATE 23505).
 func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Both pgx (pgconn.PgError) and lib/pq (pq.Error) include "23505" or
-	// "unique constraint" in their error strings when a unique violation occurs.
+	// pgx surfaces a typed *pgconn.PgError; prefer the exact SQLSTATE check.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505"
+	}
+	// Fallback for non-pgx drivers (e.g. lib/pq), which is not a dependency
+	// here and cannot be type-asserted: match the SQLSTATE / message text.
 	errStr := err.Error()
 	return strings.Contains(errStr, "23505") || strings.Contains(errStr, "unique constraint")
 }

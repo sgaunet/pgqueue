@@ -296,13 +296,11 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 	queueType QueueType,
 	ttl time.Duration,
 ) error {
-	cutoff := time.Now().Add(-ttl)
-
 	var query string
 	if queueType == QueueTypePubSub {
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s m
-			WHERE m.created_at < $1
+			WHERE m.created_at < NOW() - make_interval(secs => $1)
 			AND NOT EXISTS (
 				SELECT 1 FROM pgqueue_sub_%s s
 				WHERE s.message_id = m.id AND s.status != '%s'
@@ -312,11 +310,11 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s
 			WHERE status = '%s'
-			AND processed_at < $1
+			AND processed_at < NOW() - make_interval(secs => $1)
 		`, tableName, MessageStatusCompleted)
 	}
 
-	result, err := gc.pq.db.ExecContext(ctx, query, cutoff)
+	result, err := gc.pq.db.ExecContext(ctx, query, ttl.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to purge completed messages: %w", err)
 	}
@@ -340,13 +338,11 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 	queueType QueueType,
 	maxAge time.Duration,
 ) error {
-	cutoff := time.Now().Add(-maxAge)
-
 	var query string
 	if queueType == QueueTypePubSub {
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s m
-			WHERE m.created_at < $1
+			WHERE m.created_at < NOW() - make_interval(secs => $1)
 			AND EXISTS (
 				SELECT 1 FROM pgqueue_sub_%s s
 				WHERE s.message_id = m.id AND s.status = '%s'
@@ -356,11 +352,11 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 		query = fmt.Sprintf(`
 			DELETE FROM pgqueue_msg_%s
 			WHERE status = '%s'
-			AND created_at < $1
+			AND created_at < NOW() - make_interval(secs => $1)
 		`, tableName, MessageStatusPending)
 	}
 
-	result, err := gc.pq.db.ExecContext(ctx, query, cutoff)
+	result, err := gc.pq.db.ExecContext(ctx, query, maxAge.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to purge old pending messages: %w", err)
 	}
@@ -382,11 +378,10 @@ func (gc *GarbageCollector) purgeDLQMessages(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		DELETE FROM pgqueue_dlq_%s
-		WHERE moved_at < $1
+		WHERE moved_at < NOW() - make_interval(secs => $1)
 	`, tableName)
 
-	cutoff := time.Now().Add(-retention)
-	result, err := gc.pq.db.ExecContext(ctx, query, cutoff)
+	result, err := gc.pq.db.ExecContext(ctx, query, retention.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to purge DLQ messages: %w", err)
 	}
@@ -411,10 +406,10 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 		    visibility_timeout = NULL
 		WHERE status = '%s'
 		AND visibility_timeout IS NOT NULL
-		AND visibility_timeout < $1
+		AND visibility_timeout < NOW()
 	`, tableName, MessageStatusPending, MessageStatusProcessing)
 
-	result, err := gc.pq.db.ExecContext(ctx, query, time.Now())
+	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to reset timed-out messages: %w", err)
 	}
@@ -439,10 +434,10 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 		    visibility_timeout = NULL
 		WHERE status = '%s'
 		AND visibility_timeout IS NOT NULL
-		AND visibility_timeout < $1
+		AND visibility_timeout < NOW()
 	`, tableName, MessageStatusPending, MessageStatusProcessing)
 
-	result, err := gc.pq.db.ExecContext(ctx, query, time.Now())
+	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf(
 			"failed to reset timed-out subscriptions: %w", err,

@@ -92,4 +92,16 @@ var (
 	ErrInvalidVisibilityTimeout = errors.New(
 		"visibility timeout must be between 1ms and 24h",
 	)
+
+	// ErrSchemaNotInitialized is returned by Init when the pgqueue schema is
+	// absent from the database. Call InitSchema before Init.
+	ErrSchemaNotInitialized = errors.New(
+		"pgqueue schema is not initialized: call InitSchema first",
+	)
+
+	// ErrSchemaOutdated is returned by Init when the database schema is older
+	// than the version this build of pgqueue requires. Run InitSchema to migrate.
+	ErrSchemaOutdated = errors.New(
+		"pgqueue schema is outdated: run InitSchema to migrate",
+	)
 )

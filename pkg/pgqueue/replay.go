@@ -424,6 +424,7 @@ func (pq *PGQueue) executeReplayDLQ(
 type dlqRow struct {
 	id                uuid.UUID
 	originalMessageID uuid.UUID
+	subscriberID      sql.NullString // set for pub/sub DLQ entries, NULL for channels
 	payload           []byte
 	metadata          []byte
 }
@@ -443,7 +444,7 @@ func (pq *PGQueue) fetchDLQMessages(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	selectQuery := fmt.Sprintf(`
-		SELECT id, original_message_id, payload, metadata
+		SELECT id, original_message_id, subscriber_id, payload, metadata
 		FROM pgqueue_dlq_%s
 		LIMIT %d
 	`, tableName, limit)
@@ -458,7 +459,7 @@ func (pq *PGQueue) fetchDLQMessages(
 	for rows.Next() {
 		var msg dlqRow
 		if err := rows.Scan(
-			&msg.id, &msg.originalMessageID,
+			&msg.id, &msg.originalMessageID, &msg.subscriberID,
 			&msg.payload, &msg.metadata,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan DLQ message: %w", err)
@@ -578,7 +579,12 @@ func (pq *PGQueue) insertDLQChannelMessages(
 
 // reinsertDLQPubSub re-creates subscription records for pub/sub DLQ messages.
 // The original message still exists in pgqueue_msg_ (only the subscription was
-// deleted when moved to DLQ), so we just need to re-create subscription records.
+// deleted when moved to DLQ), so only the subscription records are re-created.
+//
+// Each DLQ entry is replayed to the exact subscriber that failed (recorded in
+// subscriber_id), so subscribers that processed the message successfully are
+// never re-delivered it. ON CONFLICT DO NOTHING additionally protects any
+// subscriber whose row still exists.
 func (pq *PGQueue) reinsertDLQPubSub(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -589,41 +595,82 @@ func (pq *PGQueue) reinsertDLQPubSub(
 		return 0, nil
 	}
 
-	// Get active subscribers once for all messages
-	subscribers, err := pq.getActiveSubscribers(ctx, tx, queueName)
+	records, replayedIDs, err := pq.resolvePubSubDLQRecords(ctx, tx, queueName, dlqMessages)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get active subscribers: %w", err)
+		return 0, err
+	}
+	if len(replayedIDs) == 0 {
+		return 0, nil
 	}
 
-	// Batch create subscription records for all messages
-	if len(subscribers) > 0 {
-		messageIDs := make([]uuid.UUID, len(dlqMessages))
-		for i, msg := range dlqMessages {
-			messageIDs[i] = msg.originalMessageID
-		}
-
-		if err := pq.batchCreateSubscriptionRecords(
-			ctx, tx, tableName, messageIDs, subscribers,
-		); err != nil {
-			return 0, fmt.Errorf("failed to create subscription records: %w", err)
-		}
-	}
-
-	// Batch delete DLQ entries
-	dlqIDs := make([]uuid.UUID, len(dlqMessages))
-	for i, msg := range dlqMessages {
-		dlqIDs[i] = msg.id
+	if err := pq.insertSubscriptionRecords(ctx, tx, tableName, records); err != nil {
+		return 0, fmt.Errorf("failed to create subscription records: %w", err)
 	}
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
 		`DELETE FROM pgqueue_dlq_%s WHERE id = ANY($1::uuid[])`, tableName,
 	)
-	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
+	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(replayedIDs)); err != nil {
 		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
 	}
 
-	return len(dlqMessages), nil
+	return len(replayedIDs), nil
+}
+
+// resolvePubSubDLQRecords maps pub/sub DLQ rows to the subscription records to
+// re-create, and returns the ids of the DLQ entries that can be deleted.
+//
+// Rows carrying a subscriber_id are replayed to exactly that subscriber. Legacy
+// rows with a NULL subscriber_id (written before schema v2) fall back to all
+// currently-active subscribers; such a row is only marked for deletion when at
+// least one active subscriber exists, so a replay with no subscribers leaves it
+// in the DLQ rather than silently dropping it.
+func (pq *PGQueue) resolvePubSubDLQRecords(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueName string,
+	dlqMessages []dlqRow,
+) ([]subRecord, []uuid.UUID, error) {
+	var legacySubscribers []Subscriber
+	legacyLoaded := false
+
+	records := make([]subRecord, 0, len(dlqMessages))
+	replayedIDs := make([]uuid.UUID, 0, len(dlqMessages))
+
+	for _, msg := range dlqMessages {
+		if msg.subscriberID.Valid {
+			records = append(records, subRecord{
+				messageID:    msg.originalMessageID,
+				subscriberID: msg.subscriberID.String,
+			})
+			replayedIDs = append(replayedIDs, msg.id)
+
+			continue
+		}
+
+		// Legacy row with no recorded subscriber: load active subscribers once.
+		if !legacyLoaded {
+			subs, err := pq.getActiveSubscribers(ctx, tx, queueName)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get active subscribers: %w", err)
+			}
+			legacySubscribers = subs
+			legacyLoaded = true
+		}
+		if len(legacySubscribers) == 0 {
+			continue // leave the DLQ row in place; nothing to replay to
+		}
+		for _, sub := range legacySubscribers {
+			records = append(records, subRecord{
+				messageID:    msg.originalMessageID,
+				subscriberID: sub.SubscriberID,
+			})
+		}
+		replayedIDs = append(replayedIDs, msg.id)
+	}
+
+	return records, replayedIDs, nil
 }
 
 func (pq *PGQueue) logReplayIfNeeded(

@@ -186,22 +186,26 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 	var args []any
 
 	if ttl > 0 {
-		ttlClause = "AND created_at > $1"
-		args = append(args, time.Now().Add(-ttl))
+		ttlClause = "AND created_at > NOW() - make_interval(secs => $1)"
+		args = append(args, ttl.Seconds())
 	}
 
+	// A message is consumable when it is pending, or when it is still marked
+	// processing but its visibility timeout has expired (the previous consumer
+	// crashed or never acked). Reclaiming timed-out messages here means
+	// redelivery does not depend on the GarbageCollector running.
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT id, payload, created_at, retry_count, max_retries, metadata,
 		       processed_at, error_message
 		FROM pgqueue_msg_%s
-		WHERE status = '%s'
-		  AND (visibility_timeout IS NULL OR visibility_timeout < NOW())
+		WHERE (status = '%s'
+		       OR (status = '%s' AND visibility_timeout < NOW()))
 		  %s
 		ORDER BY id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, tableName, MessageStatusPending, ttlClause)
+	`, tableName, MessageStatusPending, MessageStatusProcessing, ttlClause)
 
 	var msgID uuid.UUID
 	var payload []byte
@@ -246,16 +250,20 @@ func (pq *PGQueue) claimChannelMessage(
 	processedAt sql.NullTime,
 	errorMessage sql.NullString,
 ) (*Message, *time.Time, error) {
-	visTimeout := time.Now().Add(visibilityTimeout)
-
+	// Compute the visibility deadline on the database clock (NOW()) rather than
+	// the application clock, so consumers and the GC agree on expiry regardless
+	// of clock skew between the app server and PostgreSQL.
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = '%s', visibility_timeout = $1
+		SET status = '%s', visibility_timeout = NOW() + make_interval(secs => $1)
 		WHERE id = $2
+		RETURNING visibility_timeout
 	`, tableName, MessageStatusProcessing)
 
-	_, err := tx.ExecContext(ctx, updateQuery, visTimeout, msgID)
-	if err != nil {
+	var visTimeout time.Time
+	if err := tx.QueryRowContext(
+		ctx, updateQuery, visibilityTimeout.Seconds(), msgID,
+	).Scan(&visTimeout); err != nil {
 		return nil, nil, fmt.Errorf("failed to update message: %w", err)
 	}
 
