@@ -77,30 +77,31 @@ func classifyClaimMiss(
 }
 
 // classifyChannelAckMiss classifies a failed channel Ack/Nack for the receipt.
+// msgTable is the schema-qualified channel message table.
 func classifyChannelAckMiss(
 	ctx context.Context,
 	q queryRower,
-	tableName string,
+	msgTable string,
 	r Receipt,
 ) error {
 	query := fmt.Sprintf(
-		`SELECT status, claim_id FROM pgqueue_msg_%s WHERE id = $1`, tableName,
+		`SELECT status, claim_id FROM %s WHERE id = $1`, msgTable,
 	)
 
 	return classifyClaimMiss(ctx, q, query, r.ClaimID, r.MessageID)
 }
 
 // classifyTopicAckMiss classifies a failed topic Ack/Nack for the given
-// subscriber and receipt.
+// subscriber and receipt. subTable is the schema-qualified subscription table.
 func classifyTopicAckMiss(
 	ctx context.Context,
 	q queryRower,
-	tableName, subscriberID string,
+	subTable, subscriberID string,
 	r Receipt,
 ) error {
 	query := fmt.Sprintf(
-		`SELECT status, claim_id FROM pgqueue_sub_%s WHERE message_id = $1 AND subscriber_id = $2`,
-		tableName,
+		`SELECT status, claim_id FROM %s WHERE message_id = $1 AND subscriber_id = $2`,
+		subTable,
 	)
 
 	return classifyClaimMiss(ctx, q, query, r.ClaimID, r.MessageID, subscriberID)
@@ -112,12 +113,13 @@ func (pq *Queue) getQueueMetadata(
 	ctx context.Context,
 	queueType, queueName string,
 ) (*QueueMetadata, error) {
-	query := `
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
-		FROM pgqueue_metadata
+		FROM %s
 		WHERE queue_type = $1 AND queue_name = $2
 		LIMIT 1
-	`
+	`, pq.globalTable("pgqueue_metadata"))
 
 	var meta QueueMetadata
 	err := pq.db.QueryRowContext(ctx, query, queueType, queueName).Scan(
@@ -170,11 +172,12 @@ func (pq *Queue) createQueueMetadata(
 	queueType, queueName, tableName string,
 	config []byte,
 ) (*QueueMetadata, error) {
-	query := `
-		INSERT INTO pgqueue_metadata (queue_type, queue_name, table_name, config)
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
+		INSERT INTO %s (queue_type, queue_name, table_name, config)
 		VALUES ($1, $2, $3, $4)
 		RETURNING id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
-	`
+	`, pq.globalTable("pgqueue_metadata"))
 
 	var meta QueueMetadata
 	err := tx.QueryRowContext(ctx, query, queueType, queueName, tableName, config).Scan(
@@ -203,7 +206,8 @@ func (pq *Queue) createQueueMetadata(
 // so it is consistent with the metadata insert that follows.
 func (pq *Queue) countQueues(ctx context.Context, tx *sql.Tx) (int, error) {
 	var count int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pgqueue_metadata`).Scan(&count); err != nil {
+	countQuery := `SELECT COUNT(*) FROM ` + pq.globalTable("pgqueue_metadata")
+	if err := tx.QueryRowContext(ctx, countQuery).Scan(&count); err != nil {
 		return 0, fmt.Errorf("failed to count queues: %w", err)
 	}
 
@@ -274,7 +278,11 @@ func (pq *Queue) checkTableNameNotExists(
 	ctx context.Context,
 	tableName string,
 ) error {
-	query := `SELECT queue_name FROM pgqueue_metadata WHERE table_name = $1 LIMIT 1`
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(
+		`SELECT queue_name FROM %s WHERE table_name = $1 LIMIT 1`,
+		pq.globalTable("pgqueue_metadata"),
+	)
 
 	var existingName string
 
@@ -297,12 +305,13 @@ func (pq *Queue) listQueuesRaw(
 	ctx context.Context,
 	queueType string,
 ) ([]QueueMetadata, error) {
-	query := `
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
-		FROM pgqueue_metadata
+		FROM %s
 		WHERE queue_type = $1
 		ORDER BY created_at DESC
-	`
+	`, pq.globalTable("pgqueue_metadata"))
 
 	rows, err := pq.db.QueryContext(ctx, query, queueType)
 	if err != nil {
@@ -341,13 +350,14 @@ func (pq *Queue) registerSubscriber(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) (*Subscriber, error) {
-	query := `
-		INSERT INTO pgqueue_subscribers (topic_name, subscriber_id)
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
+		INSERT INTO %s (topic_name, subscriber_id)
 		VALUES ($1, $2)
 		ON CONFLICT (topic_name, subscriber_id)
 		DO UPDATE SET active = TRUE
 		RETURNING id, topic_name, subscriber_id, created_at, active
-	`
+	`, pq.globalTable("pgqueue_subscribers"))
 
 	var sub Subscriber
 	err := pq.db.QueryRowContext(ctx, query, topicName, subscriberID).Scan(
@@ -369,11 +379,12 @@ func (pq *Queue) unregisterSubscriber(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
-	query := `
-		UPDATE pgqueue_subscribers
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
+		UPDATE %s
 		SET active = FALSE
 		WHERE topic_name = $1 AND subscriber_id = $2 AND active = TRUE
-	`
+	`, pq.globalTable("pgqueue_subscribers"))
 	result, err := pq.db.ExecContext(ctx, query, topicName, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to unregister subscriber: %w", err)
@@ -395,12 +406,13 @@ func (pq *Queue) getActiveSubscribers(
 	tx *sql.Tx,
 	topicName string,
 ) ([]Subscriber, error) {
-	query := `
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
 		SELECT id, topic_name, subscriber_id, created_at, active
-		FROM pgqueue_subscribers
+		FROM %s
 		WHERE topic_name = $1 AND active = TRUE
 		ORDER BY created_at
-	`
+	`, pq.globalTable("pgqueue_subscribers"))
 
 	var rows *sql.Rows
 	var err error
@@ -445,21 +457,33 @@ func (pq *Queue) deleteQueueMetadata(
 	queueType, queueName string,
 ) error {
 	// Delete replay log entries for this queue
-	replayQuery := `DELETE FROM pgqueue_replay_log WHERE queue_type = $1 AND queue_name = $2`
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	replayQuery := fmt.Sprintf(
+		`DELETE FROM %s WHERE queue_type = $1 AND queue_name = $2`,
+		pq.globalTable("pgqueue_replay_log"),
+	)
 	if _, err := tx.ExecContext(ctx, replayQuery, queueType, queueName); err != nil {
 		return fmt.Errorf("failed to delete replay log entries: %w", err)
 	}
 
 	// For pub/sub, delete subscriber registrations
 	if queueType == string(QueueTypePubSub) {
-		subQuery := `DELETE FROM pgqueue_subscribers WHERE topic_name = $1`
+		//nolint:gosec // G201: schema-qualified internal table name, not user input
+		subQuery := fmt.Sprintf(
+			`DELETE FROM %s WHERE topic_name = $1`,
+			pq.globalTable("pgqueue_subscribers"),
+		)
 		if _, err := tx.ExecContext(ctx, subQuery, queueName); err != nil {
 			return fmt.Errorf("failed to delete subscriber registrations: %w", err)
 		}
 	}
 
 	// Delete metadata entry
-	metaQuery := `DELETE FROM pgqueue_metadata WHERE queue_type = $1 AND queue_name = $2`
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	metaQuery := fmt.Sprintf(
+		`DELETE FROM %s WHERE queue_type = $1 AND queue_name = $2`,
+		pq.globalTable("pgqueue_metadata"),
+	)
 	if _, err := tx.ExecContext(ctx, metaQuery, queueType, queueName); err != nil {
 		return fmt.Errorf("failed to delete queue metadata: %w", err)
 	}
@@ -480,13 +504,14 @@ func (pq *Queue) createReplayLog(
 	messageCount int,
 	createdBy *string,
 ) error {
-	query := `
-		INSERT INTO pgqueue_replay_log (
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
 			queue_type, queue_name, replay_type,
 			replay_params, message_count, created_by
 		)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`
+	`, pq.globalTable("pgqueue_replay_log"))
 
 	_, err := tx.ExecContext(
 		ctx, query,
@@ -505,14 +530,15 @@ func (pq *Queue) getReplayHistory(
 	queueType, queueName string,
 	limit int,
 ) ([]ReplayLog, error) {
-	query := `
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, replay_type,
 		       replay_params, message_count, created_at, created_by
-		FROM pgqueue_replay_log
+		FROM %s
 		WHERE queue_type = $1 AND queue_name = $2
 		ORDER BY created_at DESC
 		LIMIT $3
-	`
+	`, pq.globalTable("pgqueue_replay_log"))
 
 	rows, err := pq.db.QueryContext(ctx, query, queueType, queueName, limit)
 	if err != nil {

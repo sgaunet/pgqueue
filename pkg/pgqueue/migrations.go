@@ -93,12 +93,13 @@ type queryRower interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// schemaVersion returns the highest schema version recorded in
-// pgqueue_schema_version, or 0 if no migrations have been applied yet.
-func schemaVersion(ctx context.Context, q queryRower) (int, error) {
+// schemaVersion returns the highest schema version recorded in the schema
+// version table, or 0 if no migrations have been applied yet. versionTable is
+// the (optionally schema-qualified) name of the pgqueue_schema_version table.
+func schemaVersion(ctx context.Context, q queryRower, versionTable string) (int, error) {
 	var version int
 	err := q.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(version), 0) FROM pgqueue_schema_version`,
+		`SELECT COALESCE(MAX(version), 0) FROM `+versionTable,
 	).Scan(&version)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read schema version: %w", err)
@@ -114,7 +115,13 @@ func schemaVersion(ctx context.Context, q queryRower) (int, error) {
 // racing on the same DDL. Each pending migration is applied in its own
 // transaction together with the row that records it, so a version is recorded
 // if and only if its migration committed.
-func runMigrations(ctx context.Context, db *sql.DB) error {
+//
+// When a non-default schema is configured (FR-024), the schema is created and
+// the connection's search_path is pointed at it for the duration of the run, so
+// the otherwise-unqualified base-schema DDL lands in that schema. search_path is
+// reliable here because the run holds one dedicated connection; it is RESET
+// before that connection returns to the pool.
+func runMigrations(ctx context.Context, db *sql.DB, schema string) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire migration connection: %w", err)
@@ -135,11 +142,18 @@ func runMigrations(ctx context.Context, db *sql.DB) error {
 			"SELECT pg_advisory_unlock($1)", migrationAdvisoryLockKey)
 	}()
 
+	prefix := schemaTablePrefix(schema)
+	resetSearchPath, err := configureMigrationSchema(ctx, conn, schema)
+	if err != nil {
+		return err
+	}
+	defer resetSearchPath()
+
 	if _, err := conn.ExecContext(ctx, schemaVersionTableSQL); err != nil {
 		return fmt.Errorf("failed to create schema version table: %w", err)
 	}
 
-	current, err := schemaVersion(ctx, conn)
+	current, err := schemaVersion(ctx, conn, prefix+"pgqueue_schema_version")
 	if err != nil {
 		return err
 	}
@@ -155,6 +169,32 @@ func runMigrations(ctx context.Context, db *sql.DB) error {
 	}
 
 	return nil
+}
+
+// configureMigrationSchema creates the configured non-default schema and points
+// the migration connection's search_path at it, so the otherwise-unqualified
+// base-schema DDL lands there. It returns a function that resets the search_path
+// before the connection returns to the pool, preventing the change from leaking
+// onto unrelated queries on that pooled connection. For the default public
+// schema it is a no-op.
+func configureMigrationSchema(ctx context.Context, conn *sql.Conn, schema string) (func(), error) {
+	noop := func() {}
+	if schemaTablePrefix(schema) == "" {
+		return noop, nil
+	}
+	if _, err := conn.ExecContext(ctx,
+		"CREATE SCHEMA IF NOT EXISTS "+schema,
+	); err != nil {
+		return noop, fmt.Errorf("failed to create schema %q: %w", schema, err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		"SET search_path TO "+schema,
+	); err != nil {
+		return noop, fmt.Errorf("failed to set search_path: %w", err)
+	}
+	return func() {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "RESET search_path")
+	}, nil
 }
 
 // applyMigration runs a single migration and records its version atomically:
@@ -194,9 +234,10 @@ func (pq *PGQueue) GetSchemaVersion(ctx context.Context) (int, error) {
 	// to_regclass resolves to NULL (without erroring) when the table does not
 	// exist, so this stays safe to call before InitSchema. Referencing the
 	// table directly would fail at query-planning time if it were missing.
+	versionTable := pq.globalTable("pgqueue_schema_version")
 	var exists bool
 	if err := pq.db.QueryRowContext(ctx,
-		`SELECT to_regclass('pgqueue_schema_version') IS NOT NULL`,
+		`SELECT to_regclass($1) IS NOT NULL`, versionTable,
 	).Scan(&exists); err != nil {
 		return 0, fmt.Errorf("failed to check schema version table: %w", err)
 	}
@@ -204,5 +245,5 @@ func (pq *PGQueue) GetSchemaVersion(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	return schemaVersion(ctx, pq.db)
+	return schemaVersion(ctx, pq.db, versionTable)
 }

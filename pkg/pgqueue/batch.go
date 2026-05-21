@@ -105,13 +105,13 @@ func (pq *Queue) AckChannelBatch(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s AS m
+		UPDATE %s AS m
 		SET status = '%s', processed_at = NOW()
 		FROM unnest($1::uuid[], $2::uuid[]) AS u(id, claim_id)
 		WHERE m.id = u.id
 		  AND m.claim_id = u.claim_id
 		  AND m.status = '%s'
-	`, queueMeta.TableName, MessageStatusCompleted, MessageStatusProcessing)
+	`, pq.msgTable(queueMeta.TableName), MessageStatusCompleted, MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimSlices(receipts)
 	result, err := pq.db.ExecContext(ctx, query, ids, claims)
@@ -163,14 +163,14 @@ func (pq *Queue) AckTopicBatch(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s AS s
+		UPDATE %s AS s
 		SET status = '%s', acked_at = NOW()
 		FROM unnest($1::uuid[], $2::uuid[]) AS u(message_id, claim_id)
 		WHERE s.message_id = u.message_id
 		  AND s.claim_id = u.claim_id
 		  AND s.subscriber_id = $3
 		  AND s.status = '%s'
-	`, queueMeta.TableName, MessageStatusAcked, MessageStatusProcessing)
+	`, pq.subTable(queueMeta.TableName), MessageStatusAcked, MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimSlices(receipts)
 	result, err := pq.db.ExecContext(ctx, query, ids, claims, subscriberID)
@@ -418,8 +418,8 @@ func (pq *Queue) publishBatchToChannel(
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb,
-		"INSERT INTO pgqueue_msg_%s (id, payload, status, metadata, max_retries) VALUES ",
-		tableName,
+		"INSERT INTO %s (id, payload, status, metadata, max_retries) VALUES ",
+		pq.msgTable(tableName),
 	)
 
 	args := make([]any, 0, len(messages)*channelInsertParams)
@@ -508,8 +508,8 @@ func (pq *Queue) insertBatchPubSubMessages(
 ) error {
 	var sb strings.Builder
 	fmt.Fprintf(&sb,
-		"INSERT INTO pgqueue_msg_%s (id, payload, metadata) VALUES ",
-		tableName,
+		"INSERT INTO %s (id, payload, metadata) VALUES ",
+		pq.msgTable(tableName),
 	)
 
 	args := make([]any, 0, len(messages)*pubsubInsertParams)
@@ -586,8 +586,8 @@ func (pq *Queue) insertSubscriptionRecords(
 
 		var sb strings.Builder
 		fmt.Fprintf(&sb,
-			"INSERT INTO pgqueue_sub_%s (message_id, subscriber_id, status) VALUES ",
-			tableName,
+			"INSERT INTO %s (message_id, subscriber_id, status) VALUES ",
+			pq.subTable(tableName),
 		)
 
 		args := make([]any, 0, len(chunk)*subInsertParams)
@@ -635,12 +635,12 @@ func (pq *Queue) fetchBatchMessageStates(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT m.id, m.retry_count, m.max_retries, m.payload, m.metadata
-		FROM pgqueue_msg_%s AS m
+		FROM %s AS m
 		JOIN unnest($1::uuid[], $2::uuid[]) AS u(id, claim_id)
 		  ON m.id = u.id AND m.claim_id = u.claim_id
 		WHERE m.status = '%s'
 		FOR UPDATE OF m
-	`, tableName, MessageStatusProcessing)
+	`, pq.msgTable(tableName), MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimSlices(receipts)
 	rows, err := tx.QueryContext(ctx, query, ids, claims)
@@ -678,14 +678,14 @@ func (pq *Queue) batchRetryMessages(
 	// claim_id is cleared so stale receipts from the previous consumer
 	// resolve to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $2
 		WHERE id = ANY($1::uuid[])
-	`, tableName, MessageStatusPending)
+	`, pq.msgTable(tableName), MessageStatusPending)
 
 	_, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs), errorMsg)
 	if err != nil {
@@ -703,8 +703,8 @@ func (pq *Queue) batchMoveToDLQ(
 	errorMsg string,
 ) error {
 	dlqInsert := fmt.Sprintf(
-		`INSERT INTO pgqueue_dlq_%s (original_message_id, payload, failure_reason, retry_count, metadata) VALUES `,
-		tableName,
+		`INSERT INTO %s (original_message_id, payload, failure_reason, retry_count, metadata) VALUES `,
+		pq.dlqTable(tableName),
 	)
 
 	var sb strings.Builder
@@ -733,8 +733,8 @@ func (pq *Queue) batchMoveToDLQ(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	delQuery := fmt.Sprintf(
-		`DELETE FROM pgqueue_msg_%s WHERE id = ANY($1::uuid[])`,
-		tableName,
+		`DELETE FROM %s WHERE id = ANY($1::uuid[])`,
+		pq.msgTable(tableName),
 	)
 	if _, err := tx.ExecContext(ctx, delQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
 		return fmt.Errorf("failed to delete messages: %w", err)
@@ -762,14 +762,14 @@ func (pq *Queue) fetchBatchSubStates(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT s.message_id, s.retry_count, m.payload, m.metadata
-		FROM pgqueue_sub_%s s
-		JOIN pgqueue_msg_%s m ON s.message_id = m.id
+		FROM %s s
+		JOIN %s m ON s.message_id = m.id
 		JOIN unnest($1::uuid[], $2::uuid[]) AS u(message_id, claim_id)
 		  ON s.message_id = u.message_id AND s.claim_id = u.claim_id
 		WHERE s.subscriber_id = $3
 		  AND s.status = '%s'
 		FOR UPDATE OF s
-	`, tableName, tableName, MessageStatusProcessing)
+	`, pq.subTable(tableName), pq.msgTable(tableName), MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimSlices(receipts)
 	rows, err := tx.QueryContext(ctx, query, ids, claims, subscriberID)
@@ -851,7 +851,7 @@ func (pq *Queue) batchRetrySubscriptions(
 	// claim_id is cleared so stale receipts from the previous consumer
 	// resolve to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s
+		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
@@ -859,7 +859,7 @@ func (pq *Queue) batchRetrySubscriptions(
 		    error_message = $3
 		WHERE message_id = ANY($1::uuid[])
 		  AND subscriber_id = $2
-	`, tableName, MessageStatusPending)
+	`, pq.subTable(tableName), MessageStatusPending)
 
 	_, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs), subscriberID, errorMsg)
 	if err != nil {
@@ -878,9 +878,9 @@ func (pq *Queue) batchMoveSubToDLQ(
 ) error {
 	// Batch insert into DLQ, recording which subscriber failed.
 	dlqPrefix := fmt.Sprintf(
-		`INSERT INTO pgqueue_dlq_%s `+
+		`INSERT INTO %s `+
 			`(original_message_id, subscriber_id, payload, failure_reason, retry_count, metadata) VALUES `,
-		tableName,
+		pq.dlqTable(tableName),
 	)
 
 	var sb strings.Builder
@@ -910,8 +910,8 @@ func (pq *Queue) batchMoveSubToDLQ(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM pgqueue_sub_%s WHERE message_id = ANY($1::uuid[]) AND subscriber_id = $2`,
-		tableName,
+		`DELETE FROM %s WHERE message_id = ANY($1::uuid[]) AND subscriber_id = $2`,
+		pq.subTable(tableName),
 	)
 	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs), subscriberID); err != nil {
 		return fmt.Errorf("failed to delete subscriptions: %w", err)

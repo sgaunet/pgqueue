@@ -105,10 +105,10 @@ func (pq *Queue) AckChannel(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE %s
 		SET status = '%s', processed_at = NOW()
 		WHERE id = $1 AND claim_id = $2 AND status = '%s'
-	`, tableName, MessageStatusCompleted, MessageStatusProcessing)
+	`, pq.msgTable(tableName), MessageStatusCompleted, MessageStatusProcessing)
 
 	result, err := pq.db.ExecContext(ctx, query, r.MessageID, r.ClaimID)
 	if err != nil {
@@ -120,7 +120,7 @@ func (pq *Queue) AckChannel(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return classifyChannelAckMiss(ctx, pq.db, tableName, r)
+		return classifyChannelAckMiss(ctx, pq.db, pq.msgTable(tableName), r)
 	}
 
 	return nil
@@ -247,7 +247,7 @@ func (pq *Queue) fetchPendingChannelMessage(
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
 ) (*Message, *time.Time, error) {
-	query, args := channelConsumeQuery(tableName, ttl)
+	query, args := channelConsumeQuery(pq.msgTable(tableName), ttl)
 
 	// Loop so that a message reclaimed after a visibility timeout which has
 	// exhausted its retries is moved to the DLQ and skipped, rather than being
@@ -285,7 +285,7 @@ func (pq *Queue) fetchPendingChannelMessage(
 // processing but its visibility timeout has expired (the previous consumer
 // crashed or never acked). Reclaiming timed-out messages here means redelivery
 // does not depend on the GarbageCollector running.
-func channelConsumeQuery(tableName string, ttl time.Duration) (string, []any) {
+func channelConsumeQuery(msgTable string, ttl time.Duration) (string, []any) {
 	ttlClause := ""
 	var args []any
 	if ttl > 0 {
@@ -299,14 +299,14 @@ func channelConsumeQuery(tableName string, ttl time.Duration) (string, []any) {
 	query := fmt.Sprintf(`
 		SELECT id, payload, created_at, status, retry_count, max_retries,
 		       metadata, processed_at, error_message
-		FROM pgqueue_msg_%s
+		FROM %s
 		WHERE ((status = '%s' AND available_at <= NOW())
 		       OR (status = '%s' AND visibility_timeout < NOW()))
 		  %s
 		ORDER BY id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, tableName, MessageStatusPending, MessageStatusProcessing, ttlClause)
+	`, msgTable, MessageStatusPending, MessageStatusProcessing, ttlClause)
 
 	return query, args
 }
@@ -358,14 +358,14 @@ func (pq *Queue) claimChannelMessage(
 	// is minted on every (re)delivery: it fences a previous consumer whose
 	// visibility timeout lapsed from acknowledging this now-reassigned message.
 	updateQuery := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE %s
 		SET status = '%s',
 		    retry_count = $3,
 		    claim_id = uuidv7(),
 		    visibility_timeout = NOW() + make_interval(secs => $1)
 		WHERE id = $2
 		RETURNING visibility_timeout, claim_id
-	`, tableName, MessageStatusProcessing)
+	`, pq.msgTable(tableName), MessageStatusProcessing)
 
 	var visTimeout time.Time
 	var claimID uuid.UUID
@@ -407,10 +407,10 @@ func (pq *Queue) getProcessingMessageState(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT retry_count, max_retries, payload, metadata
-		FROM pgqueue_msg_%s
+		FROM %s
 		WHERE id = $1 AND claim_id = $2 AND status = '%s'
 		FOR UPDATE
-	`, tableName, MessageStatusProcessing)
+	`, pq.msgTable(tableName), MessageStatusProcessing)
 
 	var state messageState
 	err := tx.QueryRowContext(ctx, query, r.MessageID, r.ClaimID).Scan(
@@ -419,7 +419,7 @@ func (pq *Queue) getProcessingMessageState(
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No processing row under this claim: explain why (expired vs. gone).
-		return nil, classifyChannelAckMiss(ctx, tx, tableName, r)
+		return nil, classifyChannelAckMiss(ctx, tx, pq.msgTable(tableName), r)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query message: %w", err)
@@ -465,10 +465,10 @@ func (pq *Queue) moveToDLQ(
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	dlqQuery := fmt.Sprintf(`
-		INSERT INTO pgqueue_dlq_%s
+		INSERT INTO %s
 			(original_message_id, payload, failure_reason, retry_count, metadata)
 		VALUES ($1, $2, $3, $4, $5)
-	`, tableName)
+	`, pq.dlqTable(tableName))
 
 	_, err := tx.ExecContext(
 		ctx, dlqQuery, messageID, payload, errorMsg,
@@ -481,7 +481,7 @@ func (pq *Queue) moveToDLQ(
 	// Delete message from main queue
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM pgqueue_msg_%s WHERE id = $1`, tableName,
+		`DELETE FROM %s WHERE id = $1`, pq.msgTable(tableName),
 	)
 	_, err = tx.ExecContext(ctx, deleteQuery, messageID)
 	if err != nil {
@@ -505,7 +505,7 @@ func (pq *Queue) retryMessage(
 	// available_at is pushed out by the backoff delay so the message is not
 	// redelivered until the delay has elapsed (FR-023).
 	updateQuery := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
@@ -513,7 +513,7 @@ func (pq *Queue) retryMessage(
 		    available_at = NOW() + make_interval(secs => $3),
 		    error_message = $2
 		WHERE id = $1
-	`, tableName, MessageStatusPending)
+	`, pq.msgTable(tableName), MessageStatusPending)
 
 	_, err := tx.ExecContext(ctx, updateQuery, messageID, errorMsg, delay.Seconds())
 	if err != nil {

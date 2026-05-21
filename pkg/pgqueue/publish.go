@@ -85,11 +85,12 @@ func (pq *Queue) resolveQueueMetadata(
 	ctx context.Context,
 	queueName string,
 ) (*QueueMetadata, error) {
-	query := `
+	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
-		FROM pgqueue_metadata
+		FROM %s
 		WHERE queue_name = $1
-	`
+	`, pq.globalTable("pgqueue_metadata"))
 	rows, err := pq.db.QueryContext(ctx, query, queueName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query queue metadata: %w", err)
@@ -181,10 +182,10 @@ func (pq *Queue) publishToPubSub(
 	// Insert message atomically with conflict detection
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	insertMsg := fmt.Sprintf(`
-		INSERT INTO pgqueue_msg_%s (id, payload, metadata)
+		INSERT INTO %s (id, payload, metadata)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (id) DO NOTHING
-	`, tableName)
+	`, pq.msgTable(tableName))
 
 	result, err := tx.ExecContext(ctx, insertMsg, messageID, payload, metadata)
 	if err != nil {
@@ -386,10 +387,10 @@ func (pq *Queue) publishToChannel(
 	// Insert message atomically with conflict detection
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	insertMsg := fmt.Sprintf(`
-		INSERT INTO pgqueue_msg_%s (id, payload, status, metadata, max_retries)
+		INSERT INTO %s (id, payload, status, metadata, max_retries)
 		VALUES ($1, $2, '%s', $3, $4)
 		ON CONFLICT (id) DO NOTHING
-	`, tableName, MessageStatusPending)
+	`, pq.msgTable(tableName), MessageStatusPending)
 
 	result, err := tx.ExecContext(
 		ctx, insertMsg, messageID, payload, metadata, maxRetries,

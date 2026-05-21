@@ -124,12 +124,17 @@ var queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-func InitSchema(ctx context.Context, db *sql.DB) error {
+func InitSchema(ctx context.Context, db *sql.DB, opts ...Option) error {
 	if db == nil {
 		return ErrDBRequired
 	}
 
-	if err := runMigrations(ctx, db); err != nil {
+	cfg := applyConfigOptions(opts)
+	if err := validateSchemaName(cfg.schemaName); err != nil {
+		return err
+	}
+
+	if err := runMigrations(ctx, db, cfg.schemaName); err != nil {
 		return fmt.Errorf("failed to initialize base schema: %w", err)
 	}
 
@@ -196,6 +201,9 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 	if cfg.maxMessageSize < 0 || cfg.defaultMaxRetries < 0 ||
 		int64(cfg.defaultTTL) < 0 || cfg.maxQueues < 0 {
 		return nil, ErrInvalidConfig
+	}
+	if err := validateSchemaName(cfg.schemaName); err != nil {
+		return nil, err
 	}
 
 	if err := checkDBReady(ctx, db); err != nil {
@@ -417,8 +425,11 @@ func (pq *Queue) checkClosed() error {
 
 func (pq *Queue) setQueuePaused(ctx context.Context, queueName string, queueType QueueType, paused bool) error {
 	result, err := pq.db.ExecContext(ctx,
-		`UPDATE pgqueue_metadata SET paused = $1, updated_at = NOW()
-		 WHERE queue_type = $2 AND queue_name = $3`,
+		fmt.Sprintf(
+			`UPDATE %s SET paused = $1, updated_at = NOW()
+			 WHERE queue_type = $2 AND queue_name = $3`,
+			pq.globalTable("pgqueue_metadata"),
+		),
 		paused, string(queueType), queueName,
 	)
 	if err != nil {
@@ -670,20 +681,20 @@ func (pq *Queue) executeDelete(
 ) error {
 	// For pub/sub, drop subscription table first (has FK to msg table)
 	if queueType == QueueTypePubSub {
-		dropSub := "DROP TABLE IF EXISTS pgqueue_sub_" + tableName //nolint:gosec // G201: table name validated
+		dropSub := "DROP TABLE IF EXISTS " + pq.subTable(tableName)
 		if _, err := tx.ExecContext(ctx, dropSub); err != nil {
 			return fmt.Errorf("failed to drop subscription table: %w", err)
 		}
 	}
 
 	// Drop DLQ table
-	dropDLQ := "DROP TABLE IF EXISTS pgqueue_dlq_" + tableName //nolint:gosec // G201: table name validated
+	dropDLQ := "DROP TABLE IF EXISTS " + pq.dlqTable(tableName)
 	if _, err := tx.ExecContext(ctx, dropDLQ); err != nil {
 		return fmt.Errorf("failed to drop DLQ table: %w", err)
 	}
 
 	// Drop message table
-	dropMsg := "DROP TABLE IF EXISTS pgqueue_msg_" + tableName //nolint:gosec // G201: table name validated
+	dropMsg := "DROP TABLE IF EXISTS " + pq.msgTable(tableName)
 	if _, err := tx.ExecContext(ctx, dropMsg); err != nil {
 		return fmt.Errorf("failed to drop message table: %w", err)
 	}
@@ -747,12 +758,12 @@ func (pq *Queue) createPubSubTables(
 ) error {
 	// Create message table
 	messageTable := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS pgqueue_msg_%s (
+		CREATE TABLE IF NOT EXISTS %s (
 			id UUID PRIMARY KEY,
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			metadata JSONB
-		)`, tableName)
+		)`, pq.msgTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
 		return fmt.Errorf("failed to create message table: %w", err)
@@ -761,7 +772,7 @@ func (pq *Queue) createPubSubTables(
 	// Create indexes
 	createIndex := fmt.Sprintf(`
 		CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_created_at
-		ON pgqueue_msg_%s(created_at)`, tableName, tableName)
+		ON %s(created_at)`, tableName, pq.msgTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, createIndex); err != nil {
 		return fmt.Errorf("failed to create message index: %w", err)
@@ -770,7 +781,7 @@ func (pq *Queue) createPubSubTables(
 	// Create subscription table
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	subscriptionTable := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS pgqueue_sub_%s (
+		CREATE TABLE IF NOT EXISTS %s (
 			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			message_id UUID NOT NULL,
 			subscriber_id TEXT NOT NULL,
@@ -784,8 +795,8 @@ func (pq *Queue) createPubSubTables(
 			error_message TEXT,
 			UNIQUE(message_id, subscriber_id),
 			FOREIGN KEY (message_id)
-				REFERENCES pgqueue_msg_%s(id) ON DELETE CASCADE
-		)`, tableName, MessageStatusPending, tableName)
+				REFERENCES %s(id) ON DELETE CASCADE
+		)`, pq.subTable(tableName), MessageStatusPending, pq.msgTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, subscriptionTable); err != nil {
 		return fmt.Errorf("failed to create subscription table: %w", err)
@@ -804,46 +815,47 @@ func (pq *Queue) createPubSubIndexes(
 	tx *sql.Tx,
 	tableName string,
 ) error {
+	subTbl := pq.subTable(tableName)
 	subIndexes := []string{
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_msg_id
-			 ON pgqueue_sub_%s(message_id)`,
-			tableName, tableName,
+			 ON %s(message_id)`,
+			tableName, subTbl,
 		),
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_subscriber
-			 ON pgqueue_sub_%s(subscriber_id, status)`,
-			tableName, tableName,
+			 ON %s(subscriber_id, status)`,
+			tableName, subTbl,
 		),
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_status
-			 ON pgqueue_sub_%s(status) WHERE status = '%s'`,
-			tableName, tableName, MessageStatusPending,
+			 ON %s(status) WHERE status = '%s'`,
+			tableName, subTbl, MessageStatusPending,
 		),
 		// Consumption-optimized indexes: split the OR condition on
 		// visibility_timeout into two partial indexes for efficient
 		// subscriber message fetching.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_null
-			 ON pgqueue_sub_%s(subscriber_id, message_id)
+			 ON %s(subscriber_id, message_id)
 			 WHERE status = '%s' AND visibility_timeout IS NULL`,
-			tableName, tableName, MessageStatusPending,
+			tableName, subTbl, MessageStatusPending,
 		),
 		// Reclaim-optimized index: covers timed-out 'processing' subscriptions
 		// that ConsumeFromTopic redelivers once their visibility timeout expires.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
-			 ON pgqueue_sub_%s(subscriber_id, visibility_timeout, message_id)
+			 ON %s(subscriber_id, visibility_timeout, message_id)
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
-			tableName, tableName, MessageStatusProcessing,
+			tableName, subTbl, MessageStatusProcessing,
 		),
 		// Backoff-optimized index: covers pending subscriptions awaiting
 		// their scheduled redelivery time (available_at).
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_available
-			 ON pgqueue_sub_%s(available_at)
+			 ON %s(available_at)
 			 WHERE status = '%s'`,
-			tableName, tableName, MessageStatusPending,
+			tableName, subTbl, MessageStatusPending,
 		),
 	}
 
@@ -864,7 +876,7 @@ func (pq *Queue) createChannelTables(
 ) error {
 	// Create message table
 	messageTable := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS pgqueue_msg_%s (
+		CREATE TABLE IF NOT EXISTS %s (
 			id UUID PRIMARY KEY,
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -877,7 +889,7 @@ func (pq *Queue) createChannelTables(
 			processed_at TIMESTAMPTZ,
 			error_message TEXT,
 			metadata JSONB
-		)`, tableName, MessageStatusPending)
+		)`, pq.msgTable(tableName), MessageStatusPending)
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
 		return fmt.Errorf("failed to create message table: %w", err)
@@ -896,43 +908,44 @@ func (pq *Queue) createChannelIndexes(
 	tx *sql.Tx,
 	tableName string,
 ) error {
+	msgTbl := pq.msgTable(tableName)
 	indexes := []string{
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_status_created
-			 ON pgqueue_msg_%s(status, created_at)
+			 ON %s(status, created_at)
 			 WHERE status = '%s'`,
-			tableName, tableName, MessageStatusPending,
+			tableName, msgTbl, MessageStatusPending,
 		),
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_visibility
-			 ON pgqueue_msg_%s(visibility_timeout)
+			 ON %s(visibility_timeout)
 			 WHERE visibility_timeout IS NOT NULL`,
-			tableName, tableName,
+			tableName, msgTbl,
 		),
 		// Consumption-optimized indexes: split the OR condition on
 		// visibility_timeout into two partial indexes so PostgreSQL
 		// can use an efficient index scan for each branch.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_null
-			 ON pgqueue_msg_%s(id)
+			 ON %s(id)
 			 WHERE status = '%s' AND visibility_timeout IS NULL`,
-			tableName, tableName, MessageStatusPending,
+			tableName, msgTbl, MessageStatusPending,
 		),
 		// Reclaim-optimized index: covers timed-out 'processing' messages that
 		// ConsumeFromChannel redelivers once their visibility timeout expires.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_timeout
-			 ON pgqueue_msg_%s(visibility_timeout, id)
+			 ON %s(visibility_timeout, id)
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
-			tableName, tableName, MessageStatusProcessing,
+			tableName, msgTbl, MessageStatusProcessing,
 		),
 		// Backoff-optimized index: covers pending messages awaiting their
 		// scheduled redelivery time (available_at).
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_available
-			 ON pgqueue_msg_%s(available_at)
+			 ON %s(available_at)
 			 WHERE status = '%s'`,
-			tableName, tableName, MessageStatusPending,
+			tableName, msgTbl, MessageStatusPending,
 		),
 	}
 
@@ -954,7 +967,7 @@ func (pq *Queue) createDLQTable(
 	// subscriber_id records which subscriber failed for pub/sub DLQ entries;
 	// it is left NULL for channel DLQ entries, which have no subscriber.
 	dlqTable := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS pgqueue_dlq_%s (
+		CREATE TABLE IF NOT EXISTS %s (
 			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			original_message_id UUID NOT NULL,
 			subscriber_id TEXT,
@@ -963,7 +976,7 @@ func (pq *Queue) createDLQTable(
 			retry_count INT NOT NULL,
 			moved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			metadata JSONB
-		)`, tableName)
+		)`, pq.dlqTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, dlqTable); err != nil {
 		return fmt.Errorf("failed to create DLQ table: %w", err)
@@ -972,7 +985,7 @@ func (pq *Queue) createDLQTable(
 	// Create DLQ index
 	dlqIndex := fmt.Sprintf(`
 		CREATE INDEX IF NOT EXISTS idx_pgqueue_dlq_%s_moved_at
-		ON pgqueue_dlq_%s(moved_at)`, tableName, tableName)
+		ON %s(moved_at)`, tableName, pq.dlqTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, dlqIndex); err != nil {
 		return fmt.Errorf("failed to create DLQ index: %w", err)
@@ -1013,3 +1026,51 @@ func sanitizeTableName(name string) string {
 	// Replace dashes with underscores and convert to lowercase
 	return strings.ToLower(strings.ReplaceAll(name, "-", "_"))
 }
+
+// schemaNameRegex validates a PostgreSQL schema identifier. The name must be a
+// plain unquoted identifier so it can be safely interpolated into DDL/DML
+// (schema names cannot be passed as bind parameters).
+var schemaNameRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// maxSchemaNameLength is PostgreSQL's identifier length limit.
+const maxSchemaNameLength = 63
+
+// validateSchemaName rejects a configured schema name that is not a plain
+// unquoted PostgreSQL identifier. Because the schema name is interpolated
+// directly into SQL, this validation is what keeps that interpolation safe.
+func validateSchemaName(name string) error {
+	if name == "" || len(name) > maxSchemaNameLength || !schemaNameRegex.MatchString(name) {
+		return fmt.Errorf("invalid schema name %q: %w", name, ErrInvalidConfig)
+	}
+
+	return nil
+}
+
+// schemaTablePrefix returns the schema-qualification prefix for SQL identifiers.
+// For the default "public" schema it returns the empty string, leaving SQL
+// unqualified so existing databases and queries are unaffected; for any other
+// schema it returns "<schema>." (FR-024).
+func schemaTablePrefix(schema string) string {
+	if schema == "" || schema == "public" {
+		return ""
+	}
+
+	return schema + "."
+}
+
+// tablePrefix returns the schema-qualification prefix for this Queue.
+func (pq *Queue) tablePrefix() string {
+	return schemaTablePrefix(pq.cfg.schemaName)
+}
+
+// msgTable, dlqTable, and subTable return the schema-qualified physical table
+// name for a queue's message, dead-letter, and subscription tables. tableName
+// is the sanitized per-queue table name stored in pgqueue_metadata.table_name.
+func (pq *Queue) msgTable(tableName string) string { return pq.tablePrefix() + "pgqueue_msg_" + tableName }
+func (pq *Queue) dlqTable(tableName string) string { return pq.tablePrefix() + "pgqueue_dlq_" + tableName }
+func (pq *Queue) subTable(tableName string) string { return pq.tablePrefix() + "pgqueue_sub_" + tableName }
+
+// globalTable returns the schema-qualified name of a global pgqueue table
+// (pgqueue_metadata, pgqueue_subscribers, pgqueue_replay_log,
+// pgqueue_schema_version).
+func (pq *Queue) globalTable(name string) string { return pq.tablePrefix() + name }

@@ -213,20 +213,20 @@ func (gc *GarbageCollector) executePurge(
 	// For pub/sub, delete subscriptions first (before messages, to avoid FK issues
 	// if CASCADE is not relied upon). For channels, this table does not exist.
 	if queueType == QueueTypePubSub {
-		deleteSub := "DELETE FROM pgqueue_sub_" + tableName //nolint:gosec // G201: table name validated
+		deleteSub := "DELETE FROM " + gc.pq.subTable(tableName) //nolint:gosec // G201: table name validated
 		if _, err := tx.ExecContext(ctx, deleteSub); err != nil {
 			return fmt.Errorf("failed to delete subscriptions: %w", err)
 		}
 	}
 
 	// Delete all messages
-	deleteMsg := "DELETE FROM pgqueue_msg_" + tableName //nolint:gosec // G201: table name validated
+	deleteMsg := "DELETE FROM " + gc.pq.msgTable(tableName) //nolint:gosec // G201: table name validated
 	if _, err := tx.ExecContext(ctx, deleteMsg); err != nil {
 		return fmt.Errorf("failed to delete messages: %w", err)
 	}
 
 	// Delete all DLQ messages
-	deleteDLQ := "DELETE FROM pgqueue_dlq_" + tableName //nolint:gosec // G201: table name validated
+	deleteDLQ := "DELETE FROM " + gc.pq.dlqTable(tableName) //nolint:gosec // G201: table name validated
 	if _, err := tx.ExecContext(ctx, deleteDLQ); err != nil {
 		return fmt.Errorf("failed to delete DLQ messages: %w", err)
 	}
@@ -277,14 +277,14 @@ func (gc *GarbageCollector) reclaimOrphanTopicMessages(
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		DELETE FROM pgqueue_msg_%s m
+		DELETE FROM %s m
 		WHERE NOT EXISTS (
-			SELECT 1 FROM pgqueue_sub_%s s WHERE s.message_id = m.id
+			SELECT 1 FROM %s s WHERE s.message_id = m.id
 		)
 		AND NOT EXISTS (
-			SELECT 1 FROM pgqueue_dlq_%s d WHERE d.original_message_id = m.id
+			SELECT 1 FROM %s d WHERE d.original_message_id = m.id
 		)
-	`, tableName, tableName, tableName)
+	`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), gc.pq.dlqTable(tableName))
 
 	if _, err := gc.pq.db.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("failed to delete orphan topic messages: %w", err)
@@ -364,19 +364,19 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 	var query string
 	if queueType == QueueTypePubSub {
 		query = fmt.Sprintf(`
-			DELETE FROM pgqueue_msg_%s m
+			DELETE FROM %s m
 			WHERE m.created_at < NOW() - make_interval(secs => $1)
 			AND NOT EXISTS (
-				SELECT 1 FROM pgqueue_sub_%s s
+				SELECT 1 FROM %s s
 				WHERE s.message_id = m.id AND s.status != '%s'
 			)
-		`, tableName, tableName, MessageStatusAcked)
+		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusAcked)
 	} else {
 		query = fmt.Sprintf(`
-			DELETE FROM pgqueue_msg_%s
+			DELETE FROM %s
 			WHERE status = '%s'
 			AND processed_at < NOW() - make_interval(secs => $1)
-		`, tableName, MessageStatusCompleted)
+		`, gc.pq.msgTable(tableName), MessageStatusCompleted)
 	}
 
 	result, err := gc.pq.db.ExecContext(ctx, query, ttl.Seconds())
@@ -406,19 +406,19 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 	var query string
 	if queueType == QueueTypePubSub {
 		query = fmt.Sprintf(`
-			DELETE FROM pgqueue_msg_%s m
+			DELETE FROM %s m
 			WHERE m.created_at < NOW() - make_interval(secs => $1)
 			AND EXISTS (
-				SELECT 1 FROM pgqueue_sub_%s s
+				SELECT 1 FROM %s s
 				WHERE s.message_id = m.id AND s.status = '%s'
 			)
-		`, tableName, tableName, MessageStatusPending)
+		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusPending)
 	} else {
 		query = fmt.Sprintf(`
-			DELETE FROM pgqueue_msg_%s
+			DELETE FROM %s
 			WHERE status = '%s'
 			AND created_at < NOW() - make_interval(secs => $1)
-		`, tableName, MessageStatusPending)
+		`, gc.pq.msgTable(tableName), MessageStatusPending)
 	}
 
 	result, err := gc.pq.db.ExecContext(ctx, query, maxAge.Seconds())
@@ -442,9 +442,9 @@ func (gc *GarbageCollector) purgeDLQMessages(
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		DELETE FROM pgqueue_dlq_%s
+		DELETE FROM %s
 		WHERE moved_at < NOW() - make_interval(secs => $1)
-	`, tableName)
+	`, gc.pq.dlqTable(tableName))
 
 	result, err := gc.pq.db.ExecContext(ctx, query, retention.Seconds())
 	if err != nil {
@@ -469,20 +469,21 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	ctx context.Context,
 	tableName string,
 ) error {
+	msgTbl := gc.pq.msgTable(tableName)
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
 		    visibility_timeout = NULL
 		WHERE id IN (
-			SELECT id FROM pgqueue_msg_%s
+			SELECT id FROM %s
 			WHERE status = '%s'
 			  AND visibility_timeout IS NOT NULL
 			  AND visibility_timeout < NOW()
 			FOR UPDATE SKIP LOCKED
 		)
-	`, tableName, MessageStatusPending, tableName, MessageStatusProcessing)
+	`, msgTbl, MessageStatusPending, msgTbl, MessageStatusProcessing)
 
 	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {
@@ -505,20 +506,21 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	ctx context.Context,
 	tableName string,
 ) error {
+	subTbl := gc.pq.subTable(tableName)
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s
+		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
 		    visibility_timeout = NULL
 		WHERE id IN (
-			SELECT id FROM pgqueue_sub_%s
+			SELECT id FROM %s
 			WHERE status = '%s'
 			  AND visibility_timeout IS NOT NULL
 			  AND visibility_timeout < NOW()
 			FOR UPDATE SKIP LOCKED
 		)
-	`, tableName, MessageStatusPending, tableName, MessageStatusProcessing)
+	`, subTbl, MessageStatusPending, subTbl, MessageStatusProcessing)
 
 	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {
@@ -550,12 +552,12 @@ func (gc *GarbageCollector) purgeInactiveSubscriptions(
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		DELETE FROM pgqueue_sub_%s
+		DELETE FROM %s
 		WHERE subscriber_id IN (
-			SELECT subscriber_id FROM pgqueue_subscribers
+			SELECT subscriber_id FROM %s
 			WHERE topic_name = $1 AND active = FALSE
 		)
-	`, tableName)
+	`, gc.pq.subTable(tableName), gc.pq.globalTable("pgqueue_subscribers"))
 
 	result, err := gc.pq.db.ExecContext(ctx, query, queueName)
 	if err != nil {

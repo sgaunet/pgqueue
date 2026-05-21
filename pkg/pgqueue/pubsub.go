@@ -156,13 +156,13 @@ func (pq *Queue) AckTopic(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s
+		UPDATE %s
 		SET status = '%s', acked_at = NOW()
 		WHERE message_id = $1
 		  AND subscriber_id = $2
 		  AND claim_id = $3
 		  AND status = '%s'
-	`, queueMeta.TableName, MessageStatusAcked, MessageStatusProcessing)
+	`, pq.subTable(queueMeta.TableName), MessageStatusAcked, MessageStatusProcessing)
 
 	result, err := pq.db.ExecContext(ctx, query, r.MessageID, subscriberID, r.ClaimID)
 	if err != nil {
@@ -174,7 +174,7 @@ func (pq *Queue) AckTopic(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return classifyTopicAckMiss(ctx, pq.db, queueMeta.TableName, subscriberID, r)
+		return classifyTopicAckMiss(ctx, pq.db, pq.subTable(queueMeta.TableName), subscriberID, r)
 	}
 
 	return nil
@@ -290,14 +290,14 @@ func (pq *Queue) getProcessingSubState(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT s.retry_count, m.payload, m.metadata
-		FROM pgqueue_sub_%s s
-		JOIN pgqueue_msg_%s m ON s.message_id = m.id
+		FROM %s s
+		JOIN %s m ON s.message_id = m.id
 		WHERE s.message_id = $1
 		  AND s.subscriber_id = $2
 		  AND s.claim_id = $3
 		  AND s.status = '%s'
 		FOR UPDATE OF s
-	`, tableName, tableName, MessageStatusProcessing)
+	`, pq.subTable(tableName), pq.msgTable(tableName), MessageStatusProcessing)
 
 	var state subState
 
@@ -306,7 +306,7 @@ func (pq *Queue) getProcessingSubState(
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No processing row under this claim: explain why (expired vs. gone).
-		return nil, classifyTopicAckMiss(ctx, tx, tableName, subscriberID, r)
+		return nil, classifyTopicAckMiss(ctx, tx, pq.subTable(tableName), subscriberID, r)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query subscription: %w", err)
@@ -325,10 +325,10 @@ func (pq *Queue) moveSubToDLQ(
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	dlqQuery := fmt.Sprintf(`
-		INSERT INTO pgqueue_dlq_%s
+		INSERT INTO %s
 			(original_message_id, subscriber_id, payload, failure_reason, retry_count, metadata)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, tableName)
+	`, pq.dlqTable(tableName))
 
 	_, err := tx.ExecContext(
 		ctx, dlqQuery, messageID, subscriberID, state.payload, errorMsg,
@@ -340,8 +340,8 @@ func (pq *Queue) moveSubToDLQ(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM pgqueue_sub_%s WHERE message_id = $1 AND subscriber_id = $2`,
-		tableName,
+		`DELETE FROM %s WHERE message_id = $1 AND subscriber_id = $2`,
+		pq.subTable(tableName),
 	)
 
 	_, err = tx.ExecContext(ctx, deleteQuery, messageID, subscriberID)
@@ -365,7 +365,7 @@ func (pq *Queue) retrySubscription(
 	// resolves to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	// available_at is pushed out by the backoff delay (FR-023).
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s
+		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
@@ -374,7 +374,7 @@ func (pq *Queue) retrySubscription(
 		    error_message = $3
 		WHERE message_id = $1
 		  AND subscriber_id = $2
-	`, tableName, MessageStatusPending)
+	`, pq.subTable(tableName), MessageStatusPending)
 
 	_, err := tx.ExecContext(ctx, query, messageID, subscriberID, errorMsg, delay.Seconds())
 	if err != nil {
@@ -404,7 +404,7 @@ func (pq *Queue) fetchPendingTopicMessage(
 	ttl time.Duration,
 	maxRetries int,
 ) (*Message, *time.Time, error) {
-	query, args := topicConsumeQuery(tableName, subscriberID, ttl)
+	query, args := topicConsumeQuery(pq.subTable(tableName), pq.msgTable(tableName), subscriberID, ttl)
 
 	// Loop so an exhausted timed-out subscription is moved to the DLQ and
 	// skipped rather than redelivered forever — see fetchPendingChannelMessage.
@@ -440,7 +440,7 @@ func (pq *Queue) fetchPendingTopicMessage(
 // topicConsumeQuery builds the SELECT for the next consumable subscription. A
 // subscription is consumable when pending, or when still processing but its
 // visibility timeout has expired — see channelConsumeQuery.
-func topicConsumeQuery(tableName, subscriberID string, ttl time.Duration) (string, []any) {
+func topicConsumeQuery(subTable, msgTable, subscriberID string, ttl time.Duration) (string, []any) {
 	ttlClause := ""
 	args := []any{subscriberID}
 	if ttl > 0 {
@@ -453,8 +453,8 @@ func topicConsumeQuery(tableName, subscriberID string, ttl time.Duration) (strin
 	query := fmt.Sprintf(`
 		SELECT s.id, s.message_id, m.payload, m.created_at,
 		       s.status, s.retry_count, m.metadata, s.error_message
-		FROM pgqueue_sub_%s s
-		JOIN pgqueue_msg_%s m ON s.message_id = m.id
+		FROM %s s
+		JOIN %s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
 		  AND ((s.status = '%s' AND s.available_at <= NOW())
 		       OR (s.status = '%s' AND s.visibility_timeout < NOW()))
@@ -462,7 +462,7 @@ func topicConsumeQuery(tableName, subscriberID string, ttl time.Duration) (strin
 		ORDER BY m.id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED
-	`, tableName, tableName, MessageStatusPending, MessageStatusProcessing, ttlClause)
+	`, subTable, msgTable, MessageStatusPending, MessageStatusProcessing, ttlClause)
 
 	return query, args
 }
@@ -512,14 +512,14 @@ func (pq *Queue) claimTopicSubscription(
 	// fresh claim_id is minted on every (re)delivery so a previous consumer
 	// whose visibility timeout lapsed cannot acknowledge this reassigned message.
 	updateQuery := fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s
+		UPDATE %s
 		SET status = '%s',
 		    retry_count = $3,
 		    claim_id = uuidv7(),
 		    visibility_timeout = NOW() + make_interval(secs => $1)
 		WHERE id = $2
 		RETURNING visibility_timeout, claim_id
-	`, tableName, MessageStatusProcessing)
+	`, pq.subTable(tableName), MessageStatusProcessing)
 
 	var visTimeout time.Time
 	var claimID uuid.UUID

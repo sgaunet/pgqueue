@@ -62,11 +62,11 @@ func (pq *Queue) ListDLQMessages(
 	query := fmt.Sprintf(`
 		SELECT id, original_message_id, payload, failure_reason,
 		       retry_count, moved_at, metadata
-		FROM pgqueue_dlq_%s
+		FROM %s
 		WHERE ($1::uuid IS NULL OR id > $1)
 		ORDER BY id
 		LIMIT $2
-	`, tableName)
+	`, pq.dlqTable(tableName))
 
 	rows, err := pq.db.QueryContext(ctx, query, afterID, limit)
 	if err != nil {

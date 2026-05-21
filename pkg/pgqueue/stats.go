@@ -42,7 +42,7 @@ func (pq *Queue) GetStats(
 	}
 
 	// Get DLQ count
-	dlqQuery := "SELECT COUNT(*) FROM pgqueue_dlq_" + tableName
+	dlqQuery := "SELECT COUNT(*) FROM " + pq.dlqTable(tableName)
 	if err := pq.db.QueryRowContext(ctx, dlqQuery).Scan(&stats.DLQCount); err != nil {
 		return nil, fmt.Errorf("failed to get DLQ count: %w", err)
 	}
@@ -78,8 +78,8 @@ func (pq *Queue) GetQueueDepth(
 	if queueType == QueueTypeChannel {
 		//nolint:gosec // G201: table name validated by queueNameRegex
 		query := fmt.Sprintf(
-			"SELECT COUNT(*) FROM pgqueue_msg_%s WHERE status = '%s'",
-			tableName, MessageStatusPending,
+			"SELECT COUNT(*) FROM %s WHERE status = '%s'",
+			pq.msgTable(tableName), MessageStatusPending,
 		)
 		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			return 0, fmt.Errorf("failed to get queue depth: %w", err)
@@ -87,8 +87,8 @@ func (pq *Queue) GetQueueDepth(
 	} else {
 		//nolint:gosec // G201: table name validated by queueNameRegex
 		query := fmt.Sprintf(
-			"SELECT COUNT(*) FROM pgqueue_sub_%s WHERE status = '%s'",
-			tableName, MessageStatusPending,
+			"SELECT COUNT(*) FROM %s WHERE status = '%s'",
+			pq.subTable(tableName), MessageStatusPending,
 		)
 		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
 			return 0, fmt.Errorf("failed to get queue depth: %w", err)
@@ -128,9 +128,9 @@ func (pq *Queue) GetSubscriberLag(
 			COUNT(*) FILTER (WHERE status = '%s') AS processing_count,
 			COUNT(*) FILTER (WHERE status = '%s') AS acked_count,
 			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending
-		FROM pgqueue_sub_%s
+		FROM %s
 		WHERE subscriber_id = $1
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, tableName)
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, pq.subTable(tableName))
 
 	lag := &SubscriberLag{
 		SubscriberID: subscriberID,
@@ -183,8 +183,8 @@ func (pq *Queue) GetDLQStats(
 			MIN(moved_at) AS oldest_moved_at,
 			MAX(moved_at) AS newest_moved_at,
 			AVG(retry_count) AS avg_retry_count
-		FROM pgqueue_dlq_%s
-	`, tableName)
+		FROM %s
+	`, pq.dlqTable(tableName))
 
 	stats := &DLQStats{
 		QueueName: queueName,
@@ -234,8 +234,8 @@ func (pq *Queue) getChannelStats(
 				FILTER (WHERE processed_at IS NOT NULL) AS avg_processing_time,
 			MIN(created_at)
 				FILTER (WHERE status = '%s') AS oldest_pending
-		FROM pgqueue_msg_%s
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusCompleted, MessageStatusPending, tableName)
+		FROM %s
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusCompleted, MessageStatusPending, pq.msgTable(tableName))
 
 	var avgSeconds sql.NullFloat64
 	var oldestPending sql.NullTime
@@ -280,8 +280,8 @@ func (pq *Queue) getPubSubStats(
 				FILTER (WHERE acked_at IS NOT NULL) AS avg_processing_time,
 			MIN(created_at)
 				FILTER (WHERE status = '%s') AS oldest_pending
-		FROM pgqueue_sub_%s
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, tableName)
+		FROM %s
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, pq.subTable(tableName))
 
 	var avgSeconds sql.NullFloat64
 	var oldestPending sql.NullTime
@@ -341,9 +341,9 @@ func (pq *Queue) GetSubscriberHealth(
 			) AS stuck_messages,
 			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending,
 			MAX(acked_at) AS last_activity
-		FROM pgqueue_sub_%s
+		FROM %s
 		WHERE subscriber_id = $1
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, metadata.TableName)
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, pq.subTable(metadata.TableName))
 
 	health := &SubscriberHealth{
 		TopicName:    topicName,
@@ -383,7 +383,10 @@ func (pq *Queue) GetUnhealthySubscribers(
 ) ([]SubscriberHealth, error) {
 	// Get all pub/sub topics
 	rows, err := pq.db.QueryContext(ctx,
-		"SELECT queue_name, table_name FROM pgqueue_metadata WHERE queue_type = $1",
+		fmt.Sprintf(
+			"SELECT queue_name, table_name FROM %s WHERE queue_type = $1",
+			pq.globalTable("pgqueue_metadata"),
+		),
 		string(QueueTypePubSub),
 	)
 	if err != nil {
@@ -427,7 +430,7 @@ func (pq *Queue) findUnhealthyForTopic(
 	topicName, tableName string,
 	cutoff time.Time,
 ) ([]SubscriberHealth, error) {
-	query := buildUnhealthySubscribersQuery(tableName)
+	query := buildUnhealthySubscribersQuery(pq.subTable(tableName))
 
 	rows, err := pq.db.QueryContext(ctx, query, cutoff)
 	if err != nil {
@@ -464,7 +467,7 @@ func (pq *Queue) findUnhealthyForTopic(
 	return results, nil
 }
 
-func buildUnhealthySubscribersQuery(tableName string) string {
+func buildUnhealthySubscribersQuery(subTable string) string {
 	return fmt.Sprintf(`
 		SELECT
 			subscriber_id,
@@ -476,7 +479,7 @@ func buildUnhealthySubscribersQuery(tableName string) string {
 			) AS stuck_messages,
 			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending,
 			MAX(acked_at) AS last_activity
-		FROM pgqueue_sub_%s
+		FROM %s
 		GROUP BY subscriber_id
 		HAVING
 			COUNT(*) FILTER (
@@ -485,6 +488,6 @@ func buildUnhealthySubscribersQuery(tableName string) string {
 				AND visibility_timeout < NOW()
 			) > 0
 			OR MIN(created_at) FILTER (WHERE status = '%s') < $1
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, tableName,
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, subTable,
 		MessageStatusProcessing, MessageStatusPending)
 }

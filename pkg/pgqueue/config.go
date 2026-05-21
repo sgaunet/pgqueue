@@ -59,12 +59,15 @@ func WithMaxQueues(n int) Option {
 	}
 }
 
-// WithSchema sets the PostgreSQL schema that pgqueue tables will be qualified
-// with when using schema-qualified DDL/DML. The default is "public" (FR-024).
+// WithSchema sets the PostgreSQL schema that all pgqueue tables (global and
+// per-queue) live in and are qualified with in every DDL/DML statement. The
+// default is "public" (FR-024).
 //
-// NOTE: Full DML schema-qualification across all SQL statements is a later task
-// (T062). This option documents the intent and stores the value; it is not yet
-// wired into all queries.
+// The same WithSchema value must be passed to both InitSchema and New: the
+// schema is created by InitSchema and all subsequent operations qualify their
+// SQL with it. The name must be a plain unquoted PostgreSQL identifier
+// (^[a-zA-Z_][a-zA-Z0-9_]*$, at most 63 characters); an invalid name makes
+// InitSchema and New return ErrInvalidConfig.
 func WithSchema(name string) Option {
 	return func(c *queueConfig) {
 		c.schemaName = name

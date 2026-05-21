@@ -208,18 +208,18 @@ func (pq *Queue) countReplayableMessages(
 	var countQuery string
 	if queueType == QueueTypePubSub {
 		countQuery = fmt.Sprintf(`
-			SELECT COUNT(*) FROM pgqueue_sub_%s
+			SELECT COUNT(*) FROM %s
 			WHERE created_at >= $1
 			AND status != '%s'
 			AND status != '%s'
-		`, tableName, MessageStatusPending, MessageStatusProcessing)
+		`, pq.subTable(tableName), MessageStatusPending, MessageStatusProcessing)
 	} else {
 		countQuery = fmt.Sprintf(`
-			SELECT COUNT(*) FROM pgqueue_msg_%s
+			SELECT COUNT(*) FROM %s
 			WHERE created_at >= $1
 			AND status != '%s'
 			AND status != '%s'
-		`, tableName, MessageStatusPending, MessageStatusProcessing)
+		`, pq.msgTable(tableName), MessageStatusPending, MessageStatusProcessing)
 	}
 
 	var count int
@@ -285,25 +285,26 @@ func (pq *Queue) buildReplayFromQuery(
 }
 
 func (pq *Queue) buildChannelReplayQuery(tableName string, limit int) string {
+	msgTbl := pq.msgTable(tableName)
 	if limit > 0 {
 		return fmt.Sprintf(`
-			UPDATE pgqueue_msg_%s
+			UPDATE %s
 			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
 			    processed_at = NULL,
 			    error_message = NULL
 			WHERE id IN (
-				SELECT id FROM pgqueue_msg_%s
+				SELECT id FROM %s
 				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
 				ORDER BY id
 				LIMIT %d
 			)
-		`, tableName, MessageStatusPending, tableName, MessageStatusPending, MessageStatusProcessing, limit)
+		`, msgTbl, MessageStatusPending, msgTbl, MessageStatusPending, MessageStatusProcessing, limit)
 	}
 
 	return fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE %s
 		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
@@ -312,29 +313,30 @@ func (pq *Queue) buildChannelReplayQuery(tableName string, limit int) string {
 		WHERE created_at >= $1
 		AND status != '%s'
 		AND status != '%s'
-	`, tableName, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
+	`, msgTbl, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 }
 
 func (pq *Queue) buildPubSubReplayQuery(tableName string, limit int) string {
+	subTbl := pq.subTable(tableName)
 	if limit > 0 {
 		return fmt.Sprintf(`
-			UPDATE pgqueue_sub_%s
+			UPDATE %s
 			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
 			    acked_at = NULL,
 			    error_message = NULL
 			WHERE id IN (
-				SELECT id FROM pgqueue_sub_%s
+				SELECT id FROM %s
 				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
 				ORDER BY id
 				LIMIT %d
 			)
-		`, tableName, MessageStatusPending, tableName, MessageStatusPending, MessageStatusProcessing, limit)
+		`, subTbl, MessageStatusPending, subTbl, MessageStatusPending, MessageStatusProcessing, limit)
 	}
 
 	return fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s
+		UPDATE %s
 		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
@@ -343,7 +345,7 @@ func (pq *Queue) buildPubSubReplayQuery(tableName string, limit int) string {
 		WHERE created_at >= $1
 		AND status != '%s'
 		AND status != '%s'
-	`, tableName, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
+	`, subTbl, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 }
 
 func (pq *Queue) checkMessageExists(
@@ -353,7 +355,7 @@ func (pq *Queue) checkMessageExists(
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	checkQuery := fmt.Sprintf(
-		`SELECT status FROM pgqueue_msg_%s WHERE id = $1`, tableName,
+		`SELECT status FROM %s WHERE id = $1`, pq.msgTable(tableName),
 	)
 
 	var status string
@@ -386,14 +388,14 @@ func (pq *Queue) executeReplayMessage(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE %s
 		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
 		    processed_at = NULL,
 		    error_message = NULL
 		WHERE id = $1 AND status != '%s'
-	`, tableName, MessageStatusPending, MessageStatusProcessing)
+	`, pq.msgTable(tableName), MessageStatusPending, MessageStatusProcessing)
 
 	result, err := tx.ExecContext(ctx, query, messageID)
 	if err != nil {
@@ -409,7 +411,7 @@ func (pq *Queue) executeReplayMessage(
 		// Distinguish "not found" from "currently being processed"
 		var status string
 		checkQuery := fmt.Sprintf( //nolint:gosec // G201: table name validated by queueNameRegex
-			`SELECT status FROM pgqueue_msg_%s WHERE id = $1`, tableName,
+			`SELECT status FROM %s WHERE id = $1`, pq.msgTable(tableName),
 		)
 		err := tx.QueryRowContext(ctx, checkQuery, messageID).Scan(&status)
 		if err == nil && MessageStatus(status) == MessageStatusProcessing {
@@ -436,7 +438,7 @@ func (pq *Queue) countDLQMessages(
 	ctx context.Context,
 	tableName string,
 ) (int, error) {
-	countQuery := "SELECT COUNT(*) FROM pgqueue_dlq_" + tableName
+	countQuery := "SELECT COUNT(*) FROM " + pq.dlqTable(tableName)
 
 	var count int
 	if err := pq.db.QueryRowContext(ctx, countQuery).Scan(&count); err != nil {
@@ -600,12 +602,12 @@ func (pq *Queue) fetchDLQMessages(
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	selectQuery := fmt.Sprintf(`
 		SELECT id, original_message_id, subscriber_id, payload, metadata
-		FROM pgqueue_dlq_%s
+		FROM %s
 		WHERE ($1::uuid IS NULL OR id > $1)
 		ORDER BY id
 		LIMIT %d
 		FOR UPDATE SKIP LOCKED
-	`, tableName, limit)
+	`, pq.dlqTable(tableName), limit)
 
 	rows, err := tx.QueryContext(ctx, selectQuery, after)
 	if err != nil {
@@ -701,7 +703,7 @@ func (pq *Queue) reinsertDLQChannel(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM pgqueue_dlq_%s WHERE id = ANY($1::uuid[])`, tableName,
+		`DELETE FROM %s WHERE id = ANY($1::uuid[])`, pq.dlqTable(tableName),
 	)
 	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
 		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
@@ -722,8 +724,8 @@ func (pq *Queue) insertDLQChannelMessages(
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb,
-		"INSERT INTO pgqueue_msg_%s (id, payload, created_at, status, retry_count, metadata) VALUES ",
-		tableName,
+		"INSERT INTO %s (id, payload, created_at, status, retry_count, metadata) VALUES ",
+		pq.msgTable(tableName),
 	)
 
 	args := make([]any, 0, len(dlqMessages)*paramsPerRow)
@@ -808,7 +810,7 @@ func (pq *Queue) reinsertDLQPubSub(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM pgqueue_dlq_%s WHERE id = ANY($1::uuid[])`, tableName,
+		`DELETE FROM %s WHERE id = ANY($1::uuid[])`, pq.dlqTable(tableName),
 	)
 	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(replayedIDs)); err != nil {
 		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
@@ -832,7 +834,7 @@ func (pq *Queue) filterExistingMessages(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(
-		`SELECT id FROM pgqueue_msg_%s WHERE id = ANY($1::uuid[])`, tableName,
+		`SELECT id FROM %s WHERE id = ANY($1::uuid[])`, pq.msgTable(tableName),
 	)
 	rows, err := tx.QueryContext(ctx, query, uuidSliceToStringSlice(ids))
 	if err != nil {
