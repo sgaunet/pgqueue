@@ -115,29 +115,35 @@ func newNotifier(listener Listener) *notifier {
 // the demux pump. A nil return means push delivery is unavailable; the caller
 // then relies solely on the safety-net poll.
 func (n *notifier) wakeChan(ctx context.Context, notifyChannel string) <-chan struct{} {
+	// Hold n.mu across the whole decide -> LISTEN -> record sequence so the
+	// check-then-act is atomic: concurrent wakeChan callers for the same
+	// channel cannot double-issue LISTEN, and a caller cannot issue LISTEN
+	// after close() — close() takes the same lock (R-06).
 	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	if n.closed {
-		n.mu.Unlock()
 		return nil
 	}
+
 	w, ok := n.wakers[notifyChannel]
 	if !ok {
 		w = newWaker()
 		n.wakers[notifyChannel] = w
 	}
-	needListen := !n.listening[notifyChannel]
-	n.mu.Unlock()
 
+	// Start the demux pump once. pumpOnce.Do does not take n.mu; the spawned
+	// pump goroutine blocks on n.mu until this call returns, so calling it
+	// under the lock is safe.
 	n.pumpOnce.Do(func() { go n.pump() })
 
-	if needListen {
-		if err := n.listener.Listen(ctx, notifyChannel); err != nil {
-			// LISTEN failed; the safety-net poll still delivers the message.
-			return w.wait()
+	if !n.listening[notifyChannel] {
+		// Issue LISTEN exactly once per channel, atomically with recording it.
+		if err := n.listener.Listen(ctx, notifyChannel); err == nil {
+			n.listening[notifyChannel] = true
 		}
-		n.mu.Lock()
-		n.listening[notifyChannel] = true
-		n.mu.Unlock()
+		// On error the channel stays unregistered: the safety-net poll still
+		// delivers the message and a later wakeChan call retries LISTEN.
 	}
 	return w.wait()
 }

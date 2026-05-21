@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -863,5 +864,80 @@ func TestT019_GCReclaimDoesNotDoubleIncrementRetryCount(t *testing.T) {
 	// retry_count must be 0: GC didn't increment, pending-path consume doesn't increment.
 	if msg2.RetryCount != 0 {
 		t.Errorf("expected retry_count=0 (GC does not increment), got %d", msg2.RetryCount)
+	}
+}
+
+// TestExhaustedTimedOutMessagesPromotedByGCNotConsume (R-12) verifies that a
+// single ReceiveChannel call does NOT perform inline DLQ promotion of
+// timed-out-and-exhausted messages: the consume call returns ErrQueueEmpty
+// (exhausted timed-out messages are excluded from delivery) without doing the
+// migration itself. A subsequent GC maintenance pass is what promotes them to
+// the DLQ.
+func TestExhaustedTimedOutMessagesPromotedByGCNotConsume(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// maxRetries=1 so a message is exhausted after a couple of timed-out claims.
+	const channelName = "gc-exhausted-promote"
+	if err := pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(1)); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	const numMessages = 5
+	for range numMessages {
+		if _, err := pq.Publish(ctx, channelName, []byte("exhaust-me")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+	}
+
+	// Consume every message with a 1ms visibility timeout and never ack, then
+	// wait so the claims expire. Repeat enough times to exhaust the retry budget.
+	for attempt := 0; attempt < 4; attempt++ {
+		for {
+			msg, err := pq.ConsumeFromChannel(ctx, channelName, 1*time.Millisecond)
+			if errors.Is(err, pgqueue.ErrQueueEmpty) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("attempt %d consume: %v", attempt, err)
+			}
+			if msg == nil {
+				break
+			}
+			// Never ack: let the 1ms visibility timeout lapse.
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// At this point the messages are timed out and have exhausted their retries.
+	// A single ReceiveChannel must NOT inline-migrate them to the DLQ; it simply
+	// reports the queue empty (exhausted timed-out messages are not delivered).
+	if _, err := pq.ReceiveChannel(ctx, channelName); !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Fatalf("expected ErrQueueEmpty from consume of exhausted messages, got %v", err)
+	}
+
+	// The consume call must not have moved anything to the DLQ.
+	dlqBefore, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats before GC: %v", err)
+	}
+	if dlqBefore.TotalCount != 0 {
+		t.Errorf("consume call performed inline DLQ migration: %d in DLQ before GC", dlqBefore.TotalCount)
+	}
+
+	// The GC maintenance pass is what promotes exhausted timed-out messages.
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	dlqAfter, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats after GC: %v", err)
+	}
+	if dlqAfter.TotalCount != numMessages {
+		t.Errorf("expected %d messages in DLQ after GC, got %d", numMessages, dlqAfter.TotalCount)
 	}
 }

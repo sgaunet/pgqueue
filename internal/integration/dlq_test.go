@@ -124,13 +124,13 @@ func TestReplayDLQLargeBacklogPaged(t *testing.T) {
 		t.Fatalf("seed DLQ backlog: %v", err)
 	}
 
-	replayed, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel,
+	res, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel,
 		pgqueue.ReplayOptions{Confirm: true})
 	if err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
-	if replayed != backlog {
-		t.Fatalf("replayed %d messages, want %d", replayed, backlog)
+	if res.Replayed != backlog {
+		t.Fatalf("replayed %d messages, want %d", res.Replayed, backlog)
 	}
 
 	// The DLQ must now be empty and the message table must hold the backlog.

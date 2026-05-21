@@ -23,6 +23,7 @@ type queueConfig struct {
 	tracer            Tracer
 	metrics           MetricsRecorder
 	backoffPolicy     BackoffPolicy
+	backoffConfigured bool // true when WithBackoffPolicy was supplied
 	safetyNetPoll     time.Duration
 	listener          Listener
 }
@@ -98,9 +99,15 @@ func WithMetrics(m MetricsRecorder) Option {
 
 // WithBackoffPolicy overrides the decorrelated-jitter backoff policy used when
 // a message is nacked (FR-023). The default is DefaultBackoffPolicy().
+//
+// Supplying a policy also enables backoff on visibility-timeout reclaim: a
+// message whose claim times out is returned to the queue with the configured
+// backoff delay before it becomes eligible for redelivery (R-05). Without
+// WithBackoffPolicy, timeout reclaim is immediate.
 func WithBackoffPolicy(p BackoffPolicy) Option {
 	return func(c *queueConfig) {
 		c.backoffPolicy = p
+		c.backoffConfigured = true
 	}
 }
 
@@ -140,9 +147,10 @@ func applyConfigOptions(opts []Option) queueConfig {
 	if c.schemaName == "" {
 		c.schemaName = "public"
 	}
-	if c.backoffPolicy == (BackoffPolicy{}) {
-		c.backoffPolicy = DefaultBackoffPolicy()
-	}
+	// Complete the backoff policy per-field so a partially-specified policy
+	// (e.g. only MaxDelay set) still has sane BaseDelay/Multiplier values
+	// (R-15). normalized() is a no-op on an already-complete policy.
+	c.backoffPolicy = c.backoffPolicy.normalized()
 	return c
 }
 

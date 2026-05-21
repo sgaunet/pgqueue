@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -182,5 +183,89 @@ func TestNotifySafetyNetPollDeliversMissedMessage(t *testing.T) {
 	// Sanity: a follow-up empty receive must report ErrQueueEmpty, not (nil,nil).
 	if _, err := pq.ReceiveChannel(ctx, channelName); !errors.Is(err, pgqueue.ErrQueueEmpty) {
 		t.Fatalf("expected ErrQueueEmpty after draining, got %v", err)
+	}
+}
+
+// TestWakeChanConcurrent (R-06) exercises the internal listen-state machine
+// under contention: many goroutines start blocking ConsumeChannel loops on the
+// same and on different channels — each loop drives the wakeChan listen-state
+// transition — while another goroutine concurrently calls Close().
+//
+// Run under -race -count=2: the assertion is that there is no data race on the
+// listening/closed state, no panic, and that Close() shuts down cleanly even
+// while LISTEN registrations are in flight.
+func TestWakeChanConcurrent(t *testing.T) {
+	db, connStr, cleanup := setupNotifyTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("failed to initialize schema: %v", err)
+	}
+
+	listener, err := pglisten.New(ctx, connStr)
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithListener(listener),
+		pgqueue.WithSafetyNetPoll(100*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("failed to init pgqueue: %v", err)
+	}
+
+	// Three distinct channels, several consumers each — same-channel consumers
+	// contend on the same listen registration; cross-channel consumers exercise
+	// independent registrations.
+	channels := []string{"wake-a", "wake-b", "wake-c"}
+	for _, ch := range channels {
+		if err := pq.CreateChannel(ctx, ch); err != nil {
+			t.Fatalf("failed to create channel %s: %v", ch, err)
+		}
+	}
+
+	consumeCtx, cancelConsumers := context.WithCancel(ctx)
+	const consumersPerChannel = 4
+
+	var consumerWG sync.WaitGroup
+	for _, ch := range channels {
+		for range consumersPerChannel {
+			consumerWG.Add(1)
+			go func(channel string) {
+				defer consumerWG.Done()
+				_ = pq.ConsumeChannel(consumeCtx, channel,
+					func(_ context.Context, _ *pgqueue.Message) error { return nil },
+					pgqueue.WithPollInterval(20*time.Millisecond))
+			}(ch)
+		}
+	}
+
+	// Give the consumers a moment to all register their LISTENs, racing each
+	// other on the same-channel registrations.
+	time.Sleep(150 * time.Millisecond)
+
+	// Concurrently: stop the consumers and Close() the queue. Close() must join
+	// cleanly with LISTEN traffic still in flight; no LISTEN may be issued after
+	// the notifier is closed.
+	var shutdownWG sync.WaitGroup
+	shutdownWG.Add(2)
+	go func() {
+		defer shutdownWG.Done()
+		cancelConsumers()
+	}()
+	go func() {
+		defer shutdownWG.Done()
+		if err := pq.Close(); err != nil {
+			t.Errorf("Close() returned error during concurrent shutdown: %v", err)
+		}
+	}()
+	shutdownWG.Wait()
+	consumerWG.Wait()
+
+	// A second Close() must be a no-op.
+	if err := pq.Close(); err != nil {
+		t.Errorf("second Close() should be a no-op, got: %v", err)
 	}
 }

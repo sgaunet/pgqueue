@@ -10,10 +10,28 @@
 //	    pgqueue.WithTracer(otelpgqueue.NewTracer(tracerProvider)),
 //	    pgqueue.WithMetrics(otelpgqueue.NewMetrics(meterProvider)),
 //	)
+//
+// # Metric label cardinality
+//
+// Every metric records a "queue" attribute set to the pgqueue queue or topic
+// name, and every span carries it too. Each distinct attribute value is a
+// separate metric stream, so the set of queue names must stay bounded: a
+// per-tenant or otherwise dynamically generated queue name grows the stream
+// count without limit. Keep queue names drawn from a small, fixed set (R-24).
+//
+// # Deferred: MetricsRecorder context parameter
+//
+// Threading a context.Context through the pgqueue.MetricsRecorder interface
+// methods (so metrics could carry exemplar/trace correlation) was evaluated and
+// deferred — it is an interface-breaking change for every implementer and is
+// not adopted here (R-23b). This adapter records metrics with
+// context.Background until that interface change is approved separately.
 package otelpgqueue
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
@@ -27,6 +45,16 @@ import (
 
 // instrumentationName identifies this library to OpenTelemetry.
 const instrumentationName = "github.com/sgaunet/pgqueue"
+
+// Option configures a Metrics adapter at construction time.
+type Option func(*Metrics)
+
+// WithLogger attaches a structured logger. When set, OpenTelemetry
+// instrument-creation failures are logged at WARN instead of being silently
+// discarded (R-23). When nil (the default) the adapter is silent.
+func WithLogger(logger *slog.Logger) Option {
+	return func(m *Metrics) { m.logger = logger }
+}
 
 // Tracer adapts an OpenTelemetry tracer to the pgqueue.Tracer hook interface.
 type Tracer struct {
@@ -47,14 +75,20 @@ func NewTracer(tp trace.TracerProvider) *Tracer {
 
 // StartSpan begins an OpenTelemetry span and wraps it as a pgqueue.Span.
 //
-//nolint:ireturn,spancheck // pgqueue.Span is the hook interface this adapter
-// implements; the span is intentionally returned for the caller (pgqueue) to End.
+//nolint:ireturn // pgqueue.Span is the hook interface this adapter implements;
+// the span is intentionally returned for the caller (pgqueue) to End.
 func (t *Tracer) StartSpan(
 	ctx context.Context,
 	name string,
 	attrs ...pgqueue.Attr,
 ) (context.Context, pgqueue.Span) {
 	ctx, span := t.tracer.Start(ctx, name, trace.WithAttributes(toKeyValues(attrs)...))
+	// A misbehaving TracerProvider can return a nil span; substitute a no-op
+	// span so the otelSpan wrapper cannot panic on End/SetError (R-23).
+	if span == nil {
+		_, span = tracenoop.NewTracerProvider().
+			Tracer(instrumentationName).Start(ctx, name)
+	}
 	return ctx, &otelSpan{span: span}
 }
 
@@ -105,6 +139,7 @@ func toKeyValues(attrs []pgqueue.Attr) []attribute.KeyValue {
 
 // Metrics adapts OpenTelemetry instruments to the pgqueue.MetricsRecorder hook.
 type Metrics struct {
+	logger     *slog.Logger
 	publishes  metric.Int64Counter
 	consumeDur metric.Float64Histogram
 	acks       metric.Int64Counter
@@ -116,25 +151,48 @@ type Metrics struct {
 var _ pgqueue.MetricsRecorder = (*Metrics)(nil)
 
 // NewMetrics builds a pgqueue.MetricsRecorder backed by mp. A nil provider
-// falls back to a no-op meter. Instrument-creation errors are non-fatal: the
-// affected metric is simply not recorded.
-func NewMetrics(mp metric.MeterProvider) *Metrics {
+// falls back to a no-op meter.
+//
+// Instrument-creation errors are non-fatal — the affected metric is simply not
+// recorded — but they are no longer silently discarded: pass WithLogger to have
+// them logged once at WARN (R-23).
+func NewMetrics(mp metric.MeterProvider, opts ...Option) *Metrics {
 	if mp == nil {
 		mp = metricnoop.NewMeterProvider()
 	}
-	meter := mp.Meter(instrumentationName)
 	m := &Metrics{}
-	m.publishes, _ = meter.Int64Counter("pgqueue.publish.messages",
-		metric.WithDescription("Messages published to pgqueue queues"))
-	m.consumeDur, _ = meter.Float64Histogram("pgqueue.consume.duration",
+	for _, o := range opts {
+		o(m)
+	}
+	meter := mp.Meter(instrumentationName)
+
+	var errs []error
+	var err error
+	if m.publishes, err = meter.Int64Counter("pgqueue.publish.messages",
+		metric.WithDescription("Messages published to pgqueue queues")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.consumeDur, err = meter.Float64Histogram("pgqueue.consume.duration",
 		metric.WithDescription("Message processing latency"),
-		metric.WithUnit("s"))
-	m.acks, _ = meter.Int64Counter("pgqueue.ack.total",
-		metric.WithDescription("Acknowledgement outcomes (ack and nack)"))
-	m.queueDepth, _ = meter.Int64Gauge("pgqueue.queue.depth",
-		metric.WithDescription("Pending message count"))
-	m.dlqSize, _ = meter.Int64Gauge("pgqueue.dlq.size",
-		metric.WithDescription("Dead-letter queue size"))
+		metric.WithUnit("s")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.acks, err = meter.Int64Counter("pgqueue.ack.total",
+		metric.WithDescription("Acknowledgement outcomes (ack and nack)")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.queueDepth, err = meter.Int64Gauge("pgqueue.queue.depth",
+		metric.WithDescription("Pending message count")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.dlqSize, err = meter.Int64Gauge("pgqueue.dlq.size",
+		metric.WithDescription("Dead-letter queue size")); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 && m.logger != nil {
+		m.logger.Warn("otelpgqueue: some metric instruments failed to create",
+			"error", errors.Join(errs...))
+	}
 	return m
 }
 

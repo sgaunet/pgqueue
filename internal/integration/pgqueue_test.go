@@ -1,10 +1,13 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1370,5 +1373,143 @@ func TestAckTopicWithoutConsume(t *testing.T) {
 	}
 	if msg.ID != msgID {
 		t.Errorf("expected message ID %s, got %s", msgID, msg.ID)
+	}
+}
+
+// syncBuffer is a goroutine-safe bytes.Buffer adapter so a slog handler can be
+// written to from background library goroutines without a data race under -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// TestCloseJoinsBackgroundGoroutines (R-08) verifies that Close() joins the GC
+// and handler-consume background goroutines before returning: closing the DB
+// immediately afterwards must not provoke any "query on closed database" error
+// logged by a still-running library goroutine. A second Close() must be a no-op.
+//
+// Run under -race -count=2.
+func TestCloseJoinsBackgroundGoroutines(t *testing.T) {
+	db, containerCleanup := setupTestContainer(t)
+	defer containerCleanup()
+
+	ctx := context.Background()
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+
+	logBuf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithLogger(logger),
+		pgqueue.WithBackoffPolicy(pgqueue.BackoffPolicy{
+			BaseDelay: time.Nanosecond, MaxDelay: time.Nanosecond, Multiplier: 1,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	const channelName = "close-join"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// A GC that polls aggressively so it is genuinely running background work.
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		Interval: 10 * time.Millisecond,
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			CompletedMessageTTL: time.Millisecond,
+		},
+	})
+	gc.Start(ctx)
+
+	// A handler-consume loop owned by the Queue.
+	for range 10 {
+		if _, err := pq.PublishChannel(ctx, channelName, []byte("work")); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	go func() {
+		_ = pq.ConsumeChannel(ctx, channelName,
+			func(_ context.Context, _ *pgqueue.Message) error { return nil },
+			pgqueue.WithPollInterval(10*time.Millisecond))
+	}()
+
+	// Let the GC and the consume loop run a few iterations.
+	time.Sleep(200 * time.Millisecond)
+
+	// Close() must join all background goroutines before returning.
+	if err := pq.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+
+	// Now close the DB. If Close() truly joined every goroutine, nothing can
+	// issue a query against the now-closed pool.
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() returned error: %v", err)
+	}
+
+	// Give any (incorrectly) surviving goroutine a moment to fail a query.
+	time.Sleep(200 * time.Millisecond)
+
+	logs := logBuf.String()
+	for _, bad := range []string{"closed", "bad connection", "sql: database is closed"} {
+		if strings.Contains(strings.ToLower(logs), bad) {
+			t.Errorf("library goroutine logged a post-Close DB error (%q):\n%s", bad, logs)
+		}
+	}
+
+	// A second Close() must be a no-op returning nil.
+	if err := pq.Close(); err != nil {
+		t.Errorf("second Close() should be a no-op, got: %v", err)
+	}
+}
+
+// TestNewBackoffAndConfigValidation (R-15) verifies that New completes a partial
+// BackoffPolicy per-field (a policy supplying only MaxDelay is accepted), and
+// that an invalid backoff policy or a negative safety-net poll is rejected at
+// New with ErrInvalidConfig.
+func TestNewBackoffAndConfigValidation(t *testing.T) {
+	db, containerCleanup := setupTestContainer(t)
+	defer containerCleanup()
+
+	ctx := context.Background()
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+
+	// A partial backoff policy (only MaxDelay set) must be completed per-field
+	// and accepted.
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithBackoffPolicy(pgqueue.BackoffPolicy{MaxDelay: 10 * time.Minute}))
+	if err != nil {
+		t.Fatalf("New with partial BackoffPolicy should succeed, got: %v", err)
+	}
+	_ = pq.Close()
+
+	// A negative BaseDelay is an invalid policy and must be rejected.
+	if _, err := pgqueue.New(ctx, db,
+		pgqueue.WithBackoffPolicy(pgqueue.BackoffPolicy{BaseDelay: -1})); !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("New with negative BaseDelay should return ErrInvalidConfig, got: %v", err)
+	}
+
+	// A negative safety-net poll must be rejected.
+	if _, err := pgqueue.New(ctx, db,
+		pgqueue.WithSafetyNetPoll(-1*time.Second)); !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("New with negative WithSafetyNetPoll should return ErrInvalidConfig, got: %v", err)
 	}
 }

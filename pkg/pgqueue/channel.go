@@ -68,13 +68,17 @@ func (pq *Queue) ConsumeFromChannel(
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending channel message: %w", err)
 	}
-	if msg == nil {
-		return nil, nil //nolint:nilnil // nil message indicates no messages available
-	}
-
-	// Commit transaction
+	// Commit unconditionally — even with no message to deliver. The scan may
+	// have deferred timed-out messages with a backoff delay (R-05), and those
+	// UPDATEs must persist rather than be discarded by the deferred Rollback.
+	// With no message and no deferral the transaction is read-only, so the
+	// commit is harmless.
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	if msg == nil {
+		return nil, nil //nolint:nilnil // nil message indicates no messages available
 	}
 
 	msg.VisibilityTimeout = visTimeout
@@ -110,7 +114,16 @@ func (pq *Queue) AckChannel(
 		WHERE id = $1 AND claim_id = $2 AND status = '%s'
 	`, pq.msgTable(tableName), MessageStatusCompleted, MessageStatusProcessing)
 
-	result, err := pq.db.ExecContext(ctx, query, r.MessageID, r.ClaimID)
+	// Run the UPDATE and, on a miss, the classifying SELECT in one transaction
+	// so the classification observes the same snapshot as the failed UPDATE —
+	// a concurrent reclaim cannot slip in between and flip the error type (R-09).
+	tx, err := pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, query, r.MessageID, r.ClaimID)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge message: %w", err)
 	}
@@ -120,7 +133,11 @@ func (pq *Queue) AckChannel(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return classifyChannelAckMiss(ctx, pq.db, pq.msgTable(tableName), r)
+		return classifyChannelAckMiss(ctx, tx, pq.msgTable(tableName), r)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
@@ -247,11 +264,15 @@ func (pq *Queue) fetchPendingChannelMessage(
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
 ) (*Message, *time.Time, error) {
-	query, args := channelConsumeQuery(pq.msgTable(tableName), ttl)
+	query, args := channelConsumeQuery(
+		pq.msgTable(tableName), ttl, pq.config.DefaultMaxRetries,
+	)
 
-	// Loop so that a message reclaimed after a visibility timeout which has
-	// exhausted its retries is moved to the DLQ and skipped, rather than being
-	// redelivered forever (a consumer that always crashes never sends a Nack).
+	// Loop so that a timed-out message whose redelivery is deferred by the
+	// backoff policy (R-05) is skipped and the next eligible message is
+	// considered, rather than this consume call returning empty. Exhausted
+	// timed-out messages are excluded by the query itself (R-12) — the
+	// garbage collector promotes them to the DLQ.
 	for {
 		var row channelCandidate
 		err := tx.QueryRowContext(ctx, query, args...).Scan(
@@ -266,11 +287,11 @@ func (pq *Queue) fetchPendingChannelMessage(
 			return nil, nil, fmt.Errorf("failed to query message: %w", err)
 		}
 
-		retryCount, dlqd, err := pq.reclaimChannelAttempt(ctx, tx, tableName, row)
+		retryCount, deferred, err := pq.reclaimChannelAttempt(ctx, tx, tableName, row)
 		if err != nil {
 			return nil, nil, err
 		}
-		if dlqd {
+		if deferred {
 			continue
 		}
 
@@ -285,11 +306,16 @@ func (pq *Queue) fetchPendingChannelMessage(
 // processing but its visibility timeout has expired (the previous consumer
 // crashed or never acked). Reclaiming timed-out messages here means redelivery
 // does not depend on the GarbageCollector running.
-func channelConsumeQuery(msgTable string, ttl time.Duration) (string, []any) {
+//
+// A timed-out 'processing' message that has already exhausted its retries is
+// deliberately excluded (retry_count < effective max): promoting it to the DLQ
+// is the garbage collector's job, not the consume path's (R-12). defaultMaxRetries
+// is the fallback limit for rows whose max_retries column is NULL or zero.
+func channelConsumeQuery(msgTable string, ttl time.Duration, defaultMaxRetries int) (string, []any) {
+	args := []any{defaultMaxRetries}
 	ttlClause := ""
-	var args []any
 	if ttl > 0 {
-		ttlClause = "AND created_at > NOW() - make_interval(secs => $1)"
+		ttlClause = "AND created_at > NOW() - make_interval(secs => $2)"
 		args = append(args, ttl.Seconds())
 	}
 
@@ -301,7 +327,8 @@ func channelConsumeQuery(msgTable string, ttl time.Duration) (string, []any) {
 		       metadata, processed_at, error_message
 		FROM %s
 		WHERE ((status = '%s' AND available_at <= NOW())
-		       OR (status = '%s' AND visibility_timeout < NOW()))
+		       OR (status = '%s' AND visibility_timeout < NOW()
+		           AND retry_count < COALESCE(NULLIF(max_retries, 0), $1)))
 		  %s
 		ORDER BY id
 		LIMIT 1
@@ -313,33 +340,71 @@ func channelConsumeQuery(msgTable string, ttl time.Duration) (string, []any) {
 
 // reclaimChannelAttempt accounts for a redelivery when a candidate was picked
 // up in 'processing' state — a visibility timeout where the previous consumer
-// never acked. It returns the retry count to claim with; if the retries are now
-// exhausted it moves the message to the DLQ and reports dlqd=true so the caller
-// skips it.
+// never acked. The consume query already excludes exhausted timed-out messages
+// (R-12), so a reclaim here is never the final attempt.
+//
+// It returns the retry count to claim with. When a backoff policy is configured
+// (R-05) the timed-out message is instead returned to 'pending' with its
+// redelivery deferred by the backoff delay; deferred is then true and the
+// caller skips this message.
 func (pq *Queue) reclaimChannelAttempt(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	row channelCandidate,
 ) (int, bool, error) {
-	retryCount := row.retryCount
 	if MessageStatus(row.status) != MessageStatusProcessing {
-		return retryCount, false, nil
+		return row.retryCount, false, nil
 	}
 
-	retryCount++
-	if retryCount > channelMaxRetries(pq.config.DefaultMaxRetries, row.maxRetries) {
-		if err := pq.moveToDLQ(
-			ctx, tx, tableName, row.id, errReasonVisibilityTimeout,
-			row.payload, retryCount, row.metadataJSON,
-		); err != nil {
-			return 0, false, fmt.Errorf("failed to move timed-out message to DLQ: %w", err)
-		}
+	// A timeout reclaim counts as one redelivery attempt.
+	retryCount := row.retryCount + 1
 
+	if pq.cfg.backoffConfigured {
+		// Return the message to pending with available_at pushed out by the
+		// backoff delay, so a crash-looping consumer cannot drive tight,
+		// backoff-free redelivery (R-05).
+		delay := pq.computeRetryDelay(retryCount, 0)
+		if err := pq.deferReclaimedChannelMessage(
+			ctx, tx, tableName, row.id, retryCount, delay,
+		); err != nil {
+			return 0, false, err
+		}
 		return 0, true, nil
 	}
 
+	// No backoff policy configured: reclaim is immediate.
 	return retryCount, false, nil
+}
+
+// deferReclaimedChannelMessage returns a timed-out 'processing' message to
+// 'pending' with retry_count incremented and available_at pushed out by the
+// backoff delay, so it is not redelivered until the delay elapses (R-05).
+func (pq *Queue) deferReclaimedChannelMessage(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	messageID uuid.UUID,
+	retryCount int,
+	delay time.Duration,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		UPDATE %s
+		SET status = '%s',
+		    claim_id = NULL,
+		    retry_count = $2,
+		    visibility_timeout = NULL,
+		    available_at = NOW() + make_interval(secs => $3)
+		WHERE id = $1
+	`, pq.msgTable(tableName), MessageStatusPending)
+
+	if _, err := tx.ExecContext(
+		ctx, query, messageID, retryCount, delay.Seconds(),
+	); err != nil {
+		return fmt.Errorf("failed to defer reclaimed message: %w", err)
+	}
+	return nil
 }
 
 //nolint:gosec // G201: table name validated by queueNameRegex

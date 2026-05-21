@@ -8,7 +8,9 @@ package pgqueue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -79,12 +81,12 @@ func (pq *Queue) ReceiveChannel(
 	}
 
 	// Stamp queue binding onto the message so Receipt() returns a full Receipt.
-	msg.receipt = Receipt{
+	SetReceipt(msg, Receipt{
 		MessageID: msg.ID,
 		ClaimID:   msg.ClaimID,
 		QueueName: name,
 		QueueType: QueueTypeChannel,
-	}
+	})
 
 	return msg, nil
 }
@@ -115,13 +117,13 @@ func (pq *Queue) ReceiveTopic(
 		return nil, ErrQueueEmpty
 	}
 
-	msg.receipt = Receipt{
+	SetReceipt(msg, Receipt{
 		MessageID:    msg.ID,
 		ClaimID:      msg.ClaimID,
 		QueueName:    name,
 		QueueType:    QueueTypePubSub,
 		SubscriberID: subscriberID,
-	}
+	})
 
 	return msg, nil
 }
@@ -517,6 +519,13 @@ func (pq *Queue) runHandlerLoop(
 	h Handler,
 	receive func(context.Context) (*Message, error),
 ) error {
+	// Register on the Queue's worker WaitGroup so Close can join this loop
+	// before the caller closes the database (R-08).
+	if !pq.trackWorker() {
+		return ErrQueueClosed
+	}
+	defer pq.workerWG.Done()
+
 	o := applyConsumeOptions(opts)
 	workers := o.concurrency
 	if workers <= 0 {
@@ -528,6 +537,18 @@ func (pq *Queue) runHandlerLoop(
 	// error; that worker cancels the shared context so the others wind down.
 	loopCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Close cancels bgCtx; mirror that onto loopCtx so the loop also winds
+	// down on Close, not only on the caller's own context.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-pq.bgCtx.Done():
+			cancel()
+		case <-stopWatch:
+		}
+	}()
 
 	var (
 		mu       sync.Mutex
@@ -590,7 +611,7 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 		StringAttr("message_id", msg.ID.String()))
 
 	start := time.Now()
-	herr := h(ctx, msg)
+	herr := pq.callHandler(ctx, h, msg)
 	pq.recordConsume(receipt.QueueName, time.Since(start))
 	endSpan(span, herr)
 
@@ -600,4 +621,34 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 		return
 	}
 	_ = pq.Ack(ackCtx, receipt)
+}
+
+// errHandlerPanic is the static base error for a recovered handler panic; the
+// recovered value is attached as wrapping context.
+var errHandlerPanic = errors.New("handler panic")
+
+// callHandler invokes the user handler, recovering any panic so one bad
+// message cannot crash the process or take sibling workers down with it
+// (R-01). A recovered panic is converted to an error and routed to the normal
+// Nack path — the message is retried (or dead-lettered once retries are
+// exhausted) exactly as a returned error would be. The stack is logged at
+// ERROR for diagnosis.
+func (pq *Queue) callHandler(ctx context.Context, h Handler, msg *Message) (herr error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if e, ok := r.(error); ok {
+			herr = fmt.Errorf("%w: %w", errHandlerPanic, e)
+		} else {
+			herr = fmt.Errorf("%w: %v", errHandlerPanic, r)
+		}
+		pq.logError("recovered panic in message handler",
+			"message_id", msg.ID.String(),
+			"panic", r,
+			"stack", string(debug.Stack()),
+		)
+	}()
+	return h(ctx, msg)
 }

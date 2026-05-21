@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -515,5 +516,129 @@ func TestPubSubStats(t *testing.T) {
 	// 5 messages * 2 subscribers = 10 subscription records
 	if stats.PendingCount != 10 {
 		t.Errorf("expected 10 pending subscriptions (5 messages * 2 subscribers), got %d", stats.PendingCount)
+	}
+}
+
+// TestStatsAPIRejectsAfterClose (R-18) verifies that every public stats method
+// returns ErrQueueClosed once the Queue has been closed.
+func TestStatsAPIRejectsAfterClose(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create a channel and a topic so the methods have real queues to target;
+	// they must still reject because the handle is closed.
+	if err := pq.CreateChannel(ctx, "closed-stats-ch"); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+	if err := pq.CreateTopic(ctx, "closed-stats-topic"); err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, "closed-stats-topic", "sub1"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	if err := pq.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{"GetStats", func() error {
+			_, err := pq.GetStats(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
+			return err
+		}},
+		{"GetQueueDepth", func() error {
+			_, err := pq.GetQueueDepth(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
+			return err
+		}},
+		{"GetSubscriberLag", func() error {
+			_, err := pq.GetSubscriberLag(ctx, "closed-stats-topic", "sub1")
+			return err
+		}},
+		{"GetDLQStats", func() error {
+			_, err := pq.GetDLQStats(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
+			return err
+		}},
+		{"GetSubscriberHealth", func() error {
+			_, err := pq.GetSubscriberHealth(ctx, "closed-stats-topic", "sub1")
+			return err
+		}},
+		{"GetUnhealthySubscribers", func() error {
+			_, err := pq.GetUnhealthySubscribers(ctx, 5*time.Minute)
+			return err
+		}},
+	}
+
+	for _, c := range checks {
+		if err := c.call(); !errors.Is(err, pgqueue.ErrQueueClosed) {
+			t.Errorf("%s after Close: got %v, want ErrQueueClosed", c.name, err)
+		}
+	}
+}
+
+// TestStatsAgesNeverNegative (R-19) verifies that age values reported by the
+// stats API are never negative — the age must be computed in SQL (NOW() -
+// created_at) so it cannot go negative due to host/DB clock skew.
+func TestStatsAgesNeverNegative(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const channelName = "age-test-ch"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish a handful of messages; the freshly published rows have the most
+	// clock-skew-sensitive ages.
+	for range 10 {
+		if _, err := pq.Publish(ctx, channelName, []byte("msg")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+	}
+
+	stats, err := pq.GetStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats: %v", err)
+	}
+	if stats.OldestPendingAge != nil && *stats.OldestPendingAge < 0 {
+		t.Errorf("OldestPendingAge is negative: %v", *stats.OldestPendingAge)
+	}
+
+	// Subscriber-side ages too.
+	const topic = "age-test-topic"
+	if err := pq.CreateTopic(ctx, topic); err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topic, "sub-age"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+	for range 5 {
+		if _, err := pq.Publish(ctx, topic, []byte("msg")); err != nil {
+			t.Fatalf("failed to publish to topic: %v", err)
+		}
+	}
+
+	lag, err := pq.GetSubscriberLag(ctx, topic, "sub-age")
+	if err != nil {
+		t.Fatalf("failed to get subscriber lag: %v", err)
+	}
+	if lag.OldestPendingAge != nil && *lag.OldestPendingAge < 0 {
+		t.Errorf("subscriber OldestPendingAge is negative: %v", *lag.OldestPendingAge)
+	}
+
+	// SubscriberHealth.OldestPending is a wall-clock timestamp; its age relative
+	// to now must not be in the future (which would imply a negative age).
+	health, err := pq.GetSubscriberHealth(ctx, topic, "sub-age")
+	if err != nil {
+		t.Fatalf("failed to get subscriber health: %v", err)
+	}
+	if health.OldestPending != nil && time.Since(*health.OldestPending) < 0 {
+		t.Errorf("SubscriberHealth.OldestPending is in the future: %v", *health.OldestPending)
 	}
 }

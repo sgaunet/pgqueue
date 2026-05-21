@@ -3,6 +3,7 @@ package integration_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,4 +97,82 @@ func TestClaimFencing(t *testing.T) {
 			t.Errorf("current AckTopic: %v", err)
 		}
 	})
+}
+
+// TestAckMissClassificationStable (R-09) verifies that acking an already-acked
+// channel message while a concurrent reclaim races is classified consistently:
+// the ack-miss error does not flap between error types across repeated runs.
+// The AckChannel UPDATE and the classification SELECT must observe a single
+// consistent snapshot (one transaction), so the same sentinel is returned every
+// time.
+//
+// Run under -race.
+func TestAckMissClassificationStable(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const channelName = "ack-miss-classify"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// Each iteration: publish, consume, ack (success), then concurrently fire a
+	// second (stale) ack while a reclaim attempt races. Record the classified
+	// error so we can assert it never flaps.
+	const runs = 20
+	classifications := make(map[string]int)
+
+	for i := range runs {
+		if _, err := pq.Publish(ctx, channelName, []byte("payload")); err != nil {
+			t.Fatalf("run %d: publish: %v", i, err)
+		}
+		msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+		if err != nil || msg == nil {
+			t.Fatalf("run %d: consume: msg=%v err=%v", i, msg, err)
+		}
+		// First ack succeeds.
+		if err := pq.AckChannel(ctx, channelName, msg.Receipt()); err != nil {
+			t.Fatalf("run %d: first ack: %v", i, err)
+		}
+
+		// Now race a stale re-ack against a reclaim attempt on the (already
+		// completed) message.
+		var (
+			wg       sync.WaitGroup
+			staleErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			staleErr = pq.AckChannel(ctx, channelName, msg.Receipt())
+		}()
+		go func() {
+			defer wg.Done()
+			// A reclaim attempt: there is nothing pending, so this just races
+			// the ack-miss classification path.
+			_, _ = pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+		}()
+		wg.Wait()
+
+		if staleErr == nil {
+			t.Fatalf("run %d: stale re-ack unexpectedly succeeded", i)
+		}
+		// The stale ack must resolve to a known, stable sentinel.
+		switch {
+		case errors.Is(staleErr, pgqueue.ErrMessageAlreadyAcked):
+			classifications["already-acked"]++
+		case errors.Is(staleErr, pgqueue.ErrClaimExpired):
+			classifications["claim-expired"]++
+		case errors.Is(staleErr, pgqueue.ErrMessageNotFound):
+			classifications["not-found"]++
+		default:
+			t.Fatalf("run %d: stale ack returned an unclassified error: %v", i, staleErr)
+		}
+	}
+
+	// The classification must be stable: every run resolved to the same bucket.
+	if len(classifications) != 1 {
+		t.Errorf("ack-miss classification flapped across runs: %v", classifications)
+	}
 }

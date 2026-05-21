@@ -123,10 +123,21 @@ q, _ = pgqueue.New(ctx, db,
     pgqueue.WithTracer(otelpgqueue.NewTracer(tracerProvider)),
     pgqueue.WithMetrics(otelpgqueue.NewMetrics(meterProvider)))
 
+// Prometheus adapter: NewMetrics returns an error so a registration
+// failure is surfaced rather than silently dropped.
+import "github.com/sgaunet/pgqueue/pkg/pgqueue/prompgqueue"
+m, err := prompgqueue.NewMetrics(prometheus.DefaultRegisterer)
+if err != nil { /* handle */ }
+q, _ = pgqueue.New(ctx, db, pgqueue.WithMetrics(m))
+
 // Unit-test your code with no database via the in-memory fake.
 import "github.com/sgaunet/pgqueue/pkg/pgqueue/fake"
 q := fake.New()
 ```
+
+> **Metric cardinality:** both observability adapters set a `queue` label/attribute
+> to the queue or topic name. Keep the set of queue names bounded — a per-tenant or
+> otherwise unbounded name set causes unbounded metric cardinality.
 
 ## Architecture
 

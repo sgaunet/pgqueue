@@ -15,6 +15,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -22,12 +24,66 @@ import (
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
 
-// reconnectDelay is the pause between connection-loss recovery attempts.
-const reconnectDelay = 1 * time.Second
+// Default reconnect-backoff parameters (R-07).
+const (
+	defaultReconnectBaseDelay  = 1 * time.Second
+	defaultReconnectMaxDelay   = 30 * time.Second
+	defaultReconnectMultiplier = 2.0
+	// maxReconnectBackoffSteps caps the exponent so a long outage cannot make
+	// the delay computation loop run unbounded; the window has saturated at
+	// MaxDelay long before this.
+	maxReconnectBackoffSteps = 32
+)
 
 // notifyBuffer sizes the buffered notifications channel. A slow consumer cannot
 // stall the receive loop until this many notifications are outstanding.
 const notifyBuffer = 64
+
+// ReconnectPolicy controls the backoff between LISTEN/NOTIFY reconnect attempts
+// after a connection loss. The delay for attempt n is full-jittered over the
+// window min(BaseDelay * Multiplier^n, MaxDelay), so many application instances
+// recovering at once do not reconnect in lockstep.
+type ReconnectPolicy struct {
+	// BaseDelay is the backoff window for the first retry (default 1s).
+	BaseDelay time.Duration
+	// MaxDelay caps the backoff window (default 30s).
+	MaxDelay time.Duration
+	// Multiplier grows the window each attempt; clamped to >= 1 (default 2).
+	Multiplier float64
+}
+
+// normalized returns a copy of p with any zero or invalid field replaced by
+// its default, so a partially-specified policy is still usable.
+func (p ReconnectPolicy) normalized() ReconnectPolicy {
+	if p.BaseDelay <= 0 {
+		p.BaseDelay = defaultReconnectBaseDelay
+	}
+	if p.Multiplier < 1 {
+		p.Multiplier = defaultReconnectMultiplier
+	}
+	if p.MaxDelay < p.BaseDelay {
+		p.MaxDelay = defaultReconnectMaxDelay
+	}
+	if p.MaxDelay < p.BaseDelay {
+		p.MaxDelay = p.BaseDelay
+	}
+	return p
+}
+
+// Option configures a Listener at construction time.
+type Option func(*Listener)
+
+// WithReconnectPolicy overrides the default exponential-backoff reconnect
+// policy. Zero or invalid fields fall back to their defaults.
+func WithReconnectPolicy(p ReconnectPolicy) Option {
+	return func(l *Listener) { l.reconnectPolicy = p.normalized() }
+}
+
+// WithLogger attaches a structured logger. When set, each reconnect attempt is
+// logged at WARN. When nil (the default) the Listener is silent.
+func WithLogger(logger *slog.Logger) Option {
+	return func(l *Listener) { l.logger = logger }
+}
 
 // errListenerClosed is returned by Listen after the Listener has been closed.
 var errListenerClosed = errors.New("pglisten: listener is closed")
@@ -39,6 +95,9 @@ var errListenerClosed = errors.New("pglisten: listener is closed")
 type Listener struct {
 	connString string
 	notifs     chan string
+
+	reconnectPolicy ReconnectPolicy
+	logger          *slog.Logger
 
 	mu        sync.Mutex
 	conn      *pgx.Conn
@@ -55,19 +114,24 @@ var _ pgqueue.Listener = (*Listener)(nil)
 
 // New opens a dedicated connection for LISTEN/NOTIFY and starts the receive
 // loop. connString is a standard PostgreSQL connection string (the same form
-// accepted by pgx.Connect).
-func New(ctx context.Context, connString string) (*Listener, error) {
+// accepted by pgx.Connect). Optional Options configure reconnect backoff and
+// logging; omitting them yields sane exponential-backoff defaults.
+func New(ctx context.Context, connString string, opts ...Option) (*Listener, error) {
 	conn, err := pgx.Connect(ctx, connString)
 	if err != nil {
 		return nil, fmt.Errorf("pglisten: connect: %w", err)
 	}
 	l := &Listener{
-		connString: connString,
-		notifs:     make(chan string, notifyBuffer),
-		conn:       conn,
-		channels:   make(map[string]bool),
-		interrupt:  make(chan struct{}, 1),
-		done:       make(chan struct{}),
+		connString:      connString,
+		notifs:          make(chan string, notifyBuffer),
+		conn:            conn,
+		channels:        make(map[string]bool),
+		interrupt:       make(chan struct{}, 1),
+		done:            make(chan struct{}),
+		reconnectPolicy: ReconnectPolicy{}.normalized(),
+	}
+	for _, o := range opts {
+		o(l)
 	}
 	// run outlives this call; New's ctx scopes only the initial connect, so the
 	// detached goroutine intentionally uses fresh contexts for its DB calls.
@@ -200,19 +264,25 @@ func (l *Listener) drainPending() error {
 }
 
 // reconnect re-establishes the connection and re-issues every known LISTEN. It
-// returns false when the listener is closed while reconnecting.
+// returns false when the listener is closed while reconnecting. Failed attempts
+// back off exponentially with full jitter (R-07).
 func (l *Listener) reconnect() bool {
 	l.closeConn()
+	attempt := 0
 	for {
 		if l.isDone() {
 			return false
 		}
 		conn, err := pgx.Connect(context.Background(), l.connString)
 		if err != nil {
+			delay := l.reconnectBackoff(attempt)
+			l.logWarn("pglisten: reconnect attempt failed; retrying",
+				"attempt", attempt+1, "delay", delay, "error", err)
+			attempt++
 			select {
 			case <-l.done:
 				return false
-			case <-time.After(reconnectDelay):
+			case <-time.After(delay):
 				continue
 			}
 		}
@@ -225,6 +295,31 @@ func (l *Listener) reconnect() bool {
 		}
 		l.mu.Unlock()
 		return true
+	}
+}
+
+// reconnectBackoff returns the jittered delay before reconnect attempt n
+// (0-based): a uniform random duration in [0, window), where window grows
+// exponentially as min(BaseDelay * Multiplier^n, MaxDelay).
+func (l *Listener) reconnectBackoff(attempt int) time.Duration {
+	p := l.reconnectPolicy
+	window := float64(p.BaseDelay)
+	steps := min(attempt, maxReconnectBackoffSteps)
+	for range steps {
+		window *= p.Multiplier
+		if window >= float64(p.MaxDelay) {
+			window = float64(p.MaxDelay)
+			break
+		}
+	}
+	//nolint:gosec // G404: reconnect jitter is not security-sensitive.
+	return time.Duration(rand.Float64() * window)
+}
+
+// logWarn logs at WARN when a logger is configured; otherwise it is a no-op.
+func (l *Listener) logWarn(msg string, args ...any) {
+	if l.logger != nil {
+		l.logger.Warn(msg, args...)
 	}
 }
 

@@ -107,8 +107,25 @@ func (pq *Queue) ReplayMessage(
 	return nil
 }
 
-// ReplayDLQ moves messages from DLQ back to the main queue.
-// When opts.Limit is 0, up to 10,000 messages are replayed in a single transaction.
+// ReplayDLQResult reports the outcome of a ReplayDLQ call.
+type ReplayDLQResult struct {
+	// Replayed is the number of messages reinstated from the DLQ onto their
+	// live queue.
+	Replayed int
+	// Skipped is the number of DLQ rows examined but not replayable — for
+	// example a row whose original message id is still live, or a legacy
+	// pub/sub row with no active subscribers. Skipped rows are left in the DLQ.
+	Skipped int
+}
+
+// ReplayDLQ moves messages from the dead-letter queue back to the main queue.
+// It processes the DLQ in keyset-paginated pages, each in its own transaction,
+// so memory and lock footprint stay bounded regardless of backlog size.
+//
+// When opts.Limit is set, the loop terminates once Limit DLQ rows have been
+// *examined* (Replayed + Skipped), not when Limit messages have been replayed —
+// so a DLQ full of un-replayable rows still returns promptly rather than
+// scanning the whole table.
 //
 // For pub/sub topics: the original message must still exist in the message table.
 // If CompletedMessageTTL is shorter than DLQRetention in your GC policy, the message
@@ -119,35 +136,42 @@ func (pq *Queue) ReplayDLQ(
 	queueName string,
 	queueType QueueType,
 	opts ReplayOptions,
-) (int, error) {
+) (ReplayDLQResult, error) {
 	ctx, span := pq.startSpan(ctx, "pgqueue.replay",
 		StringAttr("queue", queueName), StringAttr("replay_type", "dlq"))
 	defer span.End()
 
 	if err := validateReplayOpts(opts); err != nil {
 		span.SetError(err)
-		return 0, fmt.Errorf("failed to validate replay options: %w", err)
+		return ReplayDLQResult{}, fmt.Errorf("failed to validate replay options: %w", err)
 	}
 
 	metadata, err := pq.getReplayQueueMetadata(ctx, queueType, queueName)
 	if err != nil {
 		span.SetError(err)
-		return 0, fmt.Errorf("failed to get queue metadata for replay: %w", err)
+		return ReplayDLQResult{}, fmt.Errorf("failed to get queue metadata for replay: %w", err)
 	}
 
 	tableName := metadata.TableName
 
 	if opts.DryRun {
-		return pq.countDLQMessages(ctx, tableName)
+		count, err := pq.countDLQMessages(ctx, tableName)
+		if err != nil {
+			return ReplayDLQResult{}, err
+		}
+		if opts.Limit > 0 && count > opts.Limit {
+			count = opts.Limit
+		}
+		return ReplayDLQResult{Replayed: count}, nil
 	}
 
-	count, err := pq.executeReplayDLQ(ctx, queueName, tableName, queueType, opts)
+	result, err := pq.executeReplayDLQ(ctx, queueName, tableName, queueType, opts)
 	if err != nil {
 		span.SetError(err)
-		return 0, fmt.Errorf("failed to execute DLQ replay: %w", err)
+		return result, fmt.Errorf("failed to execute DLQ replay: %w", err)
 	}
 
-	return count, nil
+	return result, nil
 }
 
 // GetReplayHistory returns the replay history for a queue.
@@ -199,6 +223,10 @@ func (pq *Queue) getReplayQueueMetadata(
 	return metadata, nil
 }
 
+// countReplayableMessages counts the rows ReplayFrom would reinstate for a
+// since timestamp. For pub/sub the predicate is on the message-table
+// created_at — the message publish time — joined to the subscription rows, so
+// it agrees exactly with what executeReplayFrom updates (R-03).
 func (pq *Queue) countReplayableMessages(
 	ctx context.Context,
 	tableName string,
@@ -208,11 +236,14 @@ func (pq *Queue) countReplayableMessages(
 	var countQuery string
 	if queueType == QueueTypePubSub {
 		countQuery = fmt.Sprintf(`
-			SELECT COUNT(*) FROM %s
-			WHERE created_at >= $1
-			AND status != '%s'
-			AND status != '%s'
-		`, pq.subTable(tableName), MessageStatusPending, MessageStatusProcessing)
+			SELECT COUNT(*)
+			FROM %s s
+			JOIN %s m ON s.message_id = m.id
+			WHERE m.created_at >= $1
+			AND s.status != '%s'
+			AND s.status != '%s'
+		`, pq.subTable(tableName), pq.msgTable(tableName),
+			MessageStatusPending, MessageStatusProcessing)
 	} else {
 		countQuery = fmt.Sprintf(`
 			SELECT COUNT(*) FROM %s
@@ -232,6 +263,22 @@ func (pq *Queue) countReplayableMessages(
 	return count, nil
 }
 
+// defaultReplayPageSize bounds the rows held in memory and locked per
+// ReplayFrom page, so a large backlog replays with O(page) footprint rather
+// than O(backlog) (R-02).
+const defaultReplayPageSize = 100
+
+// replayFromPageResult is the outcome of replaying one keyset page.
+type replayFromPageResult struct {
+	replayed int       // rows reinstated this page
+	lastID   uuid.UUID // highest message id examined — the next page's cursor
+	fetched  int       // message ids examined this page; zero means exhausted
+}
+
+// executeReplayFrom replays messages published since a timestamp in
+// keyset-paginated pages (defaultReplayPageSize per page), each page in its own
+// transaction, so memory and lock footprint stay bounded regardless of backlog
+// size (R-02). An explicit opts.Limit still caps the total.
 func (pq *Queue) executeReplayFrom(
 	ctx context.Context,
 	queueName, tableName string,
@@ -239,113 +286,196 @@ func (pq *Queue) executeReplayFrom(
 	since time.Time,
 	opts ReplayOptions,
 ) (int, error) {
+	var afterID uuid.UUID
+	total := 0
+
+	for {
+		pageLimit := defaultReplayPageSize
+		if opts.Limit > 0 {
+			remaining := opts.Limit - total
+			if remaining <= 0 {
+				break
+			}
+			if remaining < pageLimit {
+				pageLimit = remaining
+			}
+		}
+
+		page, err := pq.replayFromPage(
+			ctx, queueName, tableName, queueType, since, afterID, pageLimit, opts.PerformedBy,
+		)
+		if err != nil {
+			return total, err
+		}
+		total += page.replayed
+		if page.fetched == 0 {
+			break // backlog exhausted
+		}
+		afterID = page.lastID
+	}
+
+	return total, nil
+}
+
+// replayFromPage replays one keyset page in a single transaction. It selects a
+// page of message ids published since the cursor, reinstates the corresponding
+// rows, and writes a per-page audit row inside the same transaction.
+func (pq *Queue) replayFromPage(
+	ctx context.Context,
+	queueName, tableName string,
+	queueType QueueType,
+	since time.Time,
+	afterID uuid.UUID,
+	pageLimit int,
+	performedBy string,
+) (replayFromPageResult, error) {
 	tx, err := pq.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		return replayFromPageResult{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	query := pq.buildReplayFromQuery(tableName, queueType, opts.Limit)
-
-	result, err := tx.ExecContext(ctx, query, since)
+	ids, err := pq.fetchReplayMessageIDs(ctx, tx, tableName, queueType, since, afterID, pageLimit)
 	if err != nil {
-		return 0, fmt.Errorf("failed to replay messages: %w", err)
+		return replayFromPageResult{}, err
+	}
+	if len(ids) == 0 {
+		return replayFromPageResult{lastID: afterID}, nil
 	}
 
-	rows, err := result.RowsAffected()
+	replayed, err := pq.applyReplayFrom(ctx, tx, tableName, queueType, ids)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get affected rows: %w", err)
+		return replayFromPageResult{}, err
 	}
-	count := int(rows)
 
-	if err := pq.writeReplayLog(
-		ctx, tx, queueName, queueType, "timestamp",
-		count, opts.PerformedBy, fmt.Sprintf("since: %s", since),
-	); err != nil {
-		return 0, err
+	if replayed > 0 {
+		if err := pq.writeReplayLog(
+			ctx, tx, queueName, queueType, "timestamp",
+			replayed, performedBy, fmt.Sprintf("since: %s", since),
+		); err != nil {
+			return replayFromPageResult{}, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit replay: %w", err)
+		return replayFromPageResult{}, fmt.Errorf("failed to commit replay page: %w", err)
 	}
 
-	return count, nil
+	return replayFromPageResult{
+		replayed: replayed,
+		lastID:   ids[len(ids)-1],
+		fetched:  len(ids),
+	}, nil
 }
 
-func (pq *Queue) buildReplayFromQuery(
+// fetchReplayMessageIDs returns one keyset page of message ids published since
+// the given timestamp, ordered by id and strictly after afterID. The time
+// predicate is always on the message table's created_at — the authoritative
+// publish time — for both channels and topics (R-03).
+func (pq *Queue) fetchReplayMessageIDs(
+	ctx context.Context,
+	tx *sql.Tx,
 	tableName string,
 	queueType QueueType,
-	limit int,
-) string {
-	if queueType == QueueTypeChannel {
-		return pq.buildChannelReplayQuery(tableName, limit)
+	since time.Time,
+	afterID uuid.UUID,
+	pageLimit int,
+) ([]uuid.UUID, error) {
+	var after any
+	if afterID != (uuid.UUID{}) {
+		after = afterID
 	}
 
-	return pq.buildPubSubReplayQuery(tableName, limit)
+	var query string
+	if queueType == QueueTypeChannel {
+		// Channels carry status on the message table; only non-pending,
+		// non-processing messages are replay candidates.
+		query = fmt.Sprintf(`
+			SELECT id FROM %s
+			WHERE created_at >= $1
+			  AND status != '%s' AND status != '%s'
+			  AND ($3::uuid IS NULL OR id > $3)
+			ORDER BY id
+			LIMIT $2
+		`, pq.msgTable(tableName), MessageStatusPending, MessageStatusProcessing)
+	} else {
+		// Topics keep no status on the message table; page over every message
+		// published since the cutoff and let applyReplayFrom filter the
+		// subscription rows.
+		query = fmt.Sprintf(`
+			SELECT id FROM %s
+			WHERE created_at >= $1
+			  AND ($3::uuid IS NULL OR id > $3)
+			ORDER BY id
+			LIMIT $2
+		`, pq.msgTable(tableName))
+	}
+
+	rows, err := tx.QueryContext(ctx, query, since, pageLimit, after)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query replay candidates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan replay candidate id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating replay candidates: %w", err)
+	}
+
+	return ids, nil
 }
 
-func (pq *Queue) buildChannelReplayQuery(tableName string, limit int) string {
-	msgTbl := pq.msgTable(tableName)
-	if limit > 0 {
-		return fmt.Sprintf(`
+// applyReplayFrom reinstates the given message ids to pending and returns the
+// number of rows actually changed. For channels the message rows are reset;
+// for topics the per-subscriber subscription rows are reset (R-03).
+func (pq *Queue) applyReplayFrom(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	queueType QueueType,
+	ids []uuid.UUID,
+) (int, error) {
+	var query string
+	if queueType == QueueTypeChannel {
+		query = fmt.Sprintf(`
 			UPDATE %s
 			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
 			    processed_at = NULL,
 			    error_message = NULL
-			WHERE id IN (
-				SELECT id FROM %s
-				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
-				ORDER BY id
-				LIMIT %d
-			)
-		`, msgTbl, MessageStatusPending, msgTbl, MessageStatusPending, MessageStatusProcessing, limit)
-	}
-
-	return fmt.Sprintf(`
-		UPDATE %s
-		SET status = '%s',
-		    retry_count = 0,
-		    visibility_timeout = NULL,
-		    processed_at = NULL,
-		    error_message = NULL
-		WHERE created_at >= $1
-		AND status != '%s'
-		AND status != '%s'
-	`, msgTbl, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
-}
-
-func (pq *Queue) buildPubSubReplayQuery(tableName string, limit int) string {
-	subTbl := pq.subTable(tableName)
-	if limit > 0 {
-		return fmt.Sprintf(`
+			WHERE id = ANY($1::uuid[])
+			  AND status != '%s' AND status != '%s'
+		`, pq.msgTable(tableName), MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
+	} else {
+		query = fmt.Sprintf(`
 			UPDATE %s
 			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
 			    acked_at = NULL,
 			    error_message = NULL
-			WHERE id IN (
-				SELECT id FROM %s
-				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
-				ORDER BY id
-				LIMIT %d
-			)
-		`, subTbl, MessageStatusPending, subTbl, MessageStatusPending, MessageStatusProcessing, limit)
+			WHERE message_id = ANY($1::uuid[])
+			  AND status != '%s' AND status != '%s'
+		`, pq.subTable(tableName), MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 	}
 
-	return fmt.Sprintf(`
-		UPDATE %s
-		SET status = '%s',
-		    retry_count = 0,
-		    visibility_timeout = NULL,
-		    acked_at = NULL,
-		    error_message = NULL
-		WHERE created_at >= $1
-		AND status != '%s'
-		AND status != '%s'
-	`, subTbl, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
+	result, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(ids))
+	if err != nil {
+		return 0, fmt.Errorf("failed to replay messages: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get affected rows: %w", err)
+	}
+	return int(rows), nil
 }
 
 func (pq *Queue) checkMessageExists(
@@ -450,21 +580,24 @@ func (pq *Queue) countDLQMessages(
 
 // executeReplayDLQ replays the dead-letter queue in keyset-paginated pages
 // (defaultDLQReplayPageSize per page), each page in its own transaction, so
-// memory stays bounded by the page size regardless of backlog size (FR-025,
-// R8). The replay audit row records the total once the pages are done.
+// memory stays bounded by the page size regardless of backlog size (FR-025).
+//
+// When opts.Limit is set the loop terminates once Limit DLQ rows have been
+// examined — Replayed + Skipped — not when Limit messages have been replayed,
+// so a DLQ full of un-replayable rows still returns promptly (R-04).
 func (pq *Queue) executeReplayDLQ(
 	ctx context.Context,
 	queueName, tableName string,
 	queueType QueueType,
 	opts ReplayOptions,
-) (int, error) {
+) (ReplayDLQResult, error) {
 	var afterID uuid.UUID
-	total := 0
+	var result ReplayDLQResult
 
 	for {
 		pageLimit := defaultDLQReplayPageSize
 		if opts.Limit > 0 {
-			remaining := opts.Limit - total
+			remaining := opts.Limit - result.Replayed - result.Skipped
 			if remaining <= 0 {
 				break
 			}
@@ -474,24 +607,23 @@ func (pq *Queue) executeReplayDLQ(
 		}
 
 		page, err := pq.replayDLQPage(
-			ctx, queueName, tableName, queueType, afterID, pageLimit,
+			ctx, queueName, tableName, queueType, afterID, pageLimit, opts.PerformedBy,
 		)
 		if err != nil {
-			return total, err
+			return result, err
 		}
-		total += page.replayed
+		result.Replayed += page.replayed
+		// Rows fetched but not reinstated this call (live id still present, no
+		// active subscriber, or a duplicate id deferred to a later call) are
+		// reported as skipped.
+		result.Skipped += page.fetched - page.replayed
 		if page.fetched == 0 {
 			break // DLQ exhausted
 		}
 		afterID = page.lastID
 	}
 
-	if total > 0 {
-		if err := pq.recordDLQReplayLog(ctx, queueName, queueType, total, opts.PerformedBy); err != nil {
-			return total, err
-		}
-	}
-	return total, nil
+	return result, nil
 }
 
 // dlqPageResult is the outcome of replaying one keyset page of the DLQ.
@@ -501,13 +633,17 @@ type dlqPageResult struct {
 	fetched  int       // rows fetched this page; zero means the DLQ is exhausted
 }
 
-// replayDLQPage replays one keyset page of the DLQ in a single transaction.
+// replayDLQPage replays one keyset page of the DLQ in a single transaction. The
+// per-page audit row is written inside that same transaction, so the audit
+// trail stays consistent with the messages actually replayed even if the
+// process crashes mid-replay (R-11).
 func (pq *Queue) replayDLQPage(
 	ctx context.Context,
 	queueName, tableName string,
 	queueType QueueType,
 	afterID uuid.UUID,
 	pageLimit int,
+	performedBy string,
 ) (dlqPageResult, error) {
 	tx, err := pq.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -528,6 +664,17 @@ func (pq *Queue) replayDLQPage(
 		return dlqPageResult{}, fmt.Errorf("failed to reinsert DLQ messages: %w", err)
 	}
 
+	// Audit row per page, committed atomically with the page it describes.
+	if replayed > 0 {
+		if err := pq.writeReplayLog(
+			ctx, tx, queueName, queueType, "dlq",
+			replayed, performedBy,
+			fmt.Sprintf("replayed %d messages from DLQ", replayed),
+		); err != nil {
+			return dlqPageResult{}, err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return dlqPageResult{}, fmt.Errorf("failed to commit replay page: %w", err)
 	}
@@ -538,33 +685,6 @@ func (pq *Queue) replayDLQPage(
 		lastID:   dlqMessages[len(dlqMessages)-1].id,
 		fetched:  len(dlqMessages),
 	}, nil
-}
-
-// recordDLQReplayLog writes the single audit row for a completed DLQ replay.
-func (pq *Queue) recordDLQReplayLog(
-	ctx context.Context,
-	queueName string,
-	queueType QueueType,
-	count int,
-	performedBy string,
-) error {
-	tx, err := pq.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if err := pq.writeReplayLog(
-		ctx, tx, queueName, queueType, "dlq",
-		count, performedBy,
-		fmt.Sprintf("replayed %d messages from DLQ", count),
-	); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit replay log: %w", err)
-	}
-	return nil
 }
 
 type dlqRow struct {
@@ -934,6 +1054,13 @@ func (pq *Queue) resolvePubSubDLQRecords(
 // writeReplayLog records a replay in pgqueue_replay_log within the caller's
 // transaction. The audit row therefore commits atomically with the replay it
 // describes (FR-007) — a failed log write rolls the whole replay back.
+//
+// ReplayFrom and ReplayDLQ process the backlog in keyset-paginated pages, each
+// in its own transaction; this function is called once per page, so a paged
+// replay produces one audit row per page rather than a single total row. Each
+// row's message_count is that page's count, keeping the audit trail consistent
+// with the messages actually replayed even if the process crashes mid-replay
+// (R-11).
 func (pq *Queue) writeReplayLog(
 	ctx context.Context,
 	tx *sql.Tx,

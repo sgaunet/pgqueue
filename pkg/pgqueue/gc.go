@@ -2,11 +2,14 @@ package pgqueue
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -46,11 +49,16 @@ func NewGarbageCollector(
 		config.MaxWorkers = maxGCMaxWorkers
 	}
 
-	return &GarbageCollector{
+	gc := &GarbageCollector{
 		pq:       pq,
 		config:   config,
 		stopChan: make(chan struct{}),
 	}
+	// Back-register on the Queue so Queue.Close stops this GC even if the
+	// caller forgets to (R-08). Stop is idempotent, so a caller that also
+	// stops it stays safe.
+	pq.registerGC(gc)
+	return gc
 }
 
 // Start begins the garbage collection loop in a background goroutine.
@@ -260,7 +268,132 @@ func (gc *GarbageCollector) collectQueue(
 		}
 	}
 
+	// Promote timed-out-and-exhausted channel messages to the DLQ. The consume
+	// path no longer does this inline (R-12), so the GC owns it; run it before
+	// resetTimedOutEntries so a still-exhausted message is dead-lettered rather
+	// than reset back to pending.
+	if queue.QueueType == QueueTypeChannel {
+		if err := gc.promoteExhaustedChannelMessages(ctx, queue.TableName); err != nil {
+			return fmt.Errorf("failed to promote exhausted messages: %w", err)
+		}
+	}
+
 	return gc.resetTimedOutEntries(ctx, queue)
+}
+
+// promoteExhaustedChannelMessagesPageSize bounds the rows promoted to the DLQ
+// per transaction, keeping the GC pass's footprint bounded on a pathological
+// backlog.
+const promoteExhaustedChannelMessagesPageSize = 100
+
+// promoteExhaustedChannelMessages moves channel messages that have timed out in
+// 'processing' state and exhausted their retries to the dead-letter queue
+// (R-12). retry_count >= effective max is exactly the condition under which a
+// further reclaim would breach the retryCount+1 > maxRetry DLQ guard. Work is
+// done in bounded keyset-free pages — moveToDLQ deletes each promoted row, so a
+// fresh SELECT never re-sees it.
+func (gc *GarbageCollector) promoteExhaustedChannelMessages(
+	ctx context.Context,
+	tableName string,
+) error {
+	defaultMax := gc.pq.config.DefaultMaxRetries
+	selectQuery := fmt.Sprintf(`
+		SELECT id, payload, retry_count, metadata
+		FROM %s
+		WHERE status = '%s'
+		  AND visibility_timeout IS NOT NULL
+		  AND visibility_timeout < NOW()
+		  AND retry_count >= COALESCE(NULLIF(max_retries, 0), $1)
+		ORDER BY id
+		LIMIT %d
+		FOR UPDATE SKIP LOCKED
+	`, gc.pq.msgTable(tableName), MessageStatusProcessing, promoteExhaustedChannelMessagesPageSize)
+
+	for {
+		promoted, err := gc.promoteExhaustedChannelPage(ctx, tableName, selectQuery, defaultMax)
+		if err != nil {
+			return err
+		}
+		if promoted < promoteExhaustedChannelMessagesPageSize {
+			return nil // backlog exhausted
+		}
+	}
+}
+
+// exhaustedChannelMessage is one timed-out, retry-exhausted channel message
+// awaiting promotion to the dead-letter queue.
+type exhaustedChannelMessage struct {
+	id           uuid.UUID
+	payload      []byte
+	retryCount   int
+	metadataJSON sql.NullString
+}
+
+// promoteExhaustedChannelPage promotes one page of exhausted messages to the
+// DLQ in a single transaction and returns how many it moved.
+func (gc *GarbageCollector) promoteExhaustedChannelPage(
+	ctx context.Context,
+	tableName, selectQuery string,
+	defaultMax int,
+) (int, error) {
+	tx, err := gc.pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	batch, err := scanExhaustedChannelMessages(ctx, tx, selectQuery, defaultMax)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, e := range batch {
+		if err := gc.pq.moveToDLQ(
+			ctx, tx, tableName, e.id, errReasonVisibilityTimeout,
+			e.payload, e.retryCount+1, e.metadataJSON,
+		); err != nil {
+			return 0, fmt.Errorf("failed to move exhausted message to DLQ: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit exhausted-message promotion: %w", err)
+	}
+
+	if len(batch) > 0 {
+		gc.pq.logInfo("promoted exhausted messages to DLQ",
+			"count", len(batch), "table", tableName)
+	}
+	return len(batch), nil
+}
+
+// scanExhaustedChannelMessages reads (and FOR UPDATE locks) one page of
+// exhausted messages. The rows are fully drained and closed before the caller
+// runs any further statement on the transaction.
+func scanExhaustedChannelMessages(
+	ctx context.Context,
+	tx *sql.Tx,
+	selectQuery string,
+	defaultMax int,
+) ([]exhaustedChannelMessage, error) {
+	rows, err := tx.QueryContext(ctx, selectQuery, defaultMax)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query exhausted messages: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var batch []exhaustedChannelMessage
+	for rows.Next() {
+		var e exhaustedChannelMessage
+		if err := rows.Scan(&e.id, &e.payload, &e.retryCount, &e.metadataJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan exhausted message: %w", err)
+		}
+		batch = append(batch, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating exhausted messages: %w", err)
+	}
+	return batch, nil
 }
 
 // reclaimOrphanTopicMessages deletes pub/sub messages that can never be

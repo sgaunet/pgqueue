@@ -440,7 +440,10 @@ func (pq *Queue) publishBatchToChannel(
 		return fmt.Errorf("failed to insert messages: %w", err)
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := rowsAffectedOrErr(result)
+	if err != nil {
+		return err
+	}
 	if rowsAffected < int64(len(messages)) {
 		return fmt.Errorf(
 			"some messages had duplicate IDs: %w", ErrDuplicateMessageID,
@@ -530,7 +533,10 @@ func (pq *Queue) insertBatchPubSubMessages(
 		return fmt.Errorf("failed to insert messages: %w", err)
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := rowsAffectedOrErr(result)
+	if err != nil {
+		return err
+	}
 	if rowsAffected < int64(len(messages)) {
 		return fmt.Errorf(
 			"some messages had duplicate IDs: %w", ErrDuplicateMessageID,

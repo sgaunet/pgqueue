@@ -166,3 +166,106 @@ func waitClosed(t *testing.T, ch <-chan struct{}, msg string) {
 		t.Fatal(msg)
 	}
 }
+
+// TestConsumeChannelHandlerPanicRecovered (R-01) verifies that a panic inside a
+// handler invocation does NOT crash the process: the panicking message is
+// auto-nacked (its retry_count is incremented and it is redelivered), every
+// other message is acked, and sibling concurrency workers keep running.
+//
+// Run under -race; the panic is raised concurrently with sibling workers.
+func TestConsumeChannelHandlerPanicRecovered(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "consume-panic"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// One payload ("boom") panics on its first delivery; the rest always succeed.
+	const okCount = 6
+	for i := range okCount {
+		if _, err := pq.PublishChannel(ctx, channelName, []byte{byte('a' + i)}); err != nil {
+			t.Fatalf("failed to publish ok message %d: %v", i, err)
+		}
+	}
+	if _, err := pq.PublishChannel(ctx, channelName, []byte("boom")); err != nil {
+		t.Fatalf("failed to publish panic message: %v", err)
+	}
+
+	var (
+		mu      sync.Mutex
+		seen    = map[string]int{}
+		okDone  = make(chan struct{})
+		boom2nd = make(chan struct{})
+	)
+	var okOnce, boomOnce sync.Once
+
+	handler := func(_ context.Context, msg *pgqueue.Message) error {
+		body := string(msg.Payload)
+		mu.Lock()
+		seen[body]++
+		count := seen[body]
+		okSeen := len(seen)
+		mu.Unlock()
+
+		if body == "boom" {
+			if count == 1 {
+				// First delivery panics with an error value; the loop must
+				// recover, nack it, and survive.
+				panic(panicPayload)
+			}
+			boomOnce.Do(func() { close(boom2nd) })
+			return nil
+		}
+		// Every non-boom payload counted at least once means siblings progressed.
+		if okSeen >= okCount {
+			okOnce.Do(func() { close(okDone) })
+		}
+		return nil
+	}
+
+	consumeCtx, cancel := context.WithCancel(ctx)
+	loopDone := make(chan error, 1)
+	go func() {
+		loopDone <- pq.ConsumeChannel(consumeCtx, channelName, handler,
+			pgqueue.WithConcurrency(3),
+			pgqueue.WithPollInterval(50*time.Millisecond))
+	}()
+
+	// The process must survive the panic: all non-boom messages get handled and
+	// the panicking message is redelivered and succeeds on retry.
+	waitClosed(t, okDone, "sibling workers did not handle all non-panic messages")
+	waitClosed(t, boom2nd, "panicking message was never redelivered after recovery")
+
+	cancel()
+	select {
+	case err := <-loopDone:
+		if err != nil {
+			t.Fatalf("ConsumeChannel returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ConsumeChannel did not return within 3s of context cancellation")
+	}
+
+	// The panicking message must have been nacked (retry_count incremented), then
+	// completed on its retry.
+	mu.Lock()
+	boomDeliveries := seen["boom"]
+	mu.Unlock()
+	if boomDeliveries < 2 {
+		t.Fatalf("panic message delivered %d times, want >=2 (recover -> nack -> retry)", boomDeliveries)
+	}
+
+	var completed int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_msg_consume_panic WHERE status = $1",
+		string(pgqueue.MessageStatusCompleted),
+	).Scan(&completed); err != nil {
+		t.Fatalf("failed to count completed messages: %v", err)
+	}
+	if completed != okCount+1 {
+		t.Errorf("expected %d completed messages, got %d", okCount+1, completed)
+	}
+}

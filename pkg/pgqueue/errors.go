@@ -61,8 +61,10 @@ var (
 	// discarded — the message now belongs to whoever holds the current claim.
 	ErrClaimExpired = errors.New("message claim expired: reassigned to another consumer")
 
-	// ErrReplayMessageNotFound is returned when a message targeted for replay cannot be found.
-	ErrReplayMessageNotFound = errors.New("message not found")
+	// ErrReplayMessageNotFound is returned when a message targeted for replay
+	// cannot be found. It wraps ErrMessageNotFound so callers can match either
+	// the specific replay sentinel or the general one with errors.Is.
+	ErrReplayMessageNotFound = fmt.Errorf("replay: %w", ErrMessageNotFound)
 
 	// ErrMessageInProcessing is returned when attempting to replay a message
 	// that is currently being processed.

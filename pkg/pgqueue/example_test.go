@@ -136,17 +136,19 @@ func ExampleQueue_ListDLQMessages() {
 
 // ExampleQueue_ReplayDLQ replays every message from the dead-letter queue back
 // onto the main queue. Replay is a destructive operation, so Confirm is required.
+// ReplayDLQ returns a ReplayDLQResult distinguishing replayed from skipped
+// (un-replayable) rows.
 func ExampleQueue_ReplayDLQ() {
 	var (
 		ctx context.Context
 		q   *pgqueue.Queue
 	)
-	n, err := q.ReplayDLQ(ctx, "orders", pgqueue.QueueTypeChannel,
+	res, err := q.ReplayDLQ(ctx, "orders", pgqueue.QueueTypeChannel,
 		pgqueue.ReplayOptions{Confirm: true})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("replayed %d messages\n", n)
+	fmt.Printf("replayed %d messages, skipped %d\n", res.Replayed, res.Skipped)
 }
 
 // process is a placeholder for the caller's message-handling logic.

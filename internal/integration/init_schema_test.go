@@ -3,6 +3,7 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
@@ -121,5 +122,32 @@ func TestInitSchemaInvalidConnection(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "failed to initialize base schema") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// TestInitSchemaRejectsUnhonoredOptions (R-14) verifies that InitSchema only
+// honors WithSchema: passing any other Option (here WithMaxQueues, which
+// InitSchema cannot act on) returns ErrInvalidConfig, while InitSchema with no
+// options and InitSchema with WithSchema both still succeed.
+func TestInitSchemaRejectsUnhonoredOptions(t *testing.T) {
+	db, cleanup := setupTestContainer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// A non-schema option must be rejected.
+	err := pgqueue.InitSchema(ctx, db, pgqueue.WithMaxQueues(5))
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("InitSchema with WithMaxQueues should return ErrInvalidConfig, got: %v", err)
+	}
+
+	// No options: still succeeds.
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Errorf("InitSchema with no options should succeed, got: %v", err)
+	}
+
+	// WithSchema is the one honored option: still succeeds.
+	if err := pgqueue.InitSchema(ctx, db, pgqueue.WithSchema("public")); err != nil {
+		t.Errorf("InitSchema with WithSchema should succeed, got: %v", err)
 	}
 }

@@ -83,7 +83,13 @@ func (pq *Queue) startSpan(
 	if pq.cfg.tracer == nil {
 		return ctx, noopSpan{}
 	}
-	return pq.cfg.tracer.StartSpan(ctx, name, attrs...)
+	ctx, span := pq.cfg.tracer.StartSpan(ctx, name, attrs...)
+	// A third-party Tracer may return a nil Span; substitute the no-op so the
+	// caller can End/SetError it unconditionally without a panic (R-23).
+	if span == nil {
+		return ctx, noopSpan{}
+	}
+	return ctx, span
 }
 
 // recordPublish reports a publish to the registered MetricsRecorder, if any.

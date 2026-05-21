@@ -115,13 +115,17 @@ func (pq *Queue) ConsumeFromTopic(
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending topic message: %w", err)
 	}
-	if msg == nil {
-		return nil, nil //nolint:nilnil // nil message indicates no messages available
-	}
-
-	// Commit transaction
+	// Commit unconditionally — even with no message to deliver. The scan may
+	// have deferred timed-out subscriptions with a backoff delay (R-05), and
+	// those UPDATEs must persist rather than be discarded by the deferred
+	// Rollback. With no message and no deferral the transaction is read-only,
+	// so the commit is harmless.
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	if msg == nil {
+		return nil, nil //nolint:nilnil // nil message indicates no messages available
 	}
 
 	msg.VisibilityTimeout = visTimeout
@@ -470,7 +474,11 @@ func topicConsumeQuery(subTable, msgTable, subscriberID string, ttl time.Duratio
 // reclaimTopicAttempt accounts for a redelivery when a subscription was picked
 // up in 'processing' state — a visibility timeout where the previous consumer
 // never acked. It returns the retry count to claim with; if the retries are now
-// exhausted it moves the subscription to the DLQ and reports dlqd=true.
+// exhausted it moves the subscription to the DLQ and reports skip=true.
+//
+// When a backoff policy is configured (R-05) a non-exhausted timed-out
+// subscription is instead returned to 'pending' with its redelivery deferred by
+// the backoff delay; skip is then true and the caller moves on.
 func (pq *Queue) reclaimTopicAttempt(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -494,7 +502,49 @@ func (pq *Queue) reclaimTopicAttempt(
 		return 0, true, nil
 	}
 
-	return retryCount + 1, false, nil
+	retryCount++
+
+	if pq.cfg.backoffConfigured {
+		delay := pq.computeRetryDelay(retryCount, 0)
+		if err := pq.deferReclaimedSubscription(
+			ctx, tx, tableName, row.subID, retryCount, delay,
+		); err != nil {
+			return 0, false, err
+		}
+		return 0, true, nil
+	}
+
+	return retryCount, false, nil
+}
+
+// deferReclaimedSubscription returns a timed-out 'processing' subscription to
+// 'pending' with retry_count incremented and available_at pushed out by the
+// backoff delay, so it is not redelivered until the delay elapses (R-05).
+func (pq *Queue) deferReclaimedSubscription(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	subID uuid.UUID,
+	retryCount int,
+	delay time.Duration,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		UPDATE %s
+		SET status = '%s',
+		    claim_id = NULL,
+		    retry_count = $2,
+		    visibility_timeout = NULL,
+		    available_at = NOW() + make_interval(secs => $3)
+		WHERE id = $1
+	`, pq.subTable(tableName), MessageStatusPending)
+
+	if _, err := tx.ExecContext(
+		ctx, query, subID, retryCount, delay.Seconds(),
+	); err != nil {
+		return fmt.Errorf("failed to defer reclaimed subscription: %w", err)
+	}
+	return nil
 }
 
 //nolint:gosec // G201: table name validated by queueNameRegex

@@ -79,6 +79,10 @@ type Message struct {
 	// methods work without a queue-name argument. It is unexported so the
 	// struct can still be instantiated by callers without this field.
 	receipt Receipt
+	// receiptSet records whether a queue-aware receipt was explicitly bound via
+	// SetReceipt. It is the authoritative flag — a receipt is honored even when
+	// its QueueName is empty, which a bare receipt.QueueName != "" check missed.
+	receiptSet bool
 }
 
 // Receipt is the credential a consumer must present to acknowledge a message.
@@ -108,8 +112,10 @@ type Receipt struct {
 // will not carry the queue binding; pass it to AckChannel/NackChannel or
 // AckTopic/NackTopic instead.
 func (m *Message) Receipt() Receipt {
-	// If a pre-populated receipt was set by Receive*, return it.
-	if m.receipt.QueueName != "" {
+	// If a queue-aware receipt was bound by Receive* (or SetReceipt), return it
+	// verbatim — including the case of an empty QueueName, which a test double
+	// may legitimately use.
+	if m.receiptSet {
 		return m.receipt
 	}
 	return Receipt{MessageID: m.ID, ClaimID: m.ClaimID}
@@ -122,6 +128,7 @@ func (m *Message) Receipt() Receipt {
 // returned by a real Queue.
 func SetReceipt(m *Message, r Receipt) {
 	m.receipt = r
+	m.receiptSet = true
 }
 
 // QueueMetadata holds information about a queue.

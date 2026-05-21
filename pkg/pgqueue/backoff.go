@@ -61,16 +61,28 @@ func (p BackoffPolicy) Delay(prev time.Duration) time.Duration {
 	}
 }
 
+// maxBackoffSteps caps how many times computeRetryDelay advances the backoff
+// policy. The decorrelated-jitter series saturates at MaxDelay within a handful
+// of steps, so iterating further is wasted work — and attempt comes from the
+// unbounded retry_count column, where a corrupted large value would otherwise
+// hang the call (R-13).
+const maxBackoffSteps = 64
+
 // computeRetryDelay resolves how long a nacked message must wait before it
 // becomes eligible for redelivery. A positive override (from WithRetryDelay)
 // wins outright; otherwise the queue's BackoffPolicy is advanced attempt times
 // to produce the decorrelated-jitter delay for this retry (FR-023).
+//
+// The iteration count is capped at maxBackoffSteps so the call runs in O(cap)
+// time regardless of attempt; the delay has already saturated at MaxDelay by
+// then.
 func (pq *Queue) computeRetryDelay(attempt int, override time.Duration) time.Duration {
 	if override > 0 {
 		return override
 	}
+	steps := min(attempt, maxBackoffSteps)
 	d := time.Duration(0)
-	for range attempt {
+	for range steps {
 		d = pq.cfg.backoffPolicy.Delay(d)
 	}
 	return d

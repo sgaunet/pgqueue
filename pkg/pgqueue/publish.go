@@ -9,6 +9,18 @@ import (
 	"github.com/google/uuid"
 )
 
+// rowsAffectedOrErr returns result.RowsAffected, wrapping any driver error.
+// The error must never be discarded: coercing an unavailable count to 0 would
+// misreport a valid insert as a duplicate-ID failure, because the duplicate
+// check keys off a zero/short row count (R-10).
+func rowsAffectedOrErr(result sql.Result) (int64, error) {
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	return n, nil
+}
+
 // Publish publishes a message to a topic or channel.
 // Returns the message ID (UUIDv7) on success.
 func (pq *Queue) Publish(
@@ -192,7 +204,10 @@ func (pq *Queue) publishToPubSub(
 		return fmt.Errorf("failed to insert message: %w", err)
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := rowsAffectedOrErr(result)
+	if err != nil {
+		return err
+	}
 	if rowsAffected == 0 {
 		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
 	}
@@ -399,7 +414,10 @@ func (pq *Queue) publishToChannel(
 		return fmt.Errorf("failed to insert message: %w", err)
 	}
 
-	rowsAffected, _ := result.RowsAffected()
+	rowsAffected, err := rowsAffectedOrErr(result)
+	if err != nil {
+		return err
+	}
 	if rowsAffected == 0 {
 		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
 	}

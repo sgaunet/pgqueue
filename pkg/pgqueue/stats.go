@@ -14,6 +14,9 @@ func (pq *Queue) GetStats(
 	queueName string,
 	queueType QueueType,
 ) (*QueueStats, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, ErrQueueNotFound) {
@@ -61,6 +64,9 @@ func (pq *Queue) GetQueueDepth(
 	queueName string,
 	queueType QueueType,
 ) (int64, error) {
+	if err := pq.checkClosed(); err != nil {
+		return 0, err
+	}
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, ErrQueueNotFound) {
@@ -104,6 +110,9 @@ func (pq *Queue) GetSubscriberLag(
 	topicName string,
 	subscriberID string,
 ) (*SubscriberLag, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return nil, err
 	}
@@ -121,13 +130,15 @@ func (pq *Queue) GetSubscriberLag(
 
 	tableName := metadata.TableName
 
+	// Age computed in SQL for clock consistency — see getChannelStats (R-19).
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = '%s') AS pending_count,
 			COUNT(*) FILTER (WHERE status = '%s') AS processing_count,
 			COUNT(*) FILTER (WHERE status = '%s') AS acked_count,
-			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending
+			EXTRACT(EPOCH FROM (NOW() - MIN(created_at)
+				FILTER (WHERE status = '%s'))) AS oldest_pending_age
 		FROM %s
 		WHERE subscriber_id = $1
 	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, pq.subTable(tableName))
@@ -137,22 +148,19 @@ func (pq *Queue) GetSubscriberLag(
 		TopicName:    topicName,
 	}
 
-	var oldestPending sql.NullTime
+	var oldestPendingAge sql.NullFloat64
 
 	err = pq.db.QueryRowContext(ctx, query, subscriberID).Scan(
 		&lag.PendingCount,
 		&lag.ProcessingCount,
 		&lag.AckedCount,
-		&oldestPending,
+		&oldestPendingAge,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get subscriber lag: %w", err)
 	}
 
-	if oldestPending.Valid {
-		age := time.Since(oldestPending.Time)
-		lag.OldestPendingAge = &age
-	}
+	lag.OldestPendingAge = secondsToAge(oldestPendingAge)
 
 	return lag, nil
 }
@@ -163,6 +171,9 @@ func (pq *Queue) GetDLQStats(
 	queueName string,
 	queueType QueueType,
 ) (*DLQStats, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, ErrQueueNotFound) {
@@ -224,6 +235,9 @@ func (pq *Queue) getChannelStats(
 	tableName string,
 	stats *QueueStats,
 ) error {
+	// The oldest-pending age is computed in SQL (NOW() - created_at) rather
+	// than with time.Since on the application clock, so it is consistent with
+	// the database clock and never negative under NTP skew (R-19).
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
@@ -232,20 +246,19 @@ func (pq *Queue) getChannelStats(
 			COUNT(*) FILTER (WHERE status = '%s') AS completed,
 			AVG(EXTRACT(EPOCH FROM (processed_at - created_at)))
 				FILTER (WHERE processed_at IS NOT NULL) AS avg_processing_time,
-			MIN(created_at)
-				FILTER (WHERE status = '%s') AS oldest_pending
+			EXTRACT(EPOCH FROM (NOW() - MIN(created_at)
+				FILTER (WHERE status = '%s'))) AS oldest_pending_age
 		FROM %s
 	`, MessageStatusPending, MessageStatusProcessing, MessageStatusCompleted, MessageStatusPending, pq.msgTable(tableName))
 
-	var avgSeconds sql.NullFloat64
-	var oldestPending sql.NullTime
+	var avgSeconds, oldestPendingAge sql.NullFloat64
 
 	err := pq.db.QueryRowContext(ctx, query).Scan(
 		&stats.PendingCount,
 		&stats.ProcessingCount,
 		&stats.CompletedCount,
 		&avgSeconds,
-		&oldestPending,
+		&oldestPendingAge,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get channel stats: %w", err)
@@ -256,12 +269,24 @@ func (pq *Queue) getChannelStats(
 		stats.AvgProcessingTime = &duration
 	}
 
-	if oldestPending.Valid {
-		age := time.Since(oldestPending.Time)
-		stats.OldestPendingAge = &age
-	}
+	stats.OldestPendingAge = secondsToAge(oldestPendingAge)
 
 	return nil
+}
+
+// secondsToAge converts an age in seconds from a SQL EXTRACT(EPOCH …) result
+// into a *time.Duration, clamping any negative value to zero so a reported age
+// is never negative (R-19).
+func secondsToAge(secs sql.NullFloat64) *time.Duration {
+	if !secs.Valid {
+		return nil
+	}
+	v := secs.Float64
+	if v < 0 {
+		v = 0
+	}
+	age := time.Duration(v * float64(time.Second))
+	return &age
 }
 
 // getPubSubStats gets statistics for a pub/sub topic.
@@ -270,6 +295,7 @@ func (pq *Queue) getPubSubStats(
 	tableName string,
 	stats *QueueStats,
 ) error {
+	// Age computed in SQL for clock consistency — see getChannelStats (R-19).
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
@@ -278,20 +304,19 @@ func (pq *Queue) getPubSubStats(
 			COUNT(*) FILTER (WHERE status = '%s') AS completed,
 			AVG(EXTRACT(EPOCH FROM (acked_at - created_at)))
 				FILTER (WHERE acked_at IS NOT NULL) AS avg_processing_time,
-			MIN(created_at)
-				FILTER (WHERE status = '%s') AS oldest_pending
+			EXTRACT(EPOCH FROM (NOW() - MIN(created_at)
+				FILTER (WHERE status = '%s'))) AS oldest_pending_age
 		FROM %s
 	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, pq.subTable(tableName))
 
-	var avgSeconds sql.NullFloat64
-	var oldestPending sql.NullTime
+	var avgSeconds, oldestPendingAge sql.NullFloat64
 
 	err := pq.db.QueryRowContext(ctx, query).Scan(
 		&stats.PendingCount,
 		&stats.ProcessingCount,
 		&stats.CompletedCount,
 		&avgSeconds,
-		&oldestPending,
+		&oldestPendingAge,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get pub/sub stats: %w", err)
@@ -302,10 +327,7 @@ func (pq *Queue) getPubSubStats(
 		stats.AvgProcessingTime = &duration
 	}
 
-	if oldestPending.Valid {
-		age := time.Since(oldestPending.Time)
-		stats.OldestPendingAge = &age
-	}
+	stats.OldestPendingAge = secondsToAge(oldestPendingAge)
 
 	return nil
 }
@@ -316,6 +338,9 @@ func (pq *Queue) GetSubscriberHealth(
 	topicName string,
 	subscriberID string,
 ) (*SubscriberHealth, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return nil, err
 	}
@@ -330,20 +355,7 @@ func (pq *Queue) GetSubscriberHealth(
 		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
-	query := fmt.Sprintf(`
-		SELECT
-			COUNT(*) FILTER (WHERE status = '%s') AS pending_messages,
-			COUNT(*) FILTER (
-				WHERE status = '%s'
-				AND visibility_timeout IS NOT NULL
-				AND visibility_timeout < NOW()
-			) AS stuck_messages,
-			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending,
-			MAX(acked_at) AS last_activity
-		FROM %s
-		WHERE subscriber_id = $1
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, pq.subTable(metadata.TableName))
+	query := buildSubscriberHealthQuery(pq.subTable(metadata.TableName))
 
 	health := &SubscriberHealth{
 		TopicName:    topicName,
@@ -381,6 +393,9 @@ func (pq *Queue) GetUnhealthySubscribers(
 	ctx context.Context,
 	threshold time.Duration,
 ) ([]SubscriberHealth, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
 	// Get all pub/sub topics
 	rows, err := pq.db.QueryContext(ctx,
 		fmt.Sprintf(
@@ -465,6 +480,23 @@ func (pq *Queue) findUnhealthyForTopic(
 	}
 
 	return results, nil
+}
+
+// buildSubscriberHealthQuery builds the per-subscriber health aggregate query.
+func buildSubscriberHealthQuery(subTable string) string {
+	return fmt.Sprintf(`
+		SELECT
+			COUNT(*) FILTER (WHERE status = '%s') AS pending_messages,
+			COUNT(*) FILTER (
+				WHERE status = '%s'
+				AND visibility_timeout IS NOT NULL
+				AND visibility_timeout < NOW()
+			) AS stuck_messages,
+			MIN(created_at) FILTER (WHERE status = '%s') AS oldest_pending,
+			MAX(acked_at) AS last_activity
+		FROM %s
+		WHERE subscriber_id = $1
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, subTable)
 }
 
 func buildUnhealthySubscribersQuery(subTable string) string {

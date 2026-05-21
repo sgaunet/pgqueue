@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -72,6 +73,16 @@ type Queue struct {
 	closed   atomic.Bool    // set to true after Close() is called
 	mdcache  *metadataCache // per-queue table-name cache (immutable fields only)
 	notifier *notifier      // LISTEN/NOTIFY push delivery; nil when no Listener is set
+
+	// Background-goroutine lifecycle, joined by Close (R-08). bgCtx is a
+	// process-scoped cancellation signal for owned goroutines, not a
+	// request-scoped context — storing it on the struct is the intended use.
+	//nolint:containedctx // process-lifetime cancellation signal, not request scope
+	bgCtx    context.Context
+	bgCancel context.CancelFunc // cancels bgCtx
+	gcMu     sync.Mutex         // guards gcs and serializes worker tracking against Close
+	gcs      []*GarbageCollector // GCs created via NewGarbageCollector for this Queue
+	workerWG sync.WaitGroup     // joins handler-based consume loops owned by this Queue
 }
 
 // PGQueue is a backward-compatible alias for Queue.
@@ -129,6 +140,20 @@ func InitSchema(ctx context.Context, db *sql.DB, opts ...Option) error {
 		return ErrDBRequired
 	}
 
+	// InitSchema only honors WithSchema. Reject any other option rather than
+	// silently ignoring it, so a caller is not misled into believing an
+	// inapplicable option (WithMaxQueues, WithBackoffPolicy, …) took effect
+	// (R-14).
+	probe := queueConfig{}
+	for _, o := range opts {
+		o(&probe)
+	}
+	if probe != (queueConfig{schemaName: probe.schemaName}) {
+		return fmt.Errorf(
+			"InitSchema accepts only WithSchema: %w", ErrInvalidConfig,
+		)
+	}
+
 	cfg := applyConfigOptions(opts)
 	if err := validateSchemaName(cfg.schemaName); err != nil {
 		return err
@@ -154,6 +179,37 @@ func validateConfig(cfg Config) error {
 		return ErrInvalidConfig
 	}
 
+	return nil
+}
+
+// validateRawOptions checks the raw, pre-normalization option values:
+// applyConfigOptions completes a partial backoff policy per-field, which would
+// otherwise mask invalid input (R-15).
+func validateRawOptions(opts []Option) error {
+	raw := queueConfig{}
+	for _, o := range opts {
+		o(&raw)
+	}
+	if raw.safetyNetPoll < 0 {
+		return fmt.Errorf("safety-net poll must not be negative: %w", ErrInvalidConfig)
+	}
+	return validateBackoffPolicy(raw.backoffPolicy)
+}
+
+// validateBackoffPolicy rejects an invalid backoff policy with ErrInvalidConfig
+// (R-15). A zero-valued field is allowed — it is completed per-field by
+// normalized() — but a present-but-nonsensical value (negative delay, a
+// multiplier in (0,1), or MaxDelay below BaseDelay) is a configuration error.
+func validateBackoffPolicy(p BackoffPolicy) error {
+	if p.BaseDelay < 0 || p.MaxDelay < 0 {
+		return fmt.Errorf("backoff delays must not be negative: %w", ErrInvalidConfig)
+	}
+	if p.Multiplier != 0 && p.Multiplier < 1 {
+		return fmt.Errorf("backoff multiplier must be >= 1: %w", ErrInvalidConfig)
+	}
+	if p.BaseDelay > 0 && p.MaxDelay > 0 && p.MaxDelay < p.BaseDelay {
+		return fmt.Errorf("backoff MaxDelay must be >= BaseDelay: %w", ErrInvalidConfig)
+	}
 	return nil
 }
 
@@ -197,6 +253,10 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 		return nil, ErrDBRequired
 	}
 
+	if err := validateRawOptions(opts); err != nil {
+		return nil, err
+	}
+
 	cfg := applyConfigOptions(opts)
 	if cfg.maxMessageSize < 0 || cfg.defaultMaxRetries < 0 ||
 		int64(cfg.defaultTTL) < 0 || cfg.maxQueues < 0 {
@@ -220,6 +280,7 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 		Logger:            cfg.logger,
 	}
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	pq := &Queue{
 		db:       db,
 		config:   legacyCfg,
@@ -227,9 +288,12 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 		logger:   cfg.logger,
 		mdcache:  newMetadataCache(),
 		notifier: newNotifier(cfg.listener),
+		bgCtx:    bgCtx,
+		bgCancel: bgCancel,
 	}
 
 	if err := pq.checkSchemaReady(ctx); err != nil {
+		bgCancel()
 		return nil, err
 	}
 
@@ -344,19 +408,46 @@ func (pq *Queue) ListChannels(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// Close marks the Queue as closed and stops the LISTEN/NOTIFY listener (if one
-// was registered with WithListener). After Close returns, all public operations
-// will return ErrQueueClosed. It does NOT close the underlying *sql.DB, which
-// is owned and managed by the caller. Stop any GarbageCollector before calling
-// Close; example:
+// Close marks the Queue as closed and joins every background goroutine the
+// Queue owns: it cancels the background context, stops each GarbageCollector
+// created via NewGarbageCollector, waits for handler-based consume loops
+// (ConsumeChannel/ConsumeTopic) to drain, then closes the LISTEN/NOTIFY
+// listener. After Close returns no Queue-owned goroutine issues a database
+// query, so the caller can safely close the underlying *sql.DB next:
 //
-//	gc.Stop()       // stop GC first
-//	pq.Close()      // then mark queue closed
+//	pq.Close()      // stops GC + consume loops + listener
 //	db.Close()      // then close the database connection
 //
-// Close is idempotent: calling it multiple times is safe and returns nil.
+// Close does NOT close the *sql.DB, which is owned by the caller. It is
+// idempotent: calling it multiple times is safe and returns nil.
 func (pq *Queue) Close() error {
+	// Mark closed and snapshot the GC list under gcMu. Setting closed here,
+	// under the same lock trackWorker uses, guarantees no new consume worker
+	// is registered after this point — so workerWG.Wait below cannot race a
+	// late workerWG.Add.
+	pq.gcMu.Lock()
+	if pq.closed.Load() {
+		pq.gcMu.Unlock()
+		return nil
+	}
 	pq.closed.Store(true)
+	gcs := append([]*GarbageCollector(nil), pq.gcs...)
+	pq.gcMu.Unlock()
+
+	// Signal owned background goroutines (consume loops) to wind down.
+	if pq.bgCancel != nil {
+		pq.bgCancel()
+	}
+
+	// Stop each registered GC. GarbageCollector.Stop is idempotent, so a
+	// caller that also stops its own GC stays safe.
+	for _, gc := range gcs {
+		gc.Stop()
+	}
+
+	// Join handler-based consume loops owned by this Queue.
+	pq.workerWG.Wait()
+
 	if pq.notifier != nil {
 		if err := pq.notifier.close(); err != nil {
 			return fmt.Errorf("failed to close notification listener: %w", err)
@@ -421,6 +512,28 @@ func (pq *Queue) checkClosed() error {
 		return ErrQueueClosed
 	}
 	return nil
+}
+
+// registerGC records a GarbageCollector on the Queue so Close can stop it.
+// NewGarbageCollector calls this; supporting multiple GCs is defensive.
+func (pq *Queue) registerGC(gc *GarbageCollector) {
+	pq.gcMu.Lock()
+	defer pq.gcMu.Unlock()
+	pq.gcs = append(pq.gcs, gc)
+}
+
+// trackWorker registers one handler-based consume loop on workerWG, returning
+// false if the Queue is already closed. The Add happens under gcMu, the same
+// lock Close holds when it marks the Queue closed, so an Add can never race
+// past Close's workerWG.Wait.
+func (pq *Queue) trackWorker() bool {
+	pq.gcMu.Lock()
+	defer pq.gcMu.Unlock()
+	if pq.closed.Load() {
+		return false
+	}
+	pq.workerWG.Add(1)
+	return true
 }
 
 func (pq *Queue) setQueuePaused(ctx context.Context, queueName string, queueType QueueType, paused bool) error {

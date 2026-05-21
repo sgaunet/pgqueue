@@ -18,6 +18,7 @@ package fake
 import (
 	"context"
 	"errors"
+	"maps"
 	"sync"
 	"time"
 
@@ -154,7 +155,7 @@ func (q *Queue) PublishChannel(
 	}
 	ch.pending = append(ch.pending, &entry{
 		id:      id,
-		payload: payload,
+		payload: cloneBytes(payload),
 		status:  pgqueue.MessageStatusPending,
 	})
 	return id, nil
@@ -177,9 +178,11 @@ func (q *Queue) PublishTopic(
 		q.topics[name] = t
 	}
 	for _, sub := range t.subs {
+		// Each subscriber gets an independent copy of the payload so a consumer
+		// mutating one delivered message cannot corrupt a fan-out sibling (R-16).
 		sub.pending = append(sub.pending, &entry{
 			id:      id,
-			payload: payload,
+			payload: cloneBytes(payload),
 			status:  pgqueue.MessageStatusPending,
 		})
 	}
@@ -343,11 +346,14 @@ func (q *Queue) claim(ch *channel, base pgqueue.Receipt) (*pgqueue.Message, erro
 	e.status = pgqueue.MessageStatusProcessing
 	ch.claimed[e.id] = e
 
+	// Hand the consumer copies of the payload and metadata so mutating a
+	// delivered message cannot corrupt the stored entry — and therefore cannot
+	// affect a later redelivery of the same message (R-16).
 	msg := &pgqueue.Message{
 		ID:         e.id,
 		ClaimID:    e.claimID,
-		Payload:    e.payload,
-		Metadata:   e.metadata,
+		Payload:    cloneBytes(e.payload),
+		Metadata:   cloneMetadata(e.metadata),
 		Status:     pgqueue.MessageStatusProcessing,
 		RetryCount: e.retryCount,
 		MaxRetries: q.maxRetries,
@@ -356,6 +362,29 @@ func (q *Queue) claim(ch *channel, base pgqueue.Receipt) (*pgqueue.Message, erro
 	base.ClaimID = e.claimID
 	pgqueue.SetReceipt(msg, base)
 	return msg, nil
+}
+
+// cloneBytes returns an independent copy of b, preserving a nil/empty
+// distinction is unnecessary here — a nil slice clones to nil.
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	c := make([]byte, len(b))
+	copy(c, b)
+	return c
+}
+
+// cloneMetadata returns a shallow copy of m (a nil map clones to nil). Values
+// are copied by reference, matching how the database-backed Queue round-trips
+// metadata through JSON: callers must not mutate nested values in place.
+func cloneMetadata(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	c := make(map[string]any, len(m))
+	maps.Copy(c, m)
+	return c
 }
 
 // resolve locates the channel (or subscriber queue) a receipt refers to.
