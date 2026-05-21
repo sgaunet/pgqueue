@@ -115,6 +115,15 @@ func (m *Message) Receipt() Receipt {
 	return Receipt{MessageID: m.ID, ClaimID: m.ClaimID}
 }
 
+// SetReceipt binds a queue-aware Receipt onto a Message so that m.Receipt()
+// returns the full binding. ReceiveChannel and ReceiveTopic call this
+// internally; it is exported chiefly so in-memory test doubles (the
+// pkg/pgqueue/fake package) can build messages that behave identically to ones
+// returned by a real Queue.
+func SetReceipt(m *Message, r Receipt) {
+	m.receipt = r
+}
+
 // QueueMetadata holds information about a queue.
 type QueueMetadata struct {
 	ID        uuid.UUID

@@ -61,6 +61,21 @@ func (p BackoffPolicy) Delay(prev time.Duration) time.Duration {
 	}
 }
 
+// computeRetryDelay resolves how long a nacked message must wait before it
+// becomes eligible for redelivery. A positive override (from WithRetryDelay)
+// wins outright; otherwise the queue's BackoffPolicy is advanced attempt times
+// to produce the decorrelated-jitter delay for this retry (FR-023).
+func (pq *Queue) computeRetryDelay(attempt int, override time.Duration) time.Duration {
+	if override > 0 {
+		return override
+	}
+	d := time.Duration(0)
+	for range attempt {
+		d = pq.cfg.backoffPolicy.Delay(d)
+	}
+	return d
+}
+
 // normalized returns a copy of p with any zero or invalid field replaced by the
 // corresponding default, so a partially-specified policy is still usable.
 func (p BackoffPolicy) normalized() BackoffPolicy {

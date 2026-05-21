@@ -47,6 +47,11 @@ func (pq *Queue) GetStats(
 		return nil, fmt.Errorf("failed to get DLQ count: %w", err)
 	}
 
+	// Feed the observed depth to a registered MetricsRecorder (FR-018); a no-op
+	// when none is registered.
+	pq.observeQueueDepth(queueName, stats.PendingCount)
+	pq.observeDLQSize(queueName, stats.DLQCount)
+
 	return stats, nil
 }
 

@@ -1,0 +1,156 @@
+package pgqueue_test
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
+
+	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+)
+
+// ExampleNew shows the standard initialization sequence: open a database
+// handle, install the schema, then construct a Queue with functional options.
+func ExampleNew() {
+	ctx := context.Background()
+	db, err := sql.Open("pgx", "postgres://localhost/app?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		log.Fatal(err)
+	}
+
+	q, err := pgqueue.New(ctx, db,
+		pgqueue.WithMaxMessageSize(1<<20), // 1 MiB
+		pgqueue.WithDefaultMaxRetries(5),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = q.Close() }()
+}
+
+// ExampleQueue_PublishChannel publishes a message to a point-to-point channel.
+func ExampleQueue_PublishChannel() {
+	var (
+		ctx context.Context
+		q   *pgqueue.Queue
+	)
+	if err := q.CreateChannel(ctx, "orders"); err != nil {
+		log.Fatal(err)
+	}
+	id, err := q.PublishChannel(ctx, "orders", []byte(`{"order":123}`))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("published", id)
+}
+
+// ExampleQueue_ConsumeChannel consumes with the handler-based API: pgqueue owns
+// the loop and acknowledges automatically based on the handler result.
+func ExampleQueue_ConsumeChannel() {
+	var (
+		ctx context.Context
+		q   *pgqueue.Queue
+	)
+	err := q.ConsumeChannel(ctx, "orders",
+		func(_ context.Context, m *pgqueue.Message) error {
+			// Returning nil auto-acks; returning an error auto-nacks with backoff.
+			return process(m.Payload)
+		},
+		pgqueue.WithConcurrency(8),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// ExampleQueue_ReceiveChannel shows the single-shot consume API and the
+// ErrQueueEmpty signal that replaces the old (nil, nil) sentinel.
+func ExampleQueue_ReceiveChannel() {
+	var (
+		ctx context.Context
+		q   *pgqueue.Queue
+	)
+	msg, err := q.ReceiveChannel(ctx, "orders")
+	switch {
+	case errors.Is(err, pgqueue.ErrQueueEmpty):
+		// nothing available right now
+	case err != nil:
+		log.Fatal(err)
+	default:
+		if err := process(msg.Payload); err != nil {
+			_ = q.Nack(ctx, msg.Receipt(), err.Error())
+		} else {
+			_ = q.Ack(ctx, msg.Receipt())
+		}
+	}
+}
+
+// ExampleQueue_ChannelMessages consumes with the range-over-func iterator,
+// acknowledging each message explicitly.
+func ExampleQueue_ChannelMessages() {
+	var (
+		ctx context.Context
+		q   *pgqueue.Queue
+	)
+	for msg, err := range q.ChannelMessages(ctx, "orders") {
+		if err != nil {
+			log.Print(err)
+			break
+		}
+		if err := process(msg.Payload); err != nil {
+			_ = q.Nack(ctx, msg.Receipt(), err.Error())
+			continue
+		}
+		_ = q.Ack(ctx, msg.Receipt())
+	}
+}
+
+// ExampleQueue_ListDLQMessages walks the dead-letter queue with keyset
+// pagination.
+func ExampleQueue_ListDLQMessages() {
+	var (
+		ctx context.Context
+		q   *pgqueue.Queue
+	)
+	page := pgqueue.DLQPage{Limit: 100}
+	for {
+		msgs, next, err := q.ListDLQMessages(ctx, "orders", pgqueue.QueueTypeChannel, page)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, m := range msgs {
+			fmt.Println(m.ID, m.FailureReason)
+		}
+		if len(msgs) < page.Limit {
+			break
+		}
+		page = next
+	}
+}
+
+// ExampleQueue_ReplayDLQ replays every message from the dead-letter queue back
+// onto the main queue. Replay is a destructive operation, so Confirm is required.
+func ExampleQueue_ReplayDLQ() {
+	var (
+		ctx context.Context
+		q   *pgqueue.Queue
+	)
+	n, err := q.ReplayDLQ(ctx, "orders", pgqueue.QueueTypeChannel,
+		pgqueue.ReplayOptions{Confirm: true})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("replayed %d messages\n", n)
+}
+
+// process is a placeholder for the caller's message-handling logic.
+func process(payload []byte) error {
+	_ = payload
+	return nil
+}

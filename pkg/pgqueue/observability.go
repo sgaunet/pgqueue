@@ -60,3 +60,72 @@ type MetricsRecorder interface {
 	// ObserveDLQSize reports the current dead-letter queue size.
 	ObserveDLQSize(queue string, size int64)
 }
+
+// noopSpan is the Span returned when no Tracer is registered, so instrumented
+// code can call span methods unconditionally without a nil check.
+type noopSpan struct{}
+
+func (noopSpan) End()             {}
+func (noopSpan) SetError(error)   {}
+func (noopSpan) SetAttr(...Attr)  {}
+
+// startSpan begins a tracing span when a Tracer is registered (WithTracer);
+// otherwise it returns ctx unchanged and a no-op span. The returned span must
+// always be ended by the caller.
+//
+//nolint:ireturn // Span is the public observability hook interface; returning
+// it (a real span or the no-op) is the intended polymorphism.
+func (pq *Queue) startSpan(
+	ctx context.Context,
+	name string,
+	attrs ...Attr,
+) (context.Context, Span) {
+	if pq.cfg.tracer == nil {
+		return ctx, noopSpan{}
+	}
+	return pq.cfg.tracer.StartSpan(ctx, name, attrs...)
+}
+
+// recordPublish reports a publish to the registered MetricsRecorder, if any.
+func (pq *Queue) recordPublish(queue string, count int) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.RecordPublish(queue, count)
+	}
+}
+
+// recordConsume reports one message's processing latency, if metrics are on.
+func (pq *Queue) recordConsume(queue string, latency time.Duration) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.RecordConsume(queue, latency)
+	}
+}
+
+// recordAck reports an acknowledgement outcome (ok=false for a nack), if on.
+func (pq *Queue) recordAck(queue string, ok bool) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.RecordAck(queue, ok)
+	}
+}
+
+// observeQueueDepth reports the current pending depth, if metrics are on.
+func (pq *Queue) observeQueueDepth(queue string, depth int64) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.ObserveQueueDepth(queue, depth)
+	}
+}
+
+// observeDLQSize reports the current DLQ size, if metrics are on.
+func (pq *Queue) observeDLQSize(queue string, size int64) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.ObserveDLQSize(queue, size)
+	}
+}
+
+// endSpan finishes a span, recording err on it when non-nil. It is a small
+// convenience for the common deferred-cleanup pattern.
+func endSpan(span Span, err error) {
+	if err != nil {
+		span.SetError(err)
+	}
+	span.End()
+}

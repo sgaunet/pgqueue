@@ -447,6 +447,9 @@ func (pq *Queue) publishBatchToChannel(
 		)
 	}
 
+	// Wake any blocked consumer the instant this batch publish commits (FR-014).
+	pq.emitNotify(ctx, tx, tableName)
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -484,6 +487,9 @@ func (pq *Queue) publishBatchToPubSub(
 			return fmt.Errorf("failed to create subscription records: %w", err)
 		}
 	}
+
+	// Wake any blocked consumer the instant this batch publish commits (FR-014).
+	pq.emitNotify(ctx, tx, tableName)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)

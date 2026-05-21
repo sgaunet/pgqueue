@@ -255,9 +255,41 @@ func (gc *GarbageCollector) collectQueue(
 		); err != nil {
 			return fmt.Errorf("failed to purge inactive subscriptions: %w", err)
 		}
+		if err := gc.reclaimOrphanTopicMessages(ctx, queue.TableName); err != nil {
+			return fmt.Errorf("failed to reclaim orphan topic messages: %w", err)
+		}
 	}
 
 	return gc.resetTimedOutEntries(ctx, queue)
+}
+
+// reclaimOrphanTopicMessages deletes pub/sub messages that can never be
+// delivered: a message published to a topic that had zero subscribers at
+// publish time gets no subscription rows (subscription rows are created
+// atomically with the message), so it would otherwise occupy storage forever.
+//
+// Messages whose subscriptions were all moved to the DLQ are NOT orphans — the
+// DLQ entry still references the message for a possible replay — so the delete
+// also excludes any message referenced by a DLQ row (FR-027).
+func (gc *GarbageCollector) reclaimOrphanTopicMessages(
+	ctx context.Context,
+	tableName string,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		DELETE FROM pgqueue_msg_%s m
+		WHERE NOT EXISTS (
+			SELECT 1 FROM pgqueue_sub_%s s WHERE s.message_id = m.id
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM pgqueue_dlq_%s d WHERE d.original_message_id = m.id
+		)
+	`, tableName, tableName, tableName)
+
+	if _, err := gc.pq.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to delete orphan topic messages: %w", err)
+	}
+	return nil
 }
 
 func (gc *GarbageCollector) applyRetentionPolicy(

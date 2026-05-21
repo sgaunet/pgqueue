@@ -191,6 +191,34 @@ func (pq *Queue) NackTopic(
 	r Receipt,
 	errorMsg string,
 ) error {
+	return pq.nackTopicImpl(ctx, topicName, subscriberID, r, errorMsg, 0)
+}
+
+// nackTopicWithOpts is the option-aware topic nack used by the queue-agnostic
+// Nack. WithRetryDelay overrides the computed backoff delay (FR-023).
+func (pq *Queue) nackTopicWithOpts(
+	ctx context.Context,
+	topicName, subscriberID string,
+	r Receipt,
+	errorMsg string,
+	opts ...NackOption,
+) error {
+	o := nackOpts{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return pq.nackTopicImpl(ctx, topicName, subscriberID, r, errorMsg, o.retryDelay)
+}
+
+// nackTopicImpl is the shared topic-nack body. retryDelay > 0 overrides the
+// per-queue backoff policy for this single redelivery.
+func (pq *Queue) nackTopicImpl(
+	ctx context.Context,
+	topicName, subscriberID string,
+	r Receipt,
+	errorMsg string,
+	retryDelay time.Duration,
+) error {
 	errorMsg = truncateErrorMsg(errorMsg)
 
 	if err := validateSubscriberID(subscriberID); err != nil {
@@ -230,9 +258,10 @@ func (pq *Queue) NackTopic(
 			return fmt.Errorf("failed to move to DLQ: %w", err)
 		}
 	} else {
+		delay := pq.computeRetryDelay(state.retryCount+1, retryDelay)
 		if err := pq.retrySubscription(
 			ctx, tx, queueMeta.TableName,
-			r.MessageID, subscriberID, errorMsg,
+			r.MessageID, subscriberID, errorMsg, delay,
 		); err != nil {
 			return fmt.Errorf("failed to retry subscription: %w", err)
 		}
@@ -329,22 +358,25 @@ func (pq *Queue) retrySubscription(
 	tableName string,
 	messageID uuid.UUID,
 	subscriberID, errorMsg string,
+	delay time.Duration,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	// claim_id is cleared so a stale receipt held by the previous consumer
 	// resolves to ErrClaimExpired rather than ErrMessageAlreadyAcked.
+	// available_at is pushed out by the backoff delay (FR-023).
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
+		    available_at = NOW() + make_interval(secs => $4),
 		    error_message = $3
 		WHERE message_id = $1
 		  AND subscriber_id = $2
 	`, tableName, MessageStatusPending)
 
-	_, err := tx.ExecContext(ctx, query, messageID, subscriberID, errorMsg)
+	_, err := tx.ExecContext(ctx, query, messageID, subscriberID, errorMsg, delay.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to retry subscription: %w", err)
 	}
@@ -416,13 +448,15 @@ func topicConsumeQuery(tableName, subscriberID string, ttl time.Duration) (strin
 		args = append(args, ttl.Seconds())
 	}
 
+	// A pending subscription is only consumable once available_at has elapsed,
+	// enforcing the retry backoff delay (FR-023) — see channelConsumeQuery.
 	query := fmt.Sprintf(`
 		SELECT s.id, s.message_id, m.payload, m.created_at,
 		       s.status, s.retry_count, m.metadata, s.error_message
 		FROM pgqueue_sub_%s s
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
-		  AND (s.status = '%s'
+		  AND ((s.status = '%s' AND s.available_at <= NOW())
 		       OR (s.status = '%s' AND s.visibility_timeout < NOW()))
 		  %s
 		ORDER BY m.id

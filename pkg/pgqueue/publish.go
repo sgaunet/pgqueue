@@ -202,6 +202,9 @@ func (pq *Queue) publishToPubSub(
 		return fmt.Errorf("failed to create subscription records: %w", err)
 	}
 
+	// Wake any blocked consumer the instant this publish commits (FR-014).
+	pq.emitNotify(ctx, tx, tableName)
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
@@ -256,8 +259,15 @@ func (pq *Queue) PublishChannel(
 	if err := pq.checkClosed(); err != nil {
 		return uuid.UUID{}, err
 	}
+	ctx, span := pq.startSpan(ctx, "pgqueue.publish",
+		StringAttr("queue", name), StringAttr("queue_type", "channel"))
 	o := applyPublishOptions(opts)
-	return pq.publishTyped(ctx, name, QueueTypeChannel, payload, o.messageID, o.metadata)
+	id, err := pq.publishTyped(ctx, name, QueueTypeChannel, payload, o.messageID, o.metadata)
+	endSpan(span, err)
+	if err == nil {
+		pq.recordPublish(name, 1)
+	}
+	return id, err
 }
 
 // PublishTopic publishes a single message to a pub/sub topic, delivering it
@@ -272,8 +282,15 @@ func (pq *Queue) PublishTopic(
 	if err := pq.checkClosed(); err != nil {
 		return uuid.UUID{}, err
 	}
+	ctx, span := pq.startSpan(ctx, "pgqueue.publish",
+		StringAttr("queue", name), StringAttr("queue_type", "pubsub"))
 	o := applyPublishOptions(opts)
-	return pq.publishTyped(ctx, name, QueueTypePubSub, payload, o.messageID, o.metadata)
+	id, err := pq.publishTyped(ctx, name, QueueTypePubSub, payload, o.messageID, o.metadata)
+	endSpan(span, err)
+	if err == nil {
+		pq.recordPublish(name, 1)
+	}
+	return id, err
 }
 
 // publishTyped is the shared implementation for PublishChannel/PublishTopic.
@@ -385,6 +402,9 @@ func (pq *Queue) publishToChannel(
 	if rowsAffected == 0 {
 		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
 	}
+
+	// Wake any blocked consumer the instant this publish commits (FR-014).
+	pq.emitNotify(ctx, tx, tableName)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)

@@ -24,6 +24,7 @@ type queueConfig struct {
 	metrics           MetricsRecorder
 	backoffPolicy     BackoffPolicy
 	safetyNetPoll     time.Duration
+	listener          Listener
 }
 
 // WithMaxMessageSize sets the maximum allowed message payload size in bytes.
@@ -106,6 +107,17 @@ func WithBackoffPolicy(p BackoffPolicy) Option {
 func WithSafetyNetPoll(d time.Duration) Option {
 	return func(c *queueConfig) {
 		c.safetyNetPoll = d
+	}
+}
+
+// WithListener registers a Listener for push-based delivery via PostgreSQL
+// LISTEN/NOTIFY (FR-014). With one registered, blocking consume loops wake
+// immediately when a message is published instead of waiting for the next
+// safety-net poll. Without one, consumption falls back to polling. Concrete
+// driver-backed Listener implementations ship as optional sub-packages.
+func WithListener(l Listener) Option {
+	return func(c *queueConfig) {
+		c.listener = l
 	}
 }
 

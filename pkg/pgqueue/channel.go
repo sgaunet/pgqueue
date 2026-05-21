@@ -137,6 +137,34 @@ func (pq *Queue) NackChannel(
 	r Receipt,
 	errorMsg string,
 ) error {
+	return pq.nackChannelImpl(ctx, channelName, r, errorMsg, 0)
+}
+
+// nackChannelWithOpts is the option-aware nack used by the queue-agnostic Nack.
+// WithRetryDelay overrides the computed backoff delay (FR-023).
+func (pq *Queue) nackChannelWithOpts(
+	ctx context.Context,
+	channelName string,
+	r Receipt,
+	errorMsg string,
+	opts ...NackOption,
+) error {
+	o := nackOpts{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return pq.nackChannelImpl(ctx, channelName, r, errorMsg, o.retryDelay)
+}
+
+// nackChannelImpl is the shared nack body. retryDelay > 0 overrides the
+// per-queue backoff policy for this single redelivery.
+func (pq *Queue) nackChannelImpl(
+	ctx context.Context,
+	channelName string,
+	r Receipt,
+	errorMsg string,
+	retryDelay time.Duration,
+) error {
 	errorMsg = truncateErrorMsg(errorMsg)
 	queueMeta, err := pq.getQueueMetadata(
 		ctx, string(QueueTypeChannel), channelName,
@@ -164,7 +192,7 @@ func (pq *Queue) NackChannel(
 	}
 
 	if err := pq.handleNack(
-		ctx, tx, queueMeta.TableName, r.MessageID, errorMsg, msgState,
+		ctx, tx, queueMeta.TableName, r.MessageID, errorMsg, msgState, retryDelay,
 	); err != nil {
 		return fmt.Errorf("failed to handle nack: %w", err)
 	}
@@ -265,11 +293,14 @@ func channelConsumeQuery(tableName string, ttl time.Duration) (string, []any) {
 		args = append(args, ttl.Seconds())
 	}
 
+	// A pending message is only consumable once available_at has elapsed: this
+	// is what enforces the retry backoff delay (FR-023) and any WithRetryDelay
+	// override. Freshly published messages default available_at to now().
 	query := fmt.Sprintf(`
 		SELECT id, payload, created_at, status, retry_count, max_retries,
 		       metadata, processed_at, error_message
 		FROM pgqueue_msg_%s
-		WHERE (status = '%s'
+		WHERE ((status = '%s' AND available_at <= NOW())
 		       OR (status = '%s' AND visibility_timeout < NOW()))
 		  %s
 		ORDER BY id
@@ -404,6 +435,7 @@ func (pq *Queue) handleNack(
 	messageID uuid.UUID,
 	errorMsg string,
 	state *messageState,
+	retryDelay time.Duration,
 ) error {
 	// Determine max retries (use default if not set)
 	maxRetry := channelMaxRetries(pq.config.DefaultMaxRetries, state.maxRetries)
@@ -416,7 +448,9 @@ func (pq *Queue) handleNack(
 		)
 	}
 
-	return pq.retryMessage(ctx, tx, tableName, messageID, errorMsg)
+	// The redelivery becomes eligible only after the backoff delay elapses.
+	delay := pq.computeRetryDelay(state.retryCount+1, retryDelay)
+	return pq.retryMessage(ctx, tx, tableName, messageID, errorMsg, delay)
 }
 
 func (pq *Queue) moveToDLQ(
@@ -463,21 +497,25 @@ func (pq *Queue) retryMessage(
 	tableName string,
 	messageID uuid.UUID,
 	errorMsg string,
+	delay time.Duration,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	// claim_id is cleared so a stale receipt held by the previous consumer
 	// resolves to ErrClaimExpired rather than ErrMessageAlreadyAcked.
+	// available_at is pushed out by the backoff delay so the message is not
+	// redelivered until the delay has elapsed (FR-023).
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
+		    available_at = NOW() + make_interval(secs => $3),
 		    error_message = $2
 		WHERE id = $1
 	`, tableName, MessageStatusPending)
 
-	_, err := tx.ExecContext(ctx, updateQuery, messageID, errorMsg)
+	_, err := tx.ExecContext(ctx, updateQuery, messageID, errorMsg, delay.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to update message: %w", err)
 	}

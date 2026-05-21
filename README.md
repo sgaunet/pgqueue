@@ -5,7 +5,8 @@
 [![GoDoc](https://godoc.org/github.com/sgaunet/pgqueue?status.svg)](https://godoc.org/github.com/sgaunet/pgqueue/pkg/pgqueue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A PostgreSQL-based message queue library for Go with exactly-once delivery guarantees.
+A PostgreSQL-based message queue library for Go with at-least-once delivery.
+Driver-agnostic — works with `pgx` **or** `lib/pq`, and forces neither on you.
 
 ## Features
 
@@ -13,17 +14,25 @@ A PostgreSQL-based message queue library for Go with exactly-once delivery guara
   - **Pub/Sub**: Fan-out messaging where each subscriber receives all messages
   - **Channels**: Point-to-point queuing where each message is delivered to a single consumer
 
-- **Exactly-Once Delivery**: Guaranteed via deduplication, visibility timeout, and transactional acknowledgments
-- **Message Ordering**: Per-topic/channel ordering using UUIDv7
-- **Dead Letter Queue**: Failed messages automatically moved after max retries
-- **Message Replay**: Replay messages from specific timestamps or DLQ
-- **Garbage Collection**: Automatic cleanup with configurable retention policies
-- **Statistics & Monitoring**: Track message counts, processing times, and queue depth
+- **At-Least-Once Delivery**: Visibility timeouts redeliver messages whose consumer crashed before acknowledging, so message handlers should be idempotent. Publishing with an explicit message ID deduplicates enqueues.
+- **Three Consume APIs**: a handler-based loop (`ConsumeChannel`), a range-over-func iterator (`ChannelMessages`), and single-shot `ReceiveChannel` — pick the ergonomics you want.
+- **Push Delivery**: optional `LISTEN/NOTIFY` listener wakes idle consumers in milliseconds, with a bounded safety-net poll as a fallback.
+- **Automatic Retry Backoff**: nacked messages are retried with decorrelated-jitter exponential backoff; override per nack with `WithRetryDelay`.
+- **Message Ordering**: per-topic/channel ordering using UUIDv7.
+- **Dead Letter Queue**: failed messages moved after max retries; inspect with keyset-paginated `ListDLQMessages` / `DLQStats`.
+- **Message Replay**: replay from a timestamp or the DLQ — transactional, deterministic, and memory-bounded for large backlogs.
+- **Opt-in Observability**: zero-dependency `Tracer` / `MetricsRecorder` hooks; ready-made OpenTelemetry and Prometheus adapters ship as optional sub-modules.
+- **Testable Without a Database**: the `fake` sub-package is an in-memory implementation of the published interfaces for unit tests with no Docker.
+- **Garbage Collection**: automatic cleanup with configurable retention policies.
+- **Statistics & Monitoring**: track message counts, processing times, and queue depth.
 
 ## Requirements
 
 - PostgreSQL 18+
-- Go 1.21+
+- Go 1.25+
+
+Core depends only on the Go standard library and `github.com/google/uuid` — no
+PostgreSQL driver is a mandatory dependency.
 
 ## Installation
 
@@ -33,7 +42,8 @@ go get github.com/sgaunet/pgqueue
 
 ## Quick Start
 
-### With pgx driver (recommended)
+The constructor takes a `*sql.DB` and functional options. The driver is your
+choice — `sql.Open("pgx", …)` or `sql.Open("postgres", …)` with `lib/pq`.
 
 ```go
 package main
@@ -43,89 +53,79 @@ import (
     "database/sql"
     "log"
 
-    _ "github.com/jackc/pgx/v5/stdlib"
+    _ "github.com/jackc/pgx/v5/stdlib" // or _ "github.com/lib/pq"
     "github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
 
 func main() {
     ctx := context.Background()
 
-    // Open database connection
     db, err := sql.Open("pgx", "postgres://user:pass@localhost/dbname?sslmode=disable")
     if err != nil {
         log.Fatal(err)
     }
     defer db.Close()
 
-    // Initialize base schema (one-time setup, idempotent)
+    // Install / migrate the schema (one-time, idempotent).
     if err := pgqueue.InitSchema(ctx, db); err != nil {
         log.Fatal(err)
     }
 
-    // Initialize pgqueue
-    pq, err := pgqueue.Init(ctx, pgqueue.Config{
-        DB:                db,
-        MaxMessageSize:   1024,
-        DefaultMaxRetries: 3,
-    })
+    // Construct a Queue with functional options.
+    q, err := pgqueue.New(ctx, db,
+        pgqueue.WithMaxMessageSize(1<<20), // 1 MiB
+        pgqueue.WithDefaultMaxRetries(3),
+    )
     if err != nil {
         log.Fatal(err)
     }
+    defer q.Close() // stops the GC and the LISTEN/NOTIFY listener
 
-    // Create a channel
-    err = pq.CreateChannel(ctx, "orders", pgqueue.ChannelOptions{})
+    // Create a channel and publish.
+    if err := q.CreateChannel(ctx, "orders"); err != nil {
+        log.Fatal(err)
+    }
+    id, err := q.PublishChannel(ctx, "orders", []byte("order-123"))
     if err != nil {
         log.Fatal(err)
     }
-
-    // Publish a message
-    msgID, err := pq.Publish(ctx, "orders", []byte("order-123"))
-    if err != nil {
-        log.Fatal(err)
-    }
-    log.Printf("Published message: %s", msgID)
+    log.Printf("published message: %s", id)
 }
 ```
 
-### With lib/pq driver
+### Consuming — handler API (recommended)
+
+`ConsumeChannel` owns the loop: it fetches messages, calls your handler, and
+auto-acks on `nil` / auto-nacks (with backoff retry) on an error.
 
 ```go
-package main
+err := q.ConsumeChannel(ctx, "orders", func(ctx context.Context, m *pgqueue.Message) error {
+    return handleOrder(ctx, m.Payload) // nil -> ack; err -> nack + retry
+}, pgqueue.WithConcurrency(8))
+// returns cleanly when ctx is cancelled
+```
 
-import (
-    "context"
-    "database/sql"
-    "log"
+Two lower-level styles are also available: the `ChannelMessages` range-over-func
+iterator (manual ack/nack) and single-shot `ReceiveChannel` (returns
+`ErrQueueEmpty` when nothing is available).
 
-    _ "github.com/lib/pq"
-    "github.com/sgaunet/pgqueue/pkg/pgqueue"
-)
+### Push delivery, observability, and testing
 
-func main() {
-    ctx := context.Background()
+```go
+// Push delivery: wake idle consumers in milliseconds via LISTEN/NOTIFY.
+import "github.com/sgaunet/pgqueue/pkg/pgqueue/pglisten"
+l, _ := pglisten.New(ctx, connString)
+q, _ := pgqueue.New(ctx, db, pgqueue.WithListener(l))
 
-    // Open database connection
-    db, err := sql.Open("postgres", "postgres://user:pass@localhost/dbname?sslmode=disable")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer db.Close()
+// Observability: opt-in, zero core dependencies.
+import "github.com/sgaunet/pgqueue/pkg/pgqueue/otelpgqueue"
+q, _ = pgqueue.New(ctx, db,
+    pgqueue.WithTracer(otelpgqueue.NewTracer(tracerProvider)),
+    pgqueue.WithMetrics(otelpgqueue.NewMetrics(meterProvider)))
 
-    // Initialize base schema (one-time setup, idempotent)
-    if err := pgqueue.InitSchema(ctx, db); err != nil {
-        log.Fatal(err)
-    }
-
-    // Initialize pgqueue (same API as pgx)
-    pq, err := pgqueue.Init(ctx, pgqueue.Config{
-        DB: db,
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // Use the library...
-}
+// Unit-test your code with no database via the in-memory fake.
+import "github.com/sgaunet/pgqueue/pkg/pgqueue/fake"
+q := fake.New()
 ```
 
 ## Architecture

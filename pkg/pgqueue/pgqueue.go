@@ -71,6 +71,7 @@ type Queue struct {
 	logger   *slog.Logger
 	closed   atomic.Bool    // set to true after Close() is called
 	mdcache  *metadataCache // per-queue table-name cache (immutable fields only)
+	notifier *notifier      // LISTEN/NOTIFY push delivery; nil when no Listener is set
 }
 
 // PGQueue is a backward-compatible alias for Queue.
@@ -212,11 +213,12 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 	}
 
 	pq := &Queue{
-		db:      db,
-		config:  legacyCfg,
-		cfg:     cfg,
-		logger:  cfg.logger,
-		mdcache: newMetadataCache(),
+		db:       db,
+		config:   legacyCfg,
+		cfg:      cfg,
+		logger:   cfg.logger,
+		mdcache:  newMetadataCache(),
+		notifier: newNotifier(cfg.listener),
 	}
 
 	if err := pq.checkSchemaReady(ctx); err != nil {
@@ -334,7 +336,8 @@ func (pq *Queue) ListChannels(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// Close marks the Queue as closed. After Close returns, all public operations
+// Close marks the Queue as closed and stops the LISTEN/NOTIFY listener (if one
+// was registered with WithListener). After Close returns, all public operations
 // will return ErrQueueClosed. It does NOT close the underlying *sql.DB, which
 // is owned and managed by the caller. Stop any GarbageCollector before calling
 // Close; example:
@@ -346,6 +349,11 @@ func (pq *Queue) ListChannels(ctx context.Context) ([]string, error) {
 // Close is idempotent: calling it multiple times is safe and returns nil.
 func (pq *Queue) Close() error {
 	pq.closed.Store(true)
+	if pq.notifier != nil {
+		if err := pq.notifier.close(); err != nil {
+			return fmt.Errorf("failed to close notification listener: %w", err)
+		}
+	}
 	return nil
 }
 

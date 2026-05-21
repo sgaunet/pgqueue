@@ -1,4 +1,5 @@
-// Package main demonstrates pgqueue channel (point-to-point) messaging pattern.
+// Package main demonstrates pgqueue channel (point-to-point) messaging using
+// the handler-based consume API: pgqueue owns the loop and ack/nack lifecycle.
 package main
 
 import (
@@ -9,18 +10,17 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	// _ "github.com/lib/pq" // Alternative: use lib/pq driver.
+	// _ "github.com/lib/pq" // Alternative: use lib/pq driver ("postgres").
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
 
 const (
-	maxMessageSize    = 1024 * 1024 // 1MB.
+	maxMessageSize    = 1024 * 1024 // 1 MiB.
 	defaultMaxRetries = 3
 	channelMaxRetries = 3
-	publishDelay      = 500 * time.Millisecond
-	processingWait    = 5 * time.Second
-	visibilityTimeout = 30 * time.Second
-	pollInterval      = 1 * time.Second
+	publishDelay      = 200 * time.Millisecond
+	consumeWindow     = 5 * time.Second
+	workerConcurrency = 4
 )
 
 func main() {
@@ -32,7 +32,8 @@ func main() {
 func run() error {
 	ctx := context.Background()
 
-	// Open database connection with pgx driver
+	// Open a database connection. The driver is the caller's choice — pgqueue
+	// depends only on database/sql, not on any specific driver.
 	db, err := sql.Open(
 		"pgx",
 		"postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable")
@@ -41,12 +42,11 @@ func run() error {
 	}
 	defer func() { _ = db.Close() }()
 
-	// Initialize base schema (one-time setup, idempotent)
+	// Initialize the base schema (one-time setup, idempotent).
 	if err := pgqueue.InitSchema(ctx, db); err != nil {
 		return fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
-	// Initialize pgqueue
 	pq, err := pgqueue.New(ctx, db,
 		pgqueue.WithMaxMessageSize(maxMessageSize),
 		pgqueue.WithDefaultMaxRetries(defaultMaxRetries),
@@ -54,33 +54,23 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize pgqueue: %w", err)
 	}
+	defer func() { _ = pq.Close() }()
 
-	// Create a channel for order processing
 	channelName := "orders"
-	err = pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(channelMaxRetries))
-	if err != nil {
+	if err := pq.CreateChannel(ctx, channelName,
+		pgqueue.WithQueueMaxRetries(channelMaxRetries)); err != nil {
 		log.Printf("channel might already exist: %v", err)
 	}
 
-	// Start a goroutine to consume and process orders
-	go consumeOrders(ctx, pq, channelName)
-
 	publishOrders(ctx, pq, channelName)
-
-	// Wait for processing to complete
-	fmt.Println("\nWaiting for orders to be processed...")
-	time.Sleep(processingWait)
-
+	consumeOrders(ctx, pq, channelName)
 	printStats(ctx, pq, channelName)
-	fmt.Println("\nExample completed successfully!")
 
+	fmt.Println("\nExample completed successfully!")
 	return nil
 }
 
-func publishOrders(
-	ctx context.Context,
-	pq *pgqueue.Queue,
-	channelName string) {
+func publishOrders(ctx context.Context, pq *pgqueue.Queue, channelName string) {
 	orders := []string{
 		"order-001: 2x Widget A",
 		"order-002: 1x Widget B",
@@ -91,7 +81,7 @@ func publishOrders(
 
 	fmt.Println("Publishing orders...")
 	for _, order := range orders {
-		msgID, err := pq.Publish(ctx, channelName, []byte(order))
+		msgID, err := pq.PublishChannel(ctx, channelName, []byte(order))
 		if err != nil {
 			log.Printf("failed to publish order: %v", err)
 			continue
@@ -101,10 +91,28 @@ func publishOrders(
 	}
 }
 
-func printStats(
-	ctx context.Context,
-	pq *pgqueue.Queue,
-	channelName string) {
+// consumeOrders runs the handler-based consume loop. ConsumeChannel owns the
+// loop: it fetches each message, calls the handler, then auto-acks on a nil
+// return or auto-nacks (with retry/backoff) on an error. It returns when the
+// context is cancelled.
+func consumeOrders(ctx context.Context, pq *pgqueue.Queue, channelName string) {
+	fmt.Println("\nProcessing orders...")
+
+	consumeCtx, cancel := context.WithTimeout(ctx, consumeWindow)
+	defer cancel()
+
+	handler := func(_ context.Context, msg *pgqueue.Message) error {
+		fmt.Printf("Completed: %s\n", string(msg.Payload))
+		return nil
+	}
+
+	if err := pq.ConsumeChannel(consumeCtx, channelName, handler,
+		pgqueue.WithConcurrency(workerConcurrency)); err != nil {
+		log.Printf("consume loop error: %v", err)
+	}
+}
+
+func printStats(ctx context.Context, pq *pgqueue.Queue, channelName string) {
 	stats, err := pq.GetStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		log.Printf("failed to get stats: %v", err)
@@ -115,59 +123,4 @@ func printStats(
 	fmt.Printf("  Processing: %d\n", stats.ProcessingCount)
 	fmt.Printf("  Completed: %d\n", stats.CompletedCount)
 	fmt.Printf("  DLQ: %d\n", stats.DLQCount)
-}
-
-func consumeOrders(
-	ctx context.Context,
-	pq *pgqueue.Queue,
-	channelName string) {
-	fmt.Println("Starting order processor...")
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		// Consume next order with visibility timeout
-		msg, err := pq.ConsumeFromChannel(ctx, channelName, visibilityTimeout)
-		if err != nil {
-			log.Printf("error consuming message: %v", err)
-			time.Sleep(pollInterval)
-			continue
-		}
-
-		// No messages available
-		if msg == nil {
-			time.Sleep(pollInterval)
-			continue
-		}
-
-		// Process the order
-		fmt.Printf("Processing: %s\n", string(msg.Payload))
-		time.Sleep(pollInterval) // Simulate processing time
-
-		// Simulate occasional failures
-		if msg.RetryCount > 0 && msg.RetryCount%2 == 0 {
-			err = pq.NackChannel(
-				ctx, channelName, msg.Receipt(), "simulated processing error")
-			if err != nil {
-				log.Printf("error nacking message: %v", err)
-			}
-			fmt.Printf(
-				"Failed to process (retry %d/%d): %s\n",
-				msg.RetryCount+1, msg.MaxRetries, string(msg.Payload))
-			continue
-		}
-
-		// Acknowledge successful processing
-		err = pq.AckChannel(ctx, channelName, msg.Receipt())
-		if err != nil {
-			log.Printf("error acking message: %v", err)
-			continue
-		}
-
-		fmt.Printf("Completed: %s\n", string(msg.Payload))
-	}
 }

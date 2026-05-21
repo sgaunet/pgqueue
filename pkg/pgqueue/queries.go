@@ -239,6 +239,37 @@ func isUniqueViolation(err error) bool {
 		strings.Contains(errStr, "unique constraint")
 }
 
+// PostgreSQL SQLSTATE codes for transient failures that a retry can resolve.
+const (
+	pgSerializationFailure = "40001"
+	pgDeadlockDetected     = "40P01"
+)
+
+// isTransientError reports whether err is a transient database failure that a
+// bounded retry can plausibly resolve: a serialization failure (40001), a
+// deadlock (40P01), or a connection-level error (FR-026). It is driver-agnostic
+// — SQLSTATE is read via the sqlStater interface, with an error-text fallback
+// for drivers (such as lib/pq) whose accessor has a different shape.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var s sqlStater
+	if errors.As(err, &s) {
+		switch s.SQLState() {
+		case pgSerializationFailure, pgDeadlockDetected:
+			return true
+		}
+	}
+	es := err.Error()
+	return strings.Contains(es, pgSerializationFailure) ||
+		strings.Contains(es, pgDeadlockDetected) ||
+		strings.Contains(es, "connection refused") ||
+		strings.Contains(es, "connection reset") ||
+		strings.Contains(es, "bad connection") ||
+		strings.Contains(es, "broken pipe")
+}
+
 func (pq *Queue) checkTableNameNotExists(
 	ctx context.Context,
 	tableName string,
@@ -438,8 +469,12 @@ func (pq *Queue) deleteQueueMetadata(
 
 // Replay log query methods
 
+// createReplayLog writes the replay audit row. It always runs inside the caller's
+// transaction so the audit record commits atomically with the replay itself
+// (FR-007): if the replay rolls back, the log row never appears.
 func (pq *Queue) createReplayLog(
 	ctx context.Context,
+	tx *sql.Tx,
 	queueType, queueName, replayType string,
 	replayParams []byte,
 	messageCount int,
@@ -453,7 +488,7 @@ func (pq *Queue) createReplayLog(
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`
 
-	_, err := pq.db.ExecContext(
+	_, err := tx.ExecContext(
 		ctx, query,
 		queueType, queueName, replayType,
 		replayParams, messageCount, createdBy,

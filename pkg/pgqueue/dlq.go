@@ -1,5 +1,132 @@
 package pgqueue
 
-// dlq.go is a placeholder for the dead-letter-queue inspection API
-// (ListDLQMessages / DLQStats). The full implementation is reserved for
-// Phase 8 (US6, T060); this file was created by T001.
+// dlq.go holds the dead-letter-queue inspection API: keyset-paginated listing
+// and aggregate statistics (FR-022).
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/google/uuid"
+)
+
+// defaultDLQPageSize is the page size used by ListDLQMessages when DLQPage.Limit
+// is not set to a positive value.
+const defaultDLQPageSize = 100
+
+// DLQPage is a keyset-pagination cursor for ListDLQMessages. Start with the zero
+// value; on each call pass back the DLQPage returned by the previous call to
+// fetch the next page. Keyset pagination on the UUIDv7 id column is index-
+// friendly and stable under concurrent inserts and deletes (R8).
+type DLQPage struct {
+	// AfterID returns only rows with a greater id. The zero value starts at the
+	// beginning.
+	AfterID uuid.UUID
+	// Limit caps the rows per page; <= 0 means defaultDLQPageSize.
+	Limit int
+}
+
+// ListDLQMessages returns one keyset-paginated page of dead-letter messages,
+// ordered by id, together with the cursor for the next page. When the returned
+// page has fewer rows than the requested limit, the dead-letter queue is
+// exhausted.
+func (pq *Queue) ListDLQMessages(
+	ctx context.Context,
+	name string,
+	queueType QueueType,
+	page DLQPage,
+) ([]DLQMessage, DLQPage, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, DLQPage{}, err
+	}
+
+	limit := page.Limit
+	if limit <= 0 {
+		limit = defaultDLQPageSize
+	}
+
+	tableName, err := pq.cachedTableName(ctx, string(queueType), name)
+	if err != nil {
+		return nil, DLQPage{}, fmt.Errorf("%s/%s: %w", queueType, name, err)
+	}
+
+	// A NULL after-id (the zero UUID) starts at the beginning; otherwise only
+	// rows strictly after the cursor are returned.
+	var afterID any
+	if page.AfterID != (uuid.UUID{}) {
+		afterID = page.AfterID
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		SELECT id, original_message_id, payload, failure_reason,
+		       retry_count, moved_at, metadata
+		FROM pgqueue_dlq_%s
+		WHERE ($1::uuid IS NULL OR id > $1)
+		ORDER BY id
+		LIMIT $2
+	`, tableName)
+
+	rows, err := pq.db.QueryContext(ctx, query, afterID, limit)
+	if err != nil {
+		return nil, DLQPage{}, fmt.Errorf("failed to query DLQ: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	messages := make([]DLQMessage, 0, limit)
+	for rows.Next() {
+		msg, scanErr := pq.scanDLQMessage(rows)
+		if scanErr != nil {
+			return nil, DLQPage{}, scanErr
+		}
+		messages = append(messages, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, DLQPage{}, fmt.Errorf("error iterating DLQ messages: %w", err)
+	}
+
+	next := DLQPage{Limit: limit}
+	if len(messages) > 0 {
+		next.AfterID = messages[len(messages)-1].ID
+	}
+	return messages, next, nil
+}
+
+// scanDLQMessage scans one DLQ row into a DLQMessage.
+func (pq *Queue) scanDLQMessage(rows rowScanner) (DLQMessage, error) {
+	var (
+		msg          DLQMessage
+		metadataJSON sql.NullString
+	)
+	if err := rows.Scan(
+		&msg.ID, &msg.OriginalMessageID, &msg.Payload,
+		&msg.FailureReason, &msg.RetryCount, &msg.MovedAt, &metadataJSON,
+	); err != nil {
+		return DLQMessage{}, fmt.Errorf("failed to scan DLQ message: %w", err)
+	}
+	msg.Metadata = pq.parseMetadataJSON(metadataJSON)
+	return msg, nil
+}
+
+// rowScanner is the subset of *sql.Rows / *sql.Row used by scanDLQMessage.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// DLQStats returns aggregate statistics for a queue's dead-letter queue
+// (FR-022). It is the redesigned-API name for GetDLQStats.
+func (pq *Queue) DLQStats(
+	ctx context.Context,
+	name string,
+	queueType QueueType,
+) (DLQStats, error) {
+	if err := pq.checkClosed(); err != nil {
+		return DLQStats{}, err
+	}
+	stats, err := pq.GetDLQStats(ctx, name, queueType)
+	if err != nil {
+		return DLQStats{}, err
+	}
+	return *stats, nil
+}

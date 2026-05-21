@@ -80,6 +80,14 @@ func setupTestDB(t *testing.T) (*pgqueue.Queue, *sql.DB, func()) {
 	pq, err := pgqueue.New(ctx, db,
 		pgqueue.WithMaxMessageSize(testMaxMessageSize),
 		pgqueue.WithDefaultMaxRetries(testDefaultMaxRetries),
+		// A negligible retry backoff so tests that nack and immediately
+		// re-consume see the message right away. Tests that exercise the
+		// backoff timing itself (backoff_test.go) build their own Queue.
+		pgqueue.WithBackoffPolicy(pgqueue.BackoffPolicy{
+			BaseDelay:  time.Nanosecond,
+			MaxDelay:   time.Nanosecond,
+			Multiplier: 1,
+		}),
 	)
 	if err != nil {
 		t.Fatalf("failed to init pgqueue: %v", err)
