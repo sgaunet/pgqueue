@@ -168,7 +168,16 @@ func (pq *Queue) AckTopic(
 		  AND status = '%s'
 	`, pq.subTable(queueMeta.TableName), MessageStatusAcked, MessageStatusProcessing)
 
-	result, err := pq.db.ExecContext(ctx, query, r.MessageID, subscriberID, r.ClaimID)
+	// Run the UPDATE and, on a miss, the classifying SELECT in one transaction
+	// so the classification observes the same snapshot as the failed UPDATE — a
+	// concurrent reclaim cannot slip in between and flip the error type (R-09).
+	tx, err := pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, query, r.MessageID, subscriberID, r.ClaimID)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge message: %w", err)
 	}
@@ -178,7 +187,11 @@ func (pq *Queue) AckTopic(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return classifyTopicAckMiss(ctx, pq.db, pq.subTable(queueMeta.TableName), subscriberID, r)
+		return classifyTopicAckMiss(ctx, tx, pq.subTable(queueMeta.TableName), subscriberID, r)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil

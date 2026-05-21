@@ -617,10 +617,23 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 
 	ackCtx := context.WithoutCancel(ctx)
 	if herr != nil {
-		_ = pq.Nack(ackCtx, receipt, herr.Error())
+		if err := pq.Nack(ackCtx, receipt, herr.Error()); err != nil && !errors.Is(err, ErrClaimExpired) {
+			pq.logError("failed to nack message after handler error",
+				"queue", receipt.QueueName,
+				"message_id", msg.ID.String(),
+				"error", err)
+		}
 		return
 	}
-	_ = pq.Ack(ackCtx, receipt)
+	// A failed ack is logged but not fatal: the message simply redelivers, which
+	// at-least-once tolerates. ErrClaimExpired is the expected outcome when the
+	// handler outran the visibility timeout, so it is not logged as an error.
+	if err := pq.Ack(ackCtx, receipt); err != nil && !errors.Is(err, ErrClaimExpired) {
+		pq.logError("failed to ack message after successful handler",
+			"queue", receipt.QueueName,
+			"message_id", msg.ID.String(),
+			"error", err)
+	}
 }
 
 // errHandlerPanic is the static base error for a recovered handler panic; the

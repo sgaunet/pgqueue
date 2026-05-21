@@ -16,6 +16,7 @@ type Option func(*queueConfig)
 type queueConfig struct {
 	maxMessageSize    int
 	defaultMaxRetries int
+	maxRetriesSet     bool // true when WithDefaultMaxRetries was supplied
 	defaultTTL        time.Duration
 	maxQueues         int
 	schemaName        string
@@ -38,14 +39,22 @@ func WithMaxMessageSize(bytes int) Option {
 
 // WithDefaultMaxRetries sets the default number of delivery attempts before a
 // message is moved to the dead-letter queue. The default is 3.
+//
+// An explicit zero is honored: WithDefaultMaxRetries(0) means a message is
+// dead-lettered on its first failed delivery rather than retried.
 func WithDefaultMaxRetries(n int) Option {
 	return func(c *queueConfig) {
 		c.defaultMaxRetries = n
+		c.maxRetriesSet = true
 	}
 }
 
 // WithDefaultTTL sets the default time-to-live for messages. A zero value
 // means messages never expire.
+//
+// TTL only hides expired messages from consumers; it does not delete them. To
+// reclaim storage, configure a RetentionPolicy (MaxPendingAge) on a
+// GarbageCollector.
 func WithDefaultTTL(d time.Duration) Option {
 	return func(c *queueConfig) {
 		c.defaultTTL = d
@@ -141,7 +150,9 @@ func applyConfigOptions(opts []Option) queueConfig {
 	if c.maxMessageSize == 0 {
 		c.maxMessageSize = defaultMaxMessageSize
 	}
-	if c.defaultMaxRetries == 0 {
+	// Apply the default of 3 only when WithDefaultMaxRetries was not supplied,
+	// so an explicit WithDefaultMaxRetries(0) is honored as "no retries".
+	if !c.maxRetriesSet {
 		c.defaultMaxRetries = 3
 	}
 	if c.schemaName == "" {
@@ -159,9 +170,15 @@ func applyConfigOptions(opts []Option) queueConfig {
 func configFromLegacy(cfg Config) []Option {
 	opts := []Option{
 		WithMaxMessageSize(cfg.MaxMessageSize),
-		WithDefaultMaxRetries(cfg.DefaultMaxRetries),
 		WithDefaultTTL(cfg.DefaultTTL),
 		WithMaxQueues(cfg.MaxQueues),
+	}
+	// The legacy Config keeps its documented "0 = use default" semantics: only
+	// forward a positive value. WithDefaultMaxRetries(0) — which now means "no
+	// retries" — is reachable solely via the functional-options API. Negative
+	// values are already rejected by validateConfig before this is reached.
+	if cfg.DefaultMaxRetries > 0 {
+		opts = append(opts, WithDefaultMaxRetries(cfg.DefaultMaxRetries))
 	}
 	if cfg.Logger != nil {
 		opts = append(opts, WithLogger(cfg.Logger))

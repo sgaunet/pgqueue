@@ -161,19 +161,31 @@ func (pq *Queue) validatePayloadSize(
 	return nil
 }
 
+// resolveMaxRetries resolves the effective max-retry count for a queue from its
+// stored config, falling back to the Queue-wide default.
+//
+// The resolution is backward compatible. New queues record MaxRetriesSet, so an
+// explicit MaxRetries of 0 ("dead-letter on first failure") is honored. Queues
+// created before MaxRetriesSet existed have no flag: there, a positive
+// MaxRetries was an explicit cap and a zero MaxRetries meant "use the default"
+// — an explicit 0 was not expressible, so nothing regresses.
 func (pq *Queue) resolveMaxRetries(
 	queueMeta *QueueMetadata,
 ) int {
-	var channelOpts struct {
-		MaxRetries int `json:"MaxRetries"`
+	var opts struct {
+		MaxRetries    int  `json:"MaxRetries"`
+		MaxRetriesSet bool `json:"MaxRetriesSet"`
 	}
-	maxRetries := pq.config.DefaultMaxRetries
-	if err := json.Unmarshal(queueMeta.Config, &channelOpts); err == nil &&
-		channelOpts.MaxRetries > 0 {
-		maxRetries = channelOpts.MaxRetries
+	if err := json.Unmarshal(queueMeta.Config, &opts); err == nil {
+		if opts.MaxRetriesSet {
+			return opts.MaxRetries
+		}
+		if opts.MaxRetries > 0 {
+			return opts.MaxRetries
+		}
 	}
 
-	return maxRetries
+	return pq.config.DefaultMaxRetries
 }
 
 // publishToPubSub publishes a message to a pub/sub topic.

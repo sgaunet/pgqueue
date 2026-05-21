@@ -31,6 +31,10 @@ type GarbageCollector struct {
 }
 
 // NewGarbageCollector creates a new garbage collector instance.
+//
+// The GC back-registers on the Queue so Queue.Close stops it automatically. A
+// GC created after the Queue is already closed is inert: it is not registered
+// and Start is a no-op.
 func NewGarbageCollector(
 	pq *Queue,
 	config GarbageCollectorConfig,
@@ -69,6 +73,11 @@ func NewGarbageCollector(
 func (gc *GarbageCollector) Start(ctx context.Context) {
 	gc.mu.Lock()
 	defer gc.mu.Unlock()
+	// Refuse to start once the owning Queue is closed: Close has already joined
+	// its background goroutines, so a loop started now would never be stopped.
+	if gc.pq.closed.Load() {
+		return
+	}
 	if !gc.started.CompareAndSwap(false, true) {
 		return
 	}
@@ -303,7 +312,7 @@ func (gc *GarbageCollector) promoteExhaustedChannelMessages(
 		WHERE status = '%s'
 		  AND visibility_timeout IS NOT NULL
 		  AND visibility_timeout < NOW()
-		  AND retry_count >= COALESCE(NULLIF(max_retries, 0), $1)
+		  AND retry_count >= COALESCE(max_retries, $1)
 		ORDER BY id
 		LIMIT %d
 		FOR UPDATE SKIP LOCKED
@@ -496,6 +505,11 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 ) error {
 	var query string
 	if queueType == QueueTypePubSub {
+		// A message still referenced by a DLQ row is kept so the DLQ entry stays
+		// replayable — pub/sub DLQ replay re-creates subscription rows that
+		// foreign-key the message (FR-027). Without this guard a message whose
+		// only non-acked subscriber was dead-lettered would be purged here,
+		// silently orphaning its DLQ entry.
 		query = fmt.Sprintf(`
 			DELETE FROM %s m
 			WHERE m.created_at < NOW() - make_interval(secs => $1)
@@ -503,7 +517,11 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 				SELECT 1 FROM %s s
 				WHERE s.message_id = m.id AND s.status != '%s'
 			)
-		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusAcked)
+			AND NOT EXISTS (
+				SELECT 1 FROM %s d WHERE d.original_message_id = m.id
+			)
+		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusAcked,
+			gc.pq.dlqTable(tableName))
 	} else {
 		query = fmt.Sprintf(`
 			DELETE FROM %s
@@ -538,6 +556,8 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 ) error {
 	var query string
 	if queueType == QueueTypePubSub {
+		// Keep messages still referenced by a DLQ row so the DLQ entry stays
+		// replayable (FR-027) — see purgeCompletedMessages.
 		query = fmt.Sprintf(`
 			DELETE FROM %s m
 			WHERE m.created_at < NOW() - make_interval(secs => $1)
@@ -545,7 +565,11 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 				SELECT 1 FROM %s s
 				WHERE s.message_id = m.id AND s.status = '%s'
 			)
-		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusPending)
+			AND NOT EXISTS (
+				SELECT 1 FROM %s d WHERE d.original_message_id = m.id
+			)
+		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusPending,
+			gc.pq.dlqTable(tableName))
 	} else {
 		query = fmt.Sprintf(`
 			DELETE FROM %s
@@ -593,11 +617,13 @@ func (gc *GarbageCollector) purgeDLQMessages(
 }
 
 // resetTimedOutMessages resets messages with expired visibility timeouts back to
-// pending. The GC intentionally does NOT increment retry_count: the consume-path
-// reclaim (fetchPendingChannelMessage / reclaimChannelAttempt) is the sole place
-// that increments retry_count. The GC only flips status→pending, clears claim_id
-// and visibility_timeout so the message becomes available again. FOR UPDATE SKIP
-// LOCKED prevents racing with a consumer that is mid-reclaim on the same row.
+// pending and counts the timeout as one delivery attempt (retry_count + 1), so
+// the visibility-timeout reclaim counts toward max_retries whether it is the GC
+// or the consume-path reclaim (fetchPendingChannelMessage / reclaimChannelAttempt)
+// that handles a given row. Each timed-out row is claimed by exactly one of the
+// two (FOR UPDATE SKIP LOCKED plus the status transition), so the increment is
+// applied exactly once. A row reset here becomes immediately available rather
+// than backoff-delayed; that window is bounded by the multi-minute GC interval.
 func (gc *GarbageCollector) resetTimedOutMessages(
 	ctx context.Context,
 	tableName string,
@@ -608,7 +634,8 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
-		    visibility_timeout = NULL
+		    visibility_timeout = NULL,
+		    retry_count = retry_count + 1
 		WHERE id IN (
 			SELECT id FROM %s
 			WHERE status = '%s'
@@ -632,9 +659,9 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 }
 
 // resetTimedOutSubscriptions resets subscriptions with expired visibility
-// timeouts back to pending. Like resetTimedOutMessages, the GC does NOT
-// increment retry_count — the consume-path reclaim is the sole incrementer.
-// FOR UPDATE SKIP LOCKED prevents racing with a concurrent consumer.
+// timeouts back to pending and counts the timeout as one delivery attempt
+// (retry_count + 1) — see resetTimedOutMessages for why the increment is applied
+// exactly once. FOR UPDATE SKIP LOCKED prevents racing with a concurrent consumer.
 func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	ctx context.Context,
 	tableName string,
@@ -645,7 +672,8 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 		UPDATE %s
 		SET status = '%s',
 		    claim_id = NULL,
-		    visibility_timeout = NULL
+		    visibility_timeout = NULL,
+		    retry_count = retry_count + 1
 		WHERE id IN (
 			SELECT id FROM %s
 			WHERE status = '%s'

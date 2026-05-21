@@ -150,3 +150,119 @@ func TestReplayDLQLargeBacklogPaged(t *testing.T) {
 		t.Fatalf("expected %d reinstated messages, got %d", backlog, msgCount)
 	}
 }
+
+// TestQueueMaxRetriesZeroChannel verifies that a channel created with
+// WithQueueMaxRetries(0) dead-letters a message on its first failed delivery
+// rather than retrying it.
+func TestQueueMaxRetriesZeroChannel(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "zero-retry-channel"
+	if err := pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(0)); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := pq.PublishChannel(ctx, channelName, []byte("fail-me")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	msg, err := pq.ReceiveChannel(ctx, channelName)
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+	if err := pq.Nack(ctx, msg.Receipt(), "boom"); err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	dlq, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("DLQ stats: %v", err)
+	}
+	if dlq.TotalCount != 1 {
+		t.Errorf("expected message dead-lettered on first nack, got DLQ TotalCount=%d", dlq.TotalCount)
+	}
+	if _, err := pq.ReceiveChannel(ctx, channelName); !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Errorf("expected channel empty (no retry), got err=%v", err)
+	}
+}
+
+// TestQueueMaxRetriesZeroTopic is the pub/sub counterpart of
+// TestQueueMaxRetriesZeroChannel.
+func TestQueueMaxRetriesZeroTopic(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const topicName = "zero-retry-topic"
+	const subID = "sub-1"
+	if err := pq.CreateTopic(ctx, topicName, pgqueue.WithQueueMaxRetries(0)); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicName, subID); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if _, err := pq.PublishTopic(ctx, topicName, []byte("fail-me")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	msg, err := pq.ReceiveTopic(ctx, topicName, subID)
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+	if err := pq.Nack(ctx, msg.Receipt(), "boom"); err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	dlq, err := pq.GetDLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
+	if err != nil {
+		t.Fatalf("DLQ stats: %v", err)
+	}
+	if dlq.TotalCount != 1 {
+		t.Errorf("expected message dead-lettered on first nack, got DLQ TotalCount=%d", dlq.TotalCount)
+	}
+	if _, err := pq.ReceiveTopic(ctx, topicName, subID); !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Errorf("expected subscription empty (no retry), got err=%v", err)
+	}
+}
+
+// TestDefaultMaxRetriesZero verifies that WithDefaultMaxRetries(0) makes a
+// channel with no per-queue override dead-letter on the first failed delivery.
+func TestDefaultMaxRetriesZero(t *testing.T) {
+	db, containerCleanup := setupTestContainer(t)
+	defer containerCleanup()
+
+	ctx := context.Background()
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+	pq, err := pgqueue.New(ctx, db, pgqueue.WithDefaultMaxRetries(0))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer func() { _ = pq.Close() }()
+
+	const channelName = "zero-default-channel"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := pq.PublishChannel(ctx, channelName, []byte("fail-me")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	msg, err := pq.ReceiveChannel(ctx, channelName)
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+	if err := pq.Nack(ctx, msg.Receipt(), "boom"); err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	dlq, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("DLQ stats: %v", err)
+	}
+	if dlq.TotalCount != 1 {
+		t.Errorf("expected message dead-lettered on first nack with default 0, got %d", dlq.TotalCount)
+	}
+}

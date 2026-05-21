@@ -798,23 +798,21 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 	}
 }
 
-// TestT019_GCReclaimDoesNotDoubleIncrementRetryCount verifies that the GC does NOT
-// increment retry_count when resetting a timed-out message. Only the consume-path
-// reclaim (which picks up a message still in 'processing' state) increments retry_count.
+// TestT019_GCReclaimCountsVisibilityTimeoutOnce verifies that a visibility
+// timeout reclaimed by the garbage collector is counted as exactly one delivery
+// attempt: the GC reset increments retry_count by one (so the timeout counts
+// toward max_retries), and the subsequent pending-state consume does not add a
+// second increment for the same timeout.
 //
 // Sequence: consume → timeout → GC reset → consume again.
-//
-// Before fix (GC increments): GC sets retry_count=1, second consume delivers retry_count=1.
-// After fix (GC does NOT increment): GC leaves retry_count=0, second consume picks up
-// status=pending (not processing) so no reclaim-increment; delivers retry_count=0.
-func TestT019_GCReclaimDoesNotDoubleIncrementRetryCount(t *testing.T) {
+func TestT019_GCReclaimCountsVisibilityTimeoutOnce(t *testing.T) {
 	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	const queueName = "t019-gc-double-retry"
-	// maxRetries=5 gives plenty of headroom so we stay far from DLQ
+	const queueName = "t019-gc-retry-count"
+	// maxRetries=5 gives plenty of headroom so we stay far from DLQ.
 	if err := pq.CreateChannel(ctx, queueName, pgqueue.WithQueueMaxRetries(5)); err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -823,36 +821,34 @@ func TestT019_GCReclaimDoesNotDoubleIncrementRetryCount(t *testing.T) {
 		t.Fatalf("failed to publish: %v", err)
 	}
 
-	// Consume with a very short visibility timeout so it expires quickly
-	_, err := pq.ConsumeFromChannel(ctx, queueName, 1*time.Millisecond)
-	if err != nil {
+	// Consume with a very short visibility timeout so it expires quickly.
+	if _, err := pq.ConsumeFromChannel(ctx, queueName, 1*time.Millisecond); err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
 
-	// Wait for the visibility timeout to expire
+	// Wait for the visibility timeout to expire.
 	time.Sleep(50 * time.Millisecond)
 
-	// Run GC: this should reset the message to pending WITHOUT incrementing retry_count.
-	// The GC must only flip status→pending and clear claim_id/visibility_timeout.
+	// Run GC: it resets the timed-out message to pending and counts the timeout
+	// as one delivery attempt (retry_count 0 -> 1).
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("GC collect failed: %v", err)
 	}
 
-	// Verify the GC left retry_count at 0 in the database
+	// The GC reset must have counted the timeout exactly once.
 	var dbRetryCountAfterGC int
-	err = db.QueryRowContext(ctx,
-		"SELECT retry_count FROM pgqueue_msg_t019_gc_double_retry LIMIT 1",
-	).Scan(&dbRetryCountAfterGC)
-	if err != nil {
+	if err := db.QueryRowContext(ctx,
+		"SELECT retry_count FROM pgqueue_msg_t019_gc_retry_count LIMIT 1",
+	).Scan(&dbRetryCountAfterGC); err != nil {
 		t.Fatalf("failed to query retry_count after GC: %v", err)
 	}
-	if dbRetryCountAfterGC != 0 {
-		t.Errorf("GC must not increment retry_count: got %d after GC, want 0", dbRetryCountAfterGC)
+	if dbRetryCountAfterGC != 1 {
+		t.Errorf("GC must count the timeout once: got retry_count=%d after GC, want 1", dbRetryCountAfterGC)
 	}
 
-	// Now consume again: message is in pending state so no reclaim-path increment.
-	// The delivered message should have retry_count=0.
+	// Re-consume: the message is pending, so the consume path must not add a
+	// second increment for the same timeout (no double-counting).
 	msg2, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
 	if err != nil {
 		t.Fatalf("failed to re-consume: %v", err)
@@ -860,10 +856,8 @@ func TestT019_GCReclaimDoesNotDoubleIncrementRetryCount(t *testing.T) {
 	if msg2 == nil {
 		t.Fatal("expected message after GC reset, got nil")
 	}
-
-	// retry_count must be 0: GC didn't increment, pending-path consume doesn't increment.
-	if msg2.RetryCount != 0 {
-		t.Errorf("expected retry_count=0 (GC does not increment), got %d", msg2.RetryCount)
+	if msg2.RetryCount != 1 {
+		t.Errorf("timeout double-counted: expected retry_count=1, got %d", msg2.RetryCount)
 	}
 }
 
@@ -939,5 +933,149 @@ func TestExhaustedTimedOutMessagesPromotedByGCNotConsume(t *testing.T) {
 	}
 	if dlqAfter.TotalCount != numMessages {
 		t.Errorf("expected %d messages in DLQ after GC, got %d", numMessages, dlqAfter.TotalCount)
+	}
+}
+
+// TestGCCountsVisibilityTimeoutTowardDLQ verifies that visibility timeouts the
+// GC reclaims count toward max_retries: a message that is repeatedly claimed
+// and never acked, with a GC pass between each timeout, reaches the DLQ once it
+// has exhausted its retry budget. Without the GC counting timeouts, retry_count
+// would stay at 0 and the message would be redelivered forever.
+func TestGCCountsVisibilityTimeoutTowardDLQ(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const channelName = "gc-timeout-to-dlq"
+	if err := pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(2)); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := pq.Publish(ctx, channelName, []byte("never-acked")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+
+	// maxRetries=2 means the message tolerates retry_count 0 and 1; a third
+	// timed-out reclaim (retry_count would reach 2) promotes it to the DLQ.
+	for attempt := range 3 {
+		msg, err := pq.ConsumeFromChannel(ctx, channelName, 1*time.Millisecond)
+		if err != nil {
+			t.Fatalf("attempt %d consume: %v", attempt, err)
+		}
+		if msg == nil {
+			t.Fatalf("attempt %d: message not redelivered (lost before reaching DLQ)", attempt)
+		}
+		// Never ack: let the visibility timeout lapse, then GC reclaims it.
+		time.Sleep(30 * time.Millisecond)
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("attempt %d GC collect: %v", attempt, err)
+		}
+	}
+
+	dlq, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("DLQ stats: %v", err)
+	}
+	if dlq.TotalCount != 1 {
+		t.Errorf("expected the exhausted message in the DLQ, got TotalCount=%d", dlq.TotalCount)
+	}
+	if _, err := pq.ReceiveChannel(ctx, channelName); !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Errorf("expected channel empty after DLQ promotion, got err=%v", err)
+	}
+}
+
+// TestGCKeepsDLQReferencedPubSubMessage verifies that purgeCompletedMessages
+// does not delete a pub/sub message that is still referenced by a DLQ row
+// (FR-027). One subscriber acks the message and another is dead-lettered; the
+// completed-message GC pass must keep the message row so the DLQ entry stays
+// replayable.
+func TestGCKeepsDLQReferencedPubSubMessage(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const topicName = "gc-dlq-ref-topic"
+	// MaxRetries=0 so the failing subscriber is dead-lettered on its first nack.
+	if err := pq.CreateTopic(ctx, topicName, pgqueue.WithQueueMaxRetries(0)); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicName, "sub-ok"); err != nil {
+		t.Fatalf("subscribe sub-ok: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicName, "sub-fail"); err != nil {
+		t.Fatalf("subscribe sub-fail: %v", err)
+	}
+	if _, err := pq.Publish(ctx, topicName, []byte("fan-out")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// sub-ok acks the message.
+	okMsg, err := pq.ConsumeFromTopic(ctx, topicName, "sub-ok", 30*time.Second)
+	if err != nil || okMsg == nil {
+		t.Fatalf("sub-ok consume: msg=%v err=%v", okMsg, err)
+	}
+	if err := pq.AckTopic(ctx, topicName, "sub-ok", okMsg.Receipt()); err != nil {
+		t.Fatalf("sub-ok ack: %v", err)
+	}
+
+	// sub-fail nacks the message; with MaxRetries=0 it goes straight to the DLQ.
+	failMsg, err := pq.ConsumeFromTopic(ctx, topicName, "sub-fail", 30*time.Second)
+	if err != nil || failMsg == nil {
+		t.Fatalf("sub-fail consume: msg=%v err=%v", failMsg, err)
+	}
+	if err := pq.NackTopic(ctx, topicName, "sub-fail", failMsg.Receipt(), "boom"); err != nil {
+		t.Fatalf("sub-fail nack: %v", err)
+	}
+
+	// Run the completed-message GC pass: every remaining subscription is acked,
+	// so without the FR-027 guard the message row would be purged here.
+	time.Sleep(20 * time.Millisecond)
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{CompletedMessageTTL: 1 * time.Millisecond},
+	})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("GC collect: %v", err)
+	}
+
+	// The DLQ entry must still be replayable: replay re-creates sub-fail's
+	// subscription row, which foreign-keys the message row that survived GC.
+	res, err := pq.ReplayDLQ(ctx, topicName, pgqueue.QueueTypePubSub,
+		pgqueue.ReplayOptions{Confirm: true})
+	if err != nil {
+		t.Fatalf("replay DLQ: %v", err)
+	}
+	if res.Replayed != 1 {
+		t.Errorf("expected 1 DLQ message replayed (message row kept), got Replayed=%d Skipped=%d",
+			res.Replayed, res.Skipped)
+	}
+}
+
+// TestGarbageCollectorInertAfterClose verifies that a GarbageCollector created
+// after the owning Queue is closed does not start a background loop: Start is a
+// no-op and the create/start/stop sequence completes without panicking.
+func TestGarbageCollectorInertAfterClose(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := pq.Close(); err != nil {
+		t.Fatalf("close queue: %v", err)
+	}
+
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc.Start(ctx) // must be a no-op on a closed Queue
+
+	done := make(chan struct{})
+	go func() {
+		gc.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GC Stop hung: Start spawned a loop on a closed Queue")
 	}
 }

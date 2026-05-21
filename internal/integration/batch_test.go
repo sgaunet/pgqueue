@@ -674,3 +674,115 @@ func TestNackChannelBatchNoneProcessing(t *testing.T) {
 		t.Errorf("expected ErrMessageNotFound, got: %v", err)
 	}
 }
+
+// newBackoffQueue builds a Queue with a fast but observable backoff policy
+// (every retry waits 800ms–1s) for the batch-nack backoff tests.
+func newBackoffQueue(t *testing.T) (*pgqueue.Queue, func()) {
+	t.Helper()
+	ctx := context.Background()
+	db, containerCleanup := setupTestContainer(t)
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+	pq, err := pgqueue.New(ctx, db, pgqueue.WithBackoffPolicy(pgqueue.BackoffPolicy{
+		BaseDelay:  800 * time.Millisecond,
+		MaxDelay:   1 * time.Second,
+		Multiplier: 1,
+	}))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	return pq, func() {
+		_ = pq.Close()
+		containerCleanup()
+	}
+}
+
+// TestNackChannelBatchAppliesBackoff verifies that a batch nack honors the
+// queue's BackoffPolicy: the retried messages are not redelivered until the
+// backoff delay has elapsed, exactly as a single Nack would behave (FR-023).
+func TestNackChannelBatchAppliesBackoff(t *testing.T) {
+	pq, cleanup := newBackoffQueue(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "batch-backoff-channel"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := pq.PublishChannelBatch(ctx, channelName, []pgqueue.PublishMessage{
+		{Payload: []byte("b1")},
+		{Payload: []byte("b2")},
+	}); err != nil {
+		t.Fatalf("publish batch: %v", err)
+	}
+
+	receipts := make([]pgqueue.Receipt, 0, 2)
+	for range 2 {
+		msg, err := pq.ReceiveChannel(ctx, channelName)
+		if err != nil {
+			t.Fatalf("receive: %v", err)
+		}
+		receipts = append(receipts, msg.Receipt())
+	}
+	if err := pq.NackChannelBatch(ctx, channelName, receipts, "transient failure"); err != nil {
+		t.Fatalf("nack batch: %v", err)
+	}
+
+	// Immediately after the batch nack the messages must NOT be redelivered.
+	if _, err := pq.ReceiveChannel(ctx, channelName); !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Fatalf("batch-nacked message redelivered before backoff elapsed: err=%v", err)
+	}
+
+	// After the backoff window they become available again.
+	time.Sleep(1300 * time.Millisecond)
+	if _, err := pq.ReceiveChannel(ctx, channelName); err != nil {
+		t.Fatalf("message not redelivered after backoff: %v", err)
+	}
+}
+
+// TestNackTopicBatchAppliesBackoff is the pub/sub counterpart of
+// TestNackChannelBatchAppliesBackoff.
+func TestNackTopicBatchAppliesBackoff(t *testing.T) {
+	pq, cleanup := newBackoffQueue(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const topicName = "batch-backoff-topic"
+	const subID = "sub-1"
+	if err := pq.CreateTopic(ctx, topicName); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicName, subID); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if _, err := pq.PublishTopicBatch(ctx, topicName, []pgqueue.PublishMessage{
+		{Payload: []byte("t1")},
+		{Payload: []byte("t2")},
+	}); err != nil {
+		t.Fatalf("publish batch: %v", err)
+	}
+
+	receipts := make([]pgqueue.Receipt, 0, 2)
+	for range 2 {
+		msg, err := pq.ReceiveTopic(ctx, topicName, subID)
+		if err != nil {
+			t.Fatalf("receive: %v", err)
+		}
+		receipts = append(receipts, msg.Receipt())
+	}
+	if err := pq.NackTopicBatch(ctx, topicName, subID, receipts, "transient failure"); err != nil {
+		t.Fatalf("nack batch: %v", err)
+	}
+
+	// Immediately after the batch nack the messages must NOT be redelivered.
+	if _, err := pq.ReceiveTopic(ctx, topicName, subID); !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Fatalf("batch-nacked subscription redelivered before backoff elapsed: err=%v", err)
+	}
+
+	// After the backoff window they become available again.
+	time.Sleep(1300 * time.Millisecond)
+	if _, err := pq.ReceiveTopic(ctx, topicName, subID); err != nil {
+		t.Fatalf("message not redelivered after backoff: %v", err)
+	}
+}

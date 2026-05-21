@@ -144,11 +144,7 @@ func InitSchema(ctx context.Context, db *sql.DB, opts ...Option) error {
 	// silently ignoring it, so a caller is not misled into believing an
 	// inapplicable option (WithMaxQueues, WithBackoffPolicy, …) took effect
 	// (R-14).
-	probe := queueConfig{}
-	for _, o := range opts {
-		o(&probe)
-	}
-	if probe != (queueConfig{schemaName: probe.schemaName}) {
+	if !onlySchemaOption(opts) {
 		return fmt.Errorf(
 			"InitSchema accepts only WithSchema: %w", ErrInvalidConfig,
 		)
@@ -159,11 +155,52 @@ func InitSchema(ctx context.Context, db *sql.DB, opts ...Option) error {
 		return err
 	}
 
+	// Verify the server is reachable and runs a supported PostgreSQL version
+	// before running DDL, so an unsupported version fails with a clear
+	// ErrUnsupportedPGVersion rather than an opaque "uuidv7() does not exist".
+	if err := checkDBReady(ctx, db); err != nil {
+		return err
+	}
+
 	if err := runMigrations(ctx, db, cfg.schemaName); err != nil {
 		return fmt.Errorf("failed to initialize base schema: %w", err)
 	}
 
 	return nil
+}
+
+// onlySchemaOption reports whether opts carries nothing beyond WithSchema.
+// InitSchema uses it to reject inapplicable options. The probe is inspected
+// field-by-field rather than with a struct comparison: queueConfig carries
+// interface fields (logger, tracer, metrics, listener) whose dynamic type may
+// not be comparable, which would make a struct == panic instead of returning a
+// clean ErrInvalidConfig.
+func onlySchemaOption(opts []Option) bool {
+	probe := queueConfig{}
+	for _, o := range opts {
+		o(&probe)
+	}
+	// Each element is true when a non-WithSchema option set the corresponding
+	// field. The interface fields are tested with != nil, which never panics.
+	nonSchema := []bool{
+		probe.maxMessageSize != 0,
+		probe.defaultMaxRetries != 0,
+		probe.maxRetriesSet,
+		probe.defaultTTL != 0,
+		probe.maxQueues != 0,
+		probe.safetyNetPoll != 0,
+		probe.backoffConfigured,
+		probe.logger != nil,
+		probe.tracer != nil,
+		probe.metrics != nil,
+		probe.listener != nil,
+	}
+	for _, set := range nonSchema {
+		if set {
+			return false
+		}
+	}
+	return true
 }
 
 // minPGVersionNum is PostgreSQL 18 in server_version_num form, the lowest
@@ -332,6 +369,7 @@ func (pq *Queue) CreateChannel(
 		MaxMessageSize: o.maxMessageSize,
 		TTL:            o.ttl,
 		MaxRetries:     o.maxRetries,
+		MaxRetriesSet:  o.maxRetriesSet,
 	}
 	return pq.createQueue(ctx, QueueTypeChannel, name, co)
 }
@@ -352,6 +390,7 @@ func (pq *Queue) CreateTopic(
 		MaxMessageSize: o.maxMessageSize,
 		TTL:            o.ttl,
 		MaxRetries:     o.maxRetries,
+		MaxRetriesSet:  o.maxRetriesSet,
 	}
 	return pq.createQueue(ctx, QueueTypePubSub, name, to)
 }
@@ -516,9 +555,17 @@ func (pq *Queue) checkClosed() error {
 
 // registerGC records a GarbageCollector on the Queue so Close can stop it.
 // NewGarbageCollector calls this; supporting multiple GCs is defensive.
+//
+// When the Queue is already closed the GC is not recorded — Close has already
+// snapshotted the GC list, so a GC added now would never be stopped by it.
+// GarbageCollector.Start independently refuses to start on a closed Queue, so a
+// GC created after Close is inert rather than a leaked goroutine.
 func (pq *Queue) registerGC(gc *GarbageCollector) {
 	pq.gcMu.Lock()
 	defer pq.gcMu.Unlock()
+	if pq.closed.Load() {
+		return
+	}
 	pq.gcs = append(pq.gcs, gc)
 }
 

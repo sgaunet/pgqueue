@@ -936,7 +936,11 @@ func (pq *Queue) reinsertDLQPubSub(
 		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
 	}
 
-	return len(records), nil
+	// Report the number of DLQ rows actually replayed (and deleted), not the
+	// number of subscription records created — a legacy NULL-subscriber row
+	// fans out to many records, which would otherwise inflate the count past
+	// the page's fetched total and yield a negative Skipped.
+	return len(replayedIDs), nil
 }
 
 // filterExistingMessages returns the subset of DLQ rows whose original message

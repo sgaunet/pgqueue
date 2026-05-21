@@ -176,3 +176,73 @@ func TestAckMissClassificationStable(t *testing.T) {
 		t.Errorf("ack-miss classification flapped across runs: %v", classifications)
 	}
 }
+
+// TestAckTopicMissClassificationStable is the pub/sub counterpart of
+// TestAckMissClassificationStable. AckTopic runs its UPDATE and the classifying
+// SELECT in one transaction (R-09), so a concurrent reclaim cannot flip the
+// classified error type between the two statements.
+func TestAckTopicMissClassificationStable(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const topicName = "ack-miss-classify-topic"
+	const subID = "sub-1"
+	if err := pq.CreateTopic(ctx, topicName); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicName, subID); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	const runs = 20
+	classifications := make(map[string]int)
+
+	for i := range runs {
+		if _, err := pq.Publish(ctx, topicName, []byte("payload")); err != nil {
+			t.Fatalf("run %d: publish: %v", i, err)
+		}
+		msg, err := pq.ConsumeFromTopic(ctx, topicName, subID, 30*time.Second)
+		if err != nil || msg == nil {
+			t.Fatalf("run %d: consume: msg=%v err=%v", i, msg, err)
+		}
+		// First ack succeeds.
+		if err := pq.AckTopic(ctx, topicName, subID, msg.Receipt()); err != nil {
+			t.Fatalf("run %d: first ack: %v", i, err)
+		}
+
+		// Race a stale re-ack against a reclaim attempt on the acked message.
+		var (
+			wg       sync.WaitGroup
+			staleErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			staleErr = pq.AckTopic(ctx, topicName, subID, msg.Receipt())
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = pq.ConsumeFromTopic(ctx, topicName, subID, 30*time.Second)
+		}()
+		wg.Wait()
+
+		if staleErr == nil {
+			t.Fatalf("run %d: stale re-ack unexpectedly succeeded", i)
+		}
+		switch {
+		case errors.Is(staleErr, pgqueue.ErrMessageAlreadyAcked):
+			classifications["already-acked"]++
+		case errors.Is(staleErr, pgqueue.ErrClaimExpired):
+			classifications["claim-expired"]++
+		case errors.Is(staleErr, pgqueue.ErrMessageNotFound):
+			classifications["not-found"]++
+		default:
+			t.Fatalf("run %d: stale ack returned an unclassified error: %v", i, staleErr)
+		}
+	}
+
+	if len(classifications) != 1 {
+		t.Errorf("ack-miss classification flapped across runs: %v", classifications)
+	}
+}

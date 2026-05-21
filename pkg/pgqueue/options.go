@@ -15,18 +15,26 @@ type queueCreateOpts struct {
 	maxMessageSize int
 	ttl            time.Duration
 	maxRetries     int
+	maxRetriesSet  bool // true when WithQueueMaxRetries was supplied
 }
 
 // WithQueueMaxRetries overrides the default maximum retry count for a specific
 // channel or topic.
+//
+// An explicit zero is honored: WithQueueMaxRetries(0) dead-letters a message on
+// its first failed delivery instead of retrying it.
 func WithQueueMaxRetries(n int) QueueOption {
 	return func(o *queueCreateOpts) {
 		o.maxRetries = n
+		o.maxRetriesSet = true
 	}
 }
 
 // WithQueueTTL overrides the default message TTL for a specific channel or topic.
 // Zero means no expiry.
+//
+// TTL only hides expired messages from consumers; it does not delete them. Use a
+// GarbageCollector RetentionPolicy (MaxPendingAge) to reclaim their storage.
 func WithQueueTTL(d time.Duration) QueueOption {
 	return func(o *queueCreateOpts) {
 		o.ttl = d

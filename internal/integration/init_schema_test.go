@@ -120,10 +120,22 @@ func TestInitSchemaInvalidConnection(t *testing.T) {
 		t.Fatal("InitSchema should fail with invalid connection")
 	}
 
-	if !strings.Contains(err.Error(), "failed to initialize base schema") {
+	// InitSchema verifies the database is reachable (and runs a supported
+	// PostgreSQL version) before running any DDL, so an unreachable server
+	// fails fast at the ping rather than deep inside the migration runner.
+	if !strings.Contains(err.Error(), "failed to ping database") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
+
+// uncomparableListener is a pgqueue.Listener whose dynamic type is not
+// comparable (it has a slice field). InitSchema must reject it without panicking
+// when it inspects the supplied options.
+type uncomparableListener struct{ marker []int }
+
+func (uncomparableListener) Listen(context.Context, string) error { return nil }
+func (uncomparableListener) Notifications() <-chan string         { return nil }
+func (uncomparableListener) Close() error                         { return nil }
 
 // TestInitSchemaRejectsUnhonoredOptions (R-14) verifies that InitSchema only
 // honors WithSchema: passing any other Option (here WithMaxQueues, which
@@ -139,6 +151,13 @@ func TestInitSchemaRejectsUnhonoredOptions(t *testing.T) {
 	err := pgqueue.InitSchema(ctx, db, pgqueue.WithMaxQueues(5))
 	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
 		t.Errorf("InitSchema with WithMaxQueues should return ErrInvalidConfig, got: %v", err)
+	}
+
+	// A WithListener carrying a listener whose dynamic type is not comparable
+	// must be rejected cleanly with ErrInvalidConfig, never panic.
+	err = pgqueue.InitSchema(ctx, db, pgqueue.WithListener(uncomparableListener{}))
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("InitSchema with WithListener should return ErrInvalidConfig, got: %v", err)
 	}
 
 	// No options: still succeeds.

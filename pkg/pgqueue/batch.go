@@ -328,11 +328,12 @@ func (pq *Queue) processNackBatch(
 	errorMsg string,
 ) error {
 	var retryIDs []uuid.UUID
+	var retryDelays []float64
 	var dlqMessages []batchDLQMessage
 
 	for _, s := range states {
 		maxRetry := pq.config.DefaultMaxRetries
-		if s.maxRetries.Valid && s.maxRetries.Int32 > 0 {
+		if s.maxRetries.Valid {
 			maxRetry = int(s.maxRetries.Int32)
 		}
 
@@ -344,13 +345,17 @@ func (pq *Queue) processNackBatch(
 				metadataJSON: s.metadataJSON,
 			})
 		} else {
+			// Each retried message carries its own backoff delay so a batch
+			// nack honors the queue's BackoffPolicy exactly as a single Nack
+			// does (FR-023).
 			retryIDs = append(retryIDs, s.id)
+			retryDelays = append(retryDelays, pq.computeRetryDelay(s.retryCount+1, 0).Seconds())
 		}
 	}
 
 	if len(retryIDs) > 0 {
 		if err := pq.batchRetryMessages(
-			ctx, tx, tableName, retryIDs, errorMsg,
+			ctx, tx, tableName, retryIDs, retryDelays, errorMsg,
 		); err != nil {
 			return fmt.Errorf("failed to retry messages: %w", err)
 		}
@@ -673,27 +678,36 @@ func (pq *Queue) fetchBatchMessageStates(
 	return states, nil
 }
 
+// batchRetryMessages reinstates a batch of channel messages to pending. The
+// messageIDs and delaySeconds slices are index-aligned: each message's
+// available_at is pushed out by its own backoff delay so a batch nack respects
+// the BackoffPolicy per message (FR-023).
 func (pq *Queue) batchRetryMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	messageIDs []uuid.UUID,
+	delaySeconds []float64,
 	errorMsg string,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	// claim_id is cleared so stale receipts from the previous consumer
 	// resolve to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	query := fmt.Sprintf(`
-		UPDATE %s
+		UPDATE %s AS m
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
-		    error_message = $2
-		WHERE id = ANY($1::uuid[])
+		    available_at = NOW() + make_interval(secs => u.delay),
+		    error_message = $3
+		FROM unnest($1::uuid[], $2::float8[]) AS u(id, delay)
+		WHERE m.id = u.id
 	`, pq.msgTable(tableName), MessageStatusPending)
 
-	_, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs), errorMsg)
+	_, err := tx.ExecContext(
+		ctx, query, uuidSliceToStringSlice(messageIDs), delaySeconds, errorMsg,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to update messages: %w", err)
 	}
@@ -812,6 +826,7 @@ func (pq *Queue) processNackTopicBatch(
 	errorMsg string,
 ) error {
 	var retryIDs []uuid.UUID
+	var retryDelays []float64
 	var dlqMessages []batchDLQMessage
 
 	for _, s := range states {
@@ -823,13 +838,16 @@ func (pq *Queue) processNackTopicBatch(
 				metadataJSON: s.metadataJSON,
 			})
 		} else {
+			// Per-subscription backoff delay so a batch nack honors the
+			// BackoffPolicy exactly as a single Nack does (FR-023).
 			retryIDs = append(retryIDs, s.messageID)
+			retryDelays = append(retryDelays, pq.computeRetryDelay(s.retryCount+1, 0).Seconds())
 		}
 	}
 
 	if len(retryIDs) > 0 {
 		if err := pq.batchRetrySubscriptions(
-			ctx, tx, tableName, retryIDs, subscriberID, errorMsg,
+			ctx, tx, tableName, retryIDs, retryDelays, subscriberID, errorMsg,
 		); err != nil {
 			return fmt.Errorf("failed to retry subscriptions: %w", err)
 		}
@@ -846,28 +864,36 @@ func (pq *Queue) processNackTopicBatch(
 	return nil
 }
 
+// batchRetrySubscriptions reinstates a batch of subscriptions to pending. The
+// messageIDs and delaySeconds slices are index-aligned: each subscription's
+// available_at is pushed out by its own backoff delay (FR-023).
 func (pq *Queue) batchRetrySubscriptions(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	messageIDs []uuid.UUID,
+	delaySeconds []float64,
 	subscriberID, errorMsg string,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	// claim_id is cleared so stale receipts from the previous consumer
 	// resolve to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	query := fmt.Sprintf(`
-		UPDATE %s
+		UPDATE %s AS s
 		SET status = '%s',
 		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
-		    error_message = $3
-		WHERE message_id = ANY($1::uuid[])
-		  AND subscriber_id = $2
+		    available_at = NOW() + make_interval(secs => u.delay),
+		    error_message = $4
+		FROM unnest($1::uuid[], $2::float8[]) AS u(message_id, delay)
+		WHERE s.message_id = u.message_id
+		  AND s.subscriber_id = $3
 	`, pq.subTable(tableName), MessageStatusPending)
 
-	_, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs), subscriberID, errorMsg)
+	_, err := tx.ExecContext(
+		ctx, query, uuidSliceToStringSlice(messageIDs), delaySeconds, subscriberID, errorMsg,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to update subscriptions: %w", err)
 	}

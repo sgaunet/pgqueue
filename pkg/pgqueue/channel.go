@@ -235,10 +235,11 @@ type messageState struct {
 const errReasonVisibilityTimeout = "exceeded max retries: not acknowledged before visibility timeout"
 
 // channelMaxRetries resolves the effective retry limit for a channel message:
-// its per-message max_retries when set to a positive value, otherwise the
-// configured default.
+// its per-message max_retries when present (including an explicit 0, meaning no
+// retries), otherwise the configured default. max_retries is NULL only for
+// rows reinstated by a DLQ replay, which fall back to the default.
 func channelMaxRetries(defaultMax int, maxRetries sql.NullInt32) int {
-	if maxRetries.Valid && maxRetries.Int32 > 0 {
+	if maxRetries.Valid {
 		return int(maxRetries.Int32)
 	}
 	return defaultMax
@@ -310,7 +311,7 @@ func (pq *Queue) fetchPendingChannelMessage(
 // A timed-out 'processing' message that has already exhausted its retries is
 // deliberately excluded (retry_count < effective max): promoting it to the DLQ
 // is the garbage collector's job, not the consume path's (R-12). defaultMaxRetries
-// is the fallback limit for rows whose max_retries column is NULL or zero.
+// is the fallback limit for rows whose max_retries column is NULL (DLQ replays).
 func channelConsumeQuery(msgTable string, ttl time.Duration, defaultMaxRetries int) (string, []any) {
 	args := []any{defaultMaxRetries}
 	ttlClause := ""
@@ -328,7 +329,7 @@ func channelConsumeQuery(msgTable string, ttl time.Duration, defaultMaxRetries i
 		FROM %s
 		WHERE ((status = '%s' AND available_at <= NOW())
 		       OR (status = '%s' AND visibility_timeout < NOW()
-		           AND retry_count < COALESCE(NULLIF(max_retries, 0), $1)))
+		           AND retry_count < COALESCE(max_retries, $1)))
 		  %s
 		ORDER BY id
 		LIMIT 1

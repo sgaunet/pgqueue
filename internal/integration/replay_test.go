@@ -23,8 +23,9 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Record start time
-	startTime := time.Now()
-	time.Sleep(10 * time.Millisecond)
+	// A generous backward margin: ReplayFrom matches created_at (DB clock)
+	// against this value, so it must not land ahead of the container clock.
+	startTime := time.Now().Add(-time.Hour)
 
 	// Publish and process some messages
 	for i := 0; i < 5; i++ {
@@ -115,8 +116,9 @@ func TestReplayFromWithLimit(t *testing.T) {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
-	startTime := time.Now()
-	time.Sleep(10 * time.Millisecond)
+	// A generous backward margin: ReplayFrom matches created_at (DB clock)
+	// against this value, so it must not land ahead of the container clock.
+	startTime := time.Now().Add(-time.Hour)
 
 	// Publish and complete 5 messages
 	for i := 0; i < 5; i++ {
@@ -630,8 +632,9 @@ func TestReplayFromLargeBacklogNoLossNoDuplication(t *testing.T) {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
-	startTime := time.Now()
-	time.Sleep(10 * time.Millisecond)
+	// A generous backward margin: ReplayFrom matches created_at (DB clock)
+	// against this value, so it must not land ahead of the container clock.
+	startTime := time.Now().Add(-time.Hour)
 
 	// Seed >=10,000 messages directly into the message table in the completed
 	// state so ReplayFrom has a large backlog to reinstate. Going through the
@@ -882,5 +885,56 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 	}
 	if dbSum != res.Replayed {
 		t.Errorf("replay log message_count sum = %d, want %d", dbSum, res.Replayed)
+	}
+}
+
+// TestReplayDLQLegacyNullSubscriberCount verifies that ReplayDLQ reports an
+// accurate count for a legacy DLQ row whose subscriber_id is NULL. Such a row
+// fans out to every active subscriber, but it is still one replayed DLQ entry:
+// ReplayDLQ must count it once (Replayed=1, Skipped=0), not once per
+// subscription record it produces — which previously yielded a negative Skipped.
+func TestReplayDLQLegacyNullSubscriberCount(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const topicName = "legacy-dlq-topic"
+	if err := pq.CreateTopic(ctx, topicName); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	for _, sub := range []string{"sub-a", "sub-b"} {
+		if err := pq.Subscribe(ctx, topicName, sub); err != nil {
+			t.Fatalf("subscribe %s: %v", sub, err)
+		}
+	}
+
+	// Publish a message so the message table has a row for the DLQ entry to
+	// reference (replay re-creates subscription rows that foreign-key it).
+	msgID, err := pq.PublishTopic(ctx, topicName, []byte("legacy"))
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// Insert a legacy DLQ row directly with subscriber_id left NULL, as rows
+	// written before the subscriber_id column existed would be.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO pgqueue_dlq_legacy_dlq_topic
+		   (original_message_id, payload, failure_reason, retry_count)
+		 VALUES ($1, $2, $3, $4)`,
+		msgID, []byte("legacy"), "legacy failure", 0,
+	); err != nil {
+		t.Fatalf("insert legacy DLQ row: %v", err)
+	}
+
+	res, err := pq.ReplayDLQ(ctx, topicName, pgqueue.QueueTypePubSub,
+		pgqueue.ReplayOptions{Confirm: true})
+	if err != nil {
+		t.Fatalf("replay DLQ: %v", err)
+	}
+	if res.Replayed != 1 {
+		t.Errorf("expected Replayed=1 for one legacy DLQ row, got %d", res.Replayed)
+	}
+	if res.Skipped != 0 {
+		t.Errorf("expected Skipped=0, got %d (negative means the replayed count was inflated)", res.Skipped)
 	}
 }
