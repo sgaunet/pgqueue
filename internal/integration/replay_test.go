@@ -15,7 +15,7 @@ func TestReplayFrom(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "replay-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "replay-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestReplayFrom(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "replay-test", msg.ID); err != nil {
+		if err := pq.AckChannel(ctx, "replay-test", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -108,7 +108,7 @@ func TestReplayFromWithLimit(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "replay-limit", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "replay-limit")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestReplayFromWithLimit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "replay-limit", msg.ID); err != nil {
+		if err := pq.AckChannel(ctx, "replay-limit", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack: %v", err)
 		}
 	}
@@ -163,7 +163,7 @@ func TestReplayMessage(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "replay-msg-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "replay-msg-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestReplayMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to consume message: %v", err)
 	}
-	if err := pq.AckChannel(ctx, "replay-msg-test", msg.ID); err != nil {
+	if err := pq.AckChannel(ctx, "replay-msg-test", msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack message: %v", err)
 	}
 
@@ -217,9 +217,7 @@ func TestReplayDLQ(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel with max retries
-	err := pq.CreateChannel(ctx, "replay-dlq-test", pgqueue.ChannelOptions{
-		MaxRetries: 1,
-	})
+	err := pq.CreateChannel(ctx, "replay-dlq-test", pgqueue.WithQueueMaxRetries(1))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -238,7 +236,7 @@ func TestReplayDLQ(t *testing.T) {
 		if msg == nil {
 			t.Fatalf("consume returned nil message on attempt %d", i+1)
 		}
-		if err := pq.NackChannel(ctx, "replay-dlq-test", msg.ID, "test failure"); err != nil {
+		if err := pq.NackChannel(ctx, "replay-dlq-test", msg.Receipt(), "test failure"); err != nil {
 			t.Fatalf("failed to nack message on attempt %d: %v", i+1, err)
 		}
 	}
@@ -301,9 +299,7 @@ func TestReplayDLQPubSub(t *testing.T) {
 	ctx := context.Background()
 
 	// Create topic with max 1 retry so messages go to DLQ after 2 nacks
-	err := pq.CreateTopic(ctx, "replay-dlq-pubsub", pgqueue.TopicOptions{
-		MaxRetries: 1,
-	})
+	err := pq.CreateTopic(ctx, "replay-dlq-pubsub", pgqueue.WithQueueMaxRetries(1))
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -326,7 +322,7 @@ func TestReplayDLQPubSub(t *testing.T) {
 		if msg == nil {
 			t.Fatalf("consume %d returned nil", i)
 		}
-		err = pq.NackTopic(ctx, "replay-dlq-pubsub", "sub1", msg.ID, "fail")
+		err = pq.NackTopic(ctx, "replay-dlq-pubsub", "sub1", msg.Receipt(), "fail")
 		if err != nil {
 			t.Fatalf("nack %d failed: %v", i, err)
 		}

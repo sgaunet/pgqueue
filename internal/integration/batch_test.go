@@ -17,9 +17,7 @@ func TestPublishBatchChannel(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "batch-chan", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateChannel(ctx, "batch-chan", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -75,9 +73,7 @@ func TestPublishBatchTopic(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "batch-topic", pgqueue.TopicOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateTopic(ctx, "batch-topic", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -123,7 +119,7 @@ func TestPublishBatchEmptySlice(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "empty-batch", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "empty-batch")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -143,7 +139,7 @@ func TestPublishBatchTooLarge(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "large-batch", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "large-batch")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -165,9 +161,7 @@ func TestPublishBatchPayloadValidation(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "small-chan", pgqueue.ChannelOptions{
-		MaxMessageSize: 10,
-	})
+	err := pq.CreateChannel(ctx, "small-chan", pgqueue.WithQueueMaxMessageSize(10))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -198,9 +192,7 @@ func TestPublishBatchWithMetadata(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "meta-batch", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateChannel(ctx, "meta-batch", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -256,9 +248,7 @@ func TestPublishBatchOrderPreserved(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "order-batch", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateChannel(ctx, "order-batch", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -327,9 +317,7 @@ func TestAckChannelBatch(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "ack-batch", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateChannel(ctx, "ack-batch", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -348,16 +336,16 @@ func TestAckChannelBatch(t *testing.T) {
 	}
 
 	// Consume all
-	consumedIDs := make([]uuid.UUID, 5)
+	consumedReceipts := make([]pgqueue.Receipt, 5)
 	for i := 0; i < 5; i++ {
 		msg, err := pq.ConsumeFromChannel(ctx, "ack-batch", 30*time.Second)
 		if err != nil {
 			t.Fatalf("ConsumeFromChannel failed: %v", err)
 		}
-		consumedIDs[i] = msg.ID
+		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.AckChannelBatch(ctx, "ack-batch", consumedIDs)
+	err = pq.AckChannelBatch(ctx, "ack-batch", consumedReceipts)
 	if err != nil {
 		t.Fatalf("AckChannelBatch failed: %v", err)
 	}
@@ -377,9 +365,7 @@ func TestAckChannelBatchNoneProcessing(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "ack-none", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateChannel(ctx, "ack-none", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -393,8 +379,12 @@ func TestAckChannelBatchNoneProcessing(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	// Not consumed → still pending, not processing
-	err = pq.AckChannelBatch(ctx, "ack-none", ids)
+	// Not consumed → still pending, not processing. Zero ClaimID matches no rows.
+	receipts := make([]pgqueue.Receipt, len(ids))
+	for i, id := range ids {
+		receipts[i] = pgqueue.Receipt{MessageID: id}
+	}
+	err = pq.AckChannelBatch(ctx, "ack-none", receipts)
 	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
 		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
 	}
@@ -406,7 +396,7 @@ func TestAckChannelBatchEmptySlice(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "ack-empty", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "ack-empty")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -423,14 +413,14 @@ func TestAckChannelBatchTooLarge(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "ack-large", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "ack-large")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
-	ids := make([]uuid.UUID, pgqueue.MaxBatchSize+1)
+	receipts := make([]pgqueue.Receipt, pgqueue.MaxBatchSize+1)
 
-	err = pq.AckChannelBatch(ctx, "ack-large", ids)
+	err = pq.AckChannelBatch(ctx, "ack-large", receipts)
 	if !errors.Is(err, pgqueue.ErrBatchTooLarge) {
 		t.Errorf("expected ErrBatchTooLarge, got: %v", err)
 	}
@@ -442,9 +432,7 @@ func TestAckTopicBatch(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "ack-topic-batch", pgqueue.TopicOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateTopic(ctx, "ack-topic-batch", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -466,16 +454,16 @@ func TestAckTopicBatch(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	consumedIDs := make([]uuid.UUID, 5)
+	consumedReceipts := make([]pgqueue.Receipt, 5)
 	for i := 0; i < 5; i++ {
 		msg, err := pq.ConsumeFromTopic(ctx, "ack-topic-batch", "sub1", 30*time.Second)
 		if err != nil {
 			t.Fatalf("ConsumeFromTopic failed: %v", err)
 		}
-		consumedIDs[i] = msg.ID
+		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.AckTopicBatch(ctx, "ack-topic-batch", "sub1", consumedIDs)
+	err = pq.AckTopicBatch(ctx, "ack-topic-batch", "sub1", consumedReceipts)
 	if err != nil {
 		t.Fatalf("AckTopicBatch failed: %v", err)
 	}
@@ -487,9 +475,7 @@ func TestAckTopicBatchNoneProcessing(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "ack-topic-none", pgqueue.TopicOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateTopic(ctx, "ack-topic-none", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -506,7 +492,12 @@ func TestAckTopicBatchNoneProcessing(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	err = pq.AckTopicBatch(ctx, "ack-topic-none", "sub1", ids)
+	// Not consumed → zero ClaimID matches no rows.
+	receipts := make([]pgqueue.Receipt, len(ids))
+	for i, id := range ids {
+		receipts[i] = pgqueue.Receipt{MessageID: id}
+	}
+	err = pq.AckTopicBatch(ctx, "ack-topic-none", "sub1", receipts)
 	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
 		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
 	}
@@ -518,10 +509,7 @@ func TestNackChannelBatch(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "nack-batch", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-		MaxRetries:     3,
-	})
+	err := pq.CreateChannel(ctx, "nack-batch", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize), pgqueue.WithQueueMaxRetries(3))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -539,16 +527,16 @@ func TestNackChannelBatch(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	consumedIDs := make([]uuid.UUID, 5)
+	consumedReceipts := make([]pgqueue.Receipt, 5)
 	for i := 0; i < 5; i++ {
 		msg, err := pq.ConsumeFromChannel(ctx, "nack-batch", 30*time.Second)
 		if err != nil {
 			t.Fatalf("ConsumeFromChannel failed: %v", err)
 		}
-		consumedIDs[i] = msg.ID
+		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-batch", consumedIDs, "transient error")
+	err = pq.NackChannelBatch(ctx, "nack-batch", consumedReceipts, "transient error")
 	if err != nil {
 		t.Fatalf("NackChannelBatch failed: %v", err)
 	}
@@ -578,10 +566,7 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "nack-mixed", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-		MaxRetries:     1,
-	})
+	err := pq.CreateChannel(ctx, "nack-mixed", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize), pgqueue.WithQueueMaxRetries(1))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -598,22 +583,22 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 	}
 
 	// First round: consume and nack all (retry_count goes to 1)
-	firstIDs := make([]uuid.UUID, 3)
+	firstReceipts := make([]pgqueue.Receipt, 3)
 	for i := 0; i < 3; i++ {
 		msg, err := pq.ConsumeFromChannel(ctx, "nack-mixed", 30*time.Second)
 		if err != nil {
 			t.Fatalf("ConsumeFromChannel failed: %v", err)
 		}
-		firstIDs[i] = msg.ID
+		firstReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-mixed", firstIDs, "first failure")
+	err = pq.NackChannelBatch(ctx, "nack-mixed", firstReceipts, "first failure")
 	if err != nil {
 		t.Fatalf("first NackChannelBatch failed: %v", err)
 	}
 
 	// Second round: consume and nack again (retry_count 1+1=2 > maxRetry 1 → DLQ)
-	secondIDs := make([]uuid.UUID, 3)
+	secondReceipts := make([]pgqueue.Receipt, 3)
 	for i := 0; i < 3; i++ {
 		msg, err := pq.ConsumeFromChannel(ctx, "nack-mixed", 30*time.Second)
 		if err != nil {
@@ -622,10 +607,10 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 		if msg == nil {
 			t.Fatalf("expected message %d in round 2, got nil", i)
 		}
-		secondIDs[i] = msg.ID
+		secondReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-mixed", secondIDs, "second failure")
+	err = pq.NackChannelBatch(ctx, "nack-mixed", secondReceipts, "second failure")
 	if err != nil {
 		t.Fatalf("second NackChannelBatch failed: %v", err)
 	}
@@ -649,7 +634,7 @@ func TestNackChannelBatchEmptySlice(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "nack-empty", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "nack-empty")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -666,9 +651,7 @@ func TestNackChannelBatchNoneProcessing(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "nack-none", pgqueue.ChannelOptions{
-		MaxMessageSize: testMaxMessageSize,
-	})
+	err := pq.CreateChannel(ctx, "nack-none", pgqueue.WithQueueMaxMessageSize(testMaxMessageSize))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -681,7 +664,12 @@ func TestNackChannelBatchNoneProcessing(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-none", ids, "error")
+	// Not consumed → zero ClaimID matches no rows.
+	receipts := make([]pgqueue.Receipt, len(ids))
+	for i, id := range ids {
+		receipts[i] = pgqueue.Receipt{MessageID: id}
+	}
+	err = pq.NackChannelBatch(ctx, "nack-none", receipts, "error")
 	if !errors.Is(err, pgqueue.ErrMessageNotFound) {
 		t.Errorf("expected ErrMessageNotFound, got: %v", err)
 	}

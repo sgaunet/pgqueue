@@ -28,7 +28,7 @@ func validateVisibilityTimeout(d time.Duration) error {
 
 // ConsumeFromChannel retrieves the next available message from a channel.
 // Returns nil if no messages are available.
-func (pq *PGQueue) ConsumeFromChannel(
+func (pq *Queue) ConsumeFromChannel(
 	ctx context.Context,
 	channelName string,
 	visibilityTimeout time.Duration,
@@ -82,14 +82,19 @@ func (pq *PGQueue) ConsumeFromChannel(
 }
 
 // AckChannel acknowledges a message from a channel (marks as completed).
-func (pq *PGQueue) AckChannel(
+//
+// The receipt must carry the claim token issued by the ConsumeFromChannel call
+// that delivered the message (use msg.Receipt()). If the claim has since
+// expired — the visibility timeout lapsed and the message was redelivered to
+// another consumer — AckChannel returns ErrClaimExpired and does nothing.
+func (pq *Queue) AckChannel(
 	ctx context.Context,
 	channelName string,
-	messageID uuid.UUID,
+	r Receipt,
 ) error {
-	queueMeta, err := pq.getQueueMetadata(
-		ctx, string(QueueTypeChannel), channelName,
-	)
+	// Use the metadata cache for the table name: Ack does not need the mutable
+	// paused flag or config, so a cache hit avoids the full metadata round-trip.
+	tableName, err := pq.cachedTableName(ctx, string(QueueTypeChannel), channelName)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
 			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
@@ -101,10 +106,10 @@ func (pq *PGQueue) AckChannel(
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = '%s', processed_at = NOW()
-		WHERE id = $1 AND status = '%s'
-	`, queueMeta.TableName, MessageStatusCompleted, MessageStatusProcessing)
+		WHERE id = $1 AND claim_id = $2 AND status = '%s'
+	`, tableName, MessageStatusCompleted, MessageStatusProcessing)
 
-	result, err := pq.db.ExecContext(ctx, query, messageID)
+	result, err := pq.db.ExecContext(ctx, query, r.MessageID, r.ClaimID)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge message: %w", err)
 	}
@@ -114,7 +119,7 @@ func (pq *PGQueue) AckChannel(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return ErrMessageAlreadyAcked
+		return classifyChannelAckMiss(ctx, pq.db, tableName, r)
 	}
 
 	return nil
@@ -122,10 +127,13 @@ func (pq *PGQueue) AckChannel(
 
 // NackChannel negatively acknowledges a message from a channel (retry or move to DLQ).
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
-func (pq *PGQueue) NackChannel(
+//
+// The receipt must carry the claim token from the consume call that delivered
+// the message; a stale claim returns ErrClaimExpired (see AckChannel).
+func (pq *Queue) NackChannel(
 	ctx context.Context,
 	channelName string,
-	messageID uuid.UUID,
+	r Receipt,
 	errorMsg string,
 ) error {
 	errorMsg = truncateErrorMsg(errorMsg)
@@ -148,14 +156,14 @@ func (pq *PGQueue) NackChannel(
 
 	// Get current message state
 	msgState, err := pq.getProcessingMessageState(
-		ctx, tx, queueMeta.TableName, messageID,
+		ctx, tx, queueMeta.TableName, r,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get message state: %w", err)
 	}
 
 	if err := pq.handleNack(
-		ctx, tx, queueMeta.TableName, messageID, errorMsg, msgState,
+		ctx, tx, queueMeta.TableName, r.MessageID, errorMsg, msgState,
 	); err != nil {
 		return fmt.Errorf("failed to handle nack: %w", err)
 	}
@@ -175,29 +183,90 @@ type messageState struct {
 	metadataJSON sql.NullString
 }
 
-func (pq *PGQueue) fetchPendingChannelMessage(
+// errReasonVisibilityTimeout is the DLQ failure reason recorded when a message
+// is moved to the dead-letter queue because it was reclaimed after a visibility
+// timeout too many times without ever being acknowledged.
+const errReasonVisibilityTimeout = "exceeded max retries: not acknowledged before visibility timeout"
+
+// channelMaxRetries resolves the effective retry limit for a channel message:
+// its per-message max_retries when set to a positive value, otherwise the
+// configured default.
+func channelMaxRetries(defaultMax int, maxRetries sql.NullInt32) int {
+	if maxRetries.Valid && maxRetries.Int32 > 0 {
+		return int(maxRetries.Int32)
+	}
+	return defaultMax
+}
+
+// channelCandidate is one consumable row scanned from a channel message table.
+type channelCandidate struct {
+	id           uuid.UUID
+	payload      []byte
+	createdAt    time.Time
+	status       string
+	retryCount   int
+	maxRetries   sql.NullInt32
+	metadataJSON sql.NullString
+	processedAt  sql.NullTime
+	errorMessage sql.NullString
+}
+
+func (pq *Queue) fetchPendingChannelMessage(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
 ) (*Message, *time.Time, error) {
+	query, args := channelConsumeQuery(tableName, ttl)
+
+	// Loop so that a message reclaimed after a visibility timeout which has
+	// exhausted its retries is moved to the DLQ and skipped, rather than being
+	// redelivered forever (a consumer that always crashes never sends a Nack).
+	for {
+		var row channelCandidate
+		err := tx.QueryRowContext(ctx, query, args...).Scan(
+			&row.id, &row.payload, &row.createdAt, &row.status,
+			&row.retryCount, &row.maxRetries, &row.metadataJSON,
+			&row.processedAt, &row.errorMessage,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, nil
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to query message: %w", err)
+		}
+
+		retryCount, dlqd, err := pq.reclaimChannelAttempt(ctx, tx, tableName, row)
+		if err != nil {
+			return nil, nil, err
+		}
+		if dlqd {
+			continue
+		}
+
+		return pq.claimChannelMessage(
+			ctx, tx, tableName, visibilityTimeout, row, retryCount,
+		)
+	}
+}
+
+// channelConsumeQuery builds the SELECT for the next consumable channel message.
+// A message is consumable when it is pending, or when it is still marked
+// processing but its visibility timeout has expired (the previous consumer
+// crashed or never acked). Reclaiming timed-out messages here means redelivery
+// does not depend on the GarbageCollector running.
+func channelConsumeQuery(tableName string, ttl time.Duration) (string, []any) {
 	ttlClause := ""
 	var args []any
-
 	if ttl > 0 {
 		ttlClause = "AND created_at > NOW() - make_interval(secs => $1)"
 		args = append(args, ttl.Seconds())
 	}
 
-	// A message is consumable when it is pending, or when it is still marked
-	// processing but its visibility timeout has expired (the previous consumer
-	// crashed or never acked). Reclaiming timed-out messages here means
-	// redelivery does not depend on the GarbageCollector running.
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		SELECT id, payload, created_at, retry_count, max_retries, metadata,
-		       processed_at, error_message
+		SELECT id, payload, created_at, status, retry_count, max_retries,
+		       metadata, processed_at, error_message
 		FROM pgqueue_msg_%s
 		WHERE (status = '%s'
 		       OR (status = '%s' AND visibility_timeout < NOW()))
@@ -207,109 +276,118 @@ func (pq *PGQueue) fetchPendingChannelMessage(
 		FOR UPDATE SKIP LOCKED
 	`, tableName, MessageStatusPending, MessageStatusProcessing, ttlClause)
 
-	var msgID uuid.UUID
-	var payload []byte
-	var createdAt time.Time
-	var retryCount int
-	var maxRetries sql.NullInt32
-	var metadataJSON sql.NullString
-	var processedAt sql.NullTime
-	var errorMessage sql.NullString
+	return query, args
+}
 
-	err := tx.QueryRowContext(ctx, query, args...).Scan(
-		&msgID, &payload, &createdAt,
-		&retryCount, &maxRetries, &metadataJSON,
-		&processedAt, &errorMessage,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, nil
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query message: %w", err)
+// reclaimChannelAttempt accounts for a redelivery when a candidate was picked
+// up in 'processing' state — a visibility timeout where the previous consumer
+// never acked. It returns the retry count to claim with; if the retries are now
+// exhausted it moves the message to the DLQ and reports dlqd=true so the caller
+// skips it.
+func (pq *Queue) reclaimChannelAttempt(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	row channelCandidate,
+) (int, bool, error) {
+	retryCount := row.retryCount
+	if MessageStatus(row.status) != MessageStatusProcessing {
+		return retryCount, false, nil
 	}
 
-	return pq.claimChannelMessage(
-		ctx, tx, tableName, visibilityTimeout,
-		msgID, payload, createdAt, retryCount, maxRetries, metadataJSON,
-		processedAt, errorMessage,
-	)
+	retryCount++
+	if retryCount > channelMaxRetries(pq.config.DefaultMaxRetries, row.maxRetries) {
+		if err := pq.moveToDLQ(
+			ctx, tx, tableName, row.id, errReasonVisibilityTimeout,
+			row.payload, retryCount, row.metadataJSON,
+		); err != nil {
+			return 0, false, fmt.Errorf("failed to move timed-out message to DLQ: %w", err)
+		}
+
+		return 0, true, nil
+	}
+
+	return retryCount, false, nil
 }
 
 //nolint:gosec // G201: table name validated by queueNameRegex
-func (pq *PGQueue) claimChannelMessage(
+func (pq *Queue) claimChannelMessage(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	visibilityTimeout time.Duration,
-	msgID uuid.UUID,
-	payload []byte,
-	createdAt time.Time,
+	row channelCandidate,
 	retryCount int,
-	maxRetries sql.NullInt32,
-	metadataJSON sql.NullString,
-	processedAt sql.NullTime,
-	errorMessage sql.NullString,
 ) (*Message, *time.Time, error) {
 	// Compute the visibility deadline on the database clock (NOW()) rather than
 	// the application clock, so consumers and the GC agree on expiry regardless
-	// of clock skew between the app server and PostgreSQL.
+	// of clock skew between the app server and PostgreSQL. retry_count is
+	// written back so a reclaim-driven increment is persisted. A fresh claim_id
+	// is minted on every (re)delivery: it fences a previous consumer whose
+	// visibility timeout lapsed from acknowledging this now-reassigned message.
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
-		SET status = '%s', visibility_timeout = NOW() + make_interval(secs => $1)
+		SET status = '%s',
+		    retry_count = $3,
+		    claim_id = uuidv7(),
+		    visibility_timeout = NOW() + make_interval(secs => $1)
 		WHERE id = $2
-		RETURNING visibility_timeout
+		RETURNING visibility_timeout, claim_id
 	`, tableName, MessageStatusProcessing)
 
 	var visTimeout time.Time
+	var claimID uuid.UUID
 	if err := tx.QueryRowContext(
-		ctx, updateQuery, visibilityTimeout.Seconds(), msgID,
-	).Scan(&visTimeout); err != nil {
+		ctx, updateQuery, visibilityTimeout.Seconds(), row.id, retryCount,
+	).Scan(&visTimeout, &claimID); err != nil {
 		return nil, nil, fmt.Errorf("failed to update message: %w", err)
 	}
 
 	msg := &Message{
-		ID:         msgID,
-		Payload:    payload,
-		CreatedAt:  createdAt,
+		ID:         row.id,
+		ClaimID:    claimID,
+		Payload:    row.payload,
+		CreatedAt:  row.createdAt,
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
-		Metadata:   parseMetadataJSON(metadataJSON),
+		Metadata:   pq.parseMetadataJSON(row.metadataJSON),
 	}
 
-	if maxRetries.Valid {
-		msg.MaxRetries = int(maxRetries.Int32)
+	if row.maxRetries.Valid {
+		msg.MaxRetries = int(row.maxRetries.Int32)
 	}
-	if processedAt.Valid {
-		msg.ProcessedAt = &processedAt.Time
+	if row.processedAt.Valid {
+		msg.ProcessedAt = &row.processedAt.Time
 	}
-	if errorMessage.Valid {
-		msg.ErrorMessage = &errorMessage.String
+	if row.errorMessage.Valid {
+		msg.ErrorMessage = &row.errorMessage.String
 	}
 
 	return msg, &visTimeout, nil
 }
 
-func (pq *PGQueue) getProcessingMessageState(
+func (pq *Queue) getProcessingMessageState(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
-	messageID uuid.UUID,
+	r Receipt,
 ) (*messageState, error) {
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT retry_count, max_retries, payload, metadata
 		FROM pgqueue_msg_%s
-		WHERE id = $1 AND status = '%s'
+		WHERE id = $1 AND claim_id = $2 AND status = '%s'
 		FOR UPDATE
 	`, tableName, MessageStatusProcessing)
 
 	var state messageState
-	err := tx.QueryRowContext(ctx, query, messageID).Scan(
+	err := tx.QueryRowContext(ctx, query, r.MessageID, r.ClaimID).Scan(
 		&state.retryCount, &state.maxRetries,
 		&state.payload, &state.metadataJSON,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrMessageNotFound
+		// No processing row under this claim: explain why (expired vs. gone).
+		return nil, classifyChannelAckMiss(ctx, tx, tableName, r)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query message: %w", err)
@@ -318,7 +396,7 @@ func (pq *PGQueue) getProcessingMessageState(
 	return &state, nil
 }
 
-func (pq *PGQueue) handleNack(
+func (pq *Queue) handleNack(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -327,10 +405,7 @@ func (pq *PGQueue) handleNack(
 	state *messageState,
 ) error {
 	// Determine max retries (use default if not set)
-	maxRetry := pq.config.DefaultMaxRetries
-	if state.maxRetries.Valid && state.maxRetries.Int32 > 0 {
-		maxRetry = int(state.maxRetries.Int32)
-	}
+	maxRetry := channelMaxRetries(pq.config.DefaultMaxRetries, state.maxRetries)
 
 	// Check if we've exceeded max retries
 	if state.retryCount+1 > maxRetry {
@@ -343,7 +418,7 @@ func (pq *PGQueue) handleNack(
 	return pq.retryMessage(ctx, tx, tableName, messageID, errorMsg)
 }
 
-func (pq *PGQueue) moveToDLQ(
+func (pq *Queue) moveToDLQ(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -381,7 +456,7 @@ func (pq *PGQueue) moveToDLQ(
 	return nil
 }
 
-func (pq *PGQueue) retryMessage(
+func (pq *Queue) retryMessage(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,

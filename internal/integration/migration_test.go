@@ -28,8 +28,7 @@ func TestSchemaVersionTracking(t *testing.T) {
 	// applied migration.
 	var rowCount, maxVersion int
 	err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(MAX(version), 0) FROM pgqueue_schema_version`,
-	).Scan(&rowCount, &maxVersion)
+		`SELECT COUNT(*), COALESCE(MAX(version), 0) FROM pgqueue_schema_version`).Scan(&rowCount, &maxVersion)
 	if err != nil {
 		t.Fatalf("failed to read pgqueue_schema_version: %v", err)
 	}
@@ -46,8 +45,7 @@ func TestSchemaVersionTracking(t *testing.T) {
 	}
 	var rowCountAfter int
 	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pgqueue_schema_version`,
-	).Scan(&rowCountAfter); err != nil {
+		`SELECT COUNT(*) FROM pgqueue_schema_version`).Scan(&rowCountAfter); err != nil {
 		t.Fatalf("failed to recount pgqueue_schema_version: %v", err)
 	}
 	if rowCountAfter != rowCount {
@@ -62,7 +60,7 @@ func TestInitRequiresSchema(t *testing.T) {
 	db, cleanup := setupTestContainer(t)
 	defer cleanup()
 
-	_, err := pgqueue.Init(context.Background(), pgqueue.Config{DB: db})
+	_, err := pgqueue.New(context.Background(), db)
 	if !errors.Is(err, pgqueue.ErrSchemaNotInitialized) {
 		t.Fatalf("expected ErrSchemaNotInitialized, got %v", err)
 	}
@@ -79,7 +77,7 @@ func TestGetSchemaVersion(t *testing.T) {
 		t.Fatalf("InitSchema failed: %v", err)
 	}
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{DB: db})
+	pq, err := pgqueue.New(ctx, db)
 	if err != nil {
 		t.Fatalf("Init failed: %v", err)
 	}
@@ -102,7 +100,7 @@ func TestVisibilityTimeoutReclaim(t *testing.T) {
 
 	ctx := context.Background()
 
-	if err := pq.CreateChannel(ctx, "reclaim", pgqueue.ChannelOptions{}); err != nil {
+	if err := pq.CreateChannel(ctx, "reclaim"); err != nil {
 		t.Fatalf("CreateChannel failed: %v", err)
 	}
 
@@ -147,14 +145,13 @@ func TestQueueNameLengthLimit(t *testing.T) {
 	ctx := context.Background()
 
 	tooLong := strings.Repeat("a", 29)
-	if err := pq.CreateChannel(ctx, tooLong, pgqueue.ChannelOptions{}); !errors.Is(
-		err, pgqueue.ErrInvalidQueueName,
-	) {
+	if err := pq.CreateChannel(ctx, tooLong); !errors.Is(
+		err, pgqueue.ErrInvalidQueueName) {
 		t.Fatalf("expected ErrInvalidQueueName for a 29-char name, got %v", err)
 	}
 
 	okName := strings.Repeat("a", 28)
-	if err := pq.CreateChannel(ctx, okName, pgqueue.ChannelOptions{}); err != nil {
+	if err := pq.CreateChannel(ctx, okName); err != nil {
 		t.Fatalf("28-char name should be accepted, got %v", err)
 	}
 }
@@ -186,8 +183,7 @@ func TestInitSchemaConcurrent(t *testing.T) {
 
 	var rowCount int
 	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pgqueue_schema_version`,
-	).Scan(&rowCount); err != nil {
+		`SELECT COUNT(*) FROM pgqueue_schema_version`).Scan(&rowCount); err != nil {
 		t.Fatalf("failed to read pgqueue_schema_version: %v", err)
 	}
 	if rowCount != pgqueue.SchemaVersion {

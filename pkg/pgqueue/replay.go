@@ -13,7 +13,7 @@ import (
 )
 
 // ReplayFrom resets messages after a specific timestamp to pending status.
-func (pq *PGQueue) ReplayFrom(
+func (pq *Queue) ReplayFrom(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -32,9 +32,17 @@ func (pq *PGQueue) ReplayFrom(
 	tableName := metadata.TableName
 
 	if opts.DryRun {
-		return pq.countReplayableMessages(
-			ctx, tableName, queueType, since,
-		)
+		count, err := pq.countReplayableMessages(ctx, tableName, queueType, since)
+		if err != nil {
+			return 0, err
+		}
+		// A real run with a limit caps the rows it touches; reflect that here
+		// so the dry-run count matches what a subsequent replay would do.
+		if opts.Limit > 0 && count > opts.Limit {
+			count = opts.Limit
+		}
+
+		return count, nil
 	}
 
 	count, err := pq.executeReplayFrom(
@@ -55,7 +63,7 @@ func (pq *PGQueue) ReplayFrom(
 
 // ReplayMessage resets a specific channel message to pending status.
 // Not supported for pub/sub queues (use ReplayFrom or ReplayDLQ instead).
-func (pq *PGQueue) ReplayMessage(
+func (pq *Queue) ReplayMessage(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -103,7 +111,7 @@ func (pq *PGQueue) ReplayMessage(
 // If CompletedMessageTTL is shorter than DLQRetention in your GC policy, the message
 // row may be garbage-collected before the DLQ entry, causing a foreign key error on replay.
 // Ensure DLQRetention does not exceed CompletedMessageTTL for pub/sub topics.
-func (pq *PGQueue) ReplayDLQ(
+func (pq *Queue) ReplayDLQ(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -139,7 +147,7 @@ func (pq *PGQueue) ReplayDLQ(
 }
 
 // GetReplayHistory returns the replay history for a queue.
-func (pq *PGQueue) GetReplayHistory(
+func (pq *Queue) GetReplayHistory(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -162,7 +170,7 @@ func validateReplayOpts(opts ReplayOptions) error {
 	return nil
 }
 
-func (pq *PGQueue) getReplayQueueMetadata(
+func (pq *Queue) getReplayQueueMetadata(
 	ctx context.Context,
 	queueType QueueType,
 	queueName string,
@@ -182,7 +190,7 @@ func (pq *PGQueue) getReplayQueueMetadata(
 	return metadata, nil
 }
 
-func (pq *PGQueue) countReplayableMessages(
+func (pq *Queue) countReplayableMessages(
 	ctx context.Context,
 	tableName string,
 	queueType QueueType,
@@ -215,7 +223,7 @@ func (pq *PGQueue) countReplayableMessages(
 	return count, nil
 }
 
-func (pq *PGQueue) executeReplayFrom(
+func (pq *Queue) executeReplayFrom(
 	ctx context.Context,
 	tableName string,
 	queueType QueueType,
@@ -237,7 +245,7 @@ func (pq *PGQueue) executeReplayFrom(
 	return int(rows), nil
 }
 
-func (pq *PGQueue) buildReplayFromQuery(
+func (pq *Queue) buildReplayFromQuery(
 	tableName string,
 	queueType QueueType,
 	limit int,
@@ -249,7 +257,7 @@ func (pq *PGQueue) buildReplayFromQuery(
 	return pq.buildPubSubReplayQuery(tableName, limit)
 }
 
-func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
+func (pq *Queue) buildChannelReplayQuery(tableName string, limit int) string {
 	if limit > 0 {
 		return fmt.Sprintf(`
 			UPDATE pgqueue_msg_%s
@@ -279,7 +287,7 @@ func (pq *PGQueue) buildChannelReplayQuery(tableName string, limit int) string {
 	`, tableName, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 }
 
-func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
+func (pq *Queue) buildPubSubReplayQuery(tableName string, limit int) string {
 	if limit > 0 {
 		return fmt.Sprintf(`
 			UPDATE pgqueue_sub_%s
@@ -309,7 +317,7 @@ func (pq *PGQueue) buildPubSubReplayQuery(tableName string, limit int) string {
 	`, tableName, MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 }
 
-func (pq *PGQueue) checkMessageExists(
+func (pq *Queue) checkMessageExists(
 	ctx context.Context,
 	tableName string,
 	messageID uuid.UUID,
@@ -334,7 +342,7 @@ func (pq *PGQueue) checkMessageExists(
 	return nil
 }
 
-func (pq *PGQueue) executeReplayMessage(
+func (pq *Queue) executeReplayMessage(
 	ctx context.Context,
 	tableName string,
 	messageID uuid.UUID,
@@ -376,7 +384,7 @@ func (pq *PGQueue) executeReplayMessage(
 	return nil
 }
 
-func (pq *PGQueue) countDLQMessages(
+func (pq *Queue) countDLQMessages(
 	ctx context.Context,
 	tableName string,
 ) (int, error) {
@@ -390,7 +398,7 @@ func (pq *PGQueue) countDLQMessages(
 	return count, nil
 }
 
-func (pq *PGQueue) executeReplayDLQ(
+func (pq *Queue) executeReplayDLQ(
 	ctx context.Context,
 	queueName, tableName string,
 	queueType QueueType,
@@ -432,7 +440,7 @@ type dlqRow struct {
 // defaultDLQReplayLimit prevents unbounded memory usage when replaying DLQ messages.
 const defaultDLQReplayLimit = 10000
 
-func (pq *PGQueue) fetchDLQMessages(
+func (pq *Queue) fetchDLQMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -474,7 +482,7 @@ func (pq *PGQueue) fetchDLQMessages(
 	return dlqMessages, nil
 }
 
-func (pq *PGQueue) reinsertDLQMessages(
+func (pq *Queue) reinsertDLQMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	queueName, tableName string,
@@ -488,7 +496,25 @@ func (pq *PGQueue) reinsertDLQMessages(
 	return pq.reinsertDLQChannel(ctx, tx, tableName, dlqMessages)
 }
 
-func (pq *PGQueue) reinsertDLQChannel(
+// dedupeDLQByMessageID returns the DLQ rows keeping only the first occurrence
+// of each original_message_id. A message table can hold at most one row per id,
+// so duplicate DLQ entries for the same id cannot all be replayed at once; the
+// dropped ones are left in the DLQ for a later replay.
+func dedupeDLQByMessageID(dlqMessages []dlqRow) []dlqRow {
+	seen := make(map[uuid.UUID]struct{}, len(dlqMessages))
+	unique := make([]dlqRow, 0, len(dlqMessages))
+	for _, msg := range dlqMessages {
+		if _, dup := seen[msg.originalMessageID]; dup {
+			continue
+		}
+		seen[msg.originalMessageID] = struct{}{}
+		unique = append(unique, msg)
+	}
+
+	return unique
+}
+
+func (pq *Queue) reinsertDLQChannel(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -498,8 +524,15 @@ func (pq *PGQueue) reinsertDLQChannel(
 		return 0, nil
 	}
 
+	// Two DLQ rows can carry the same original_message_id (e.g. a message was
+	// DLQ'd, then re-published with the same ID and DLQ'd again). Only one row
+	// with a given id can exist in the message table, so deduplicate: the first
+	// DLQ row per id is replayed and the rest are left in the DLQ, rather than
+	// being deleted alongside it without their payload ever being restored.
+	unique := dedupeDLQByMessageID(dlqMessages)
+
 	// Insert messages and collect which IDs were actually inserted (ON CONFLICT skips dupes).
-	insertedIDs, err := pq.insertDLQChannelMessages(ctx, tx, tableName, dlqMessages)
+	insertedIDs, err := pq.insertDLQChannelMessages(ctx, tx, tableName, unique)
 	if err != nil {
 		return 0, err
 	}
@@ -510,7 +543,7 @@ func (pq *PGQueue) reinsertDLQChannel(
 
 	// Only delete DLQ entries whose messages were actually reinserted
 	dlqIDs := make([]uuid.UUID, 0, len(insertedIDs))
-	for _, msg := range dlqMessages {
+	for _, msg := range unique {
 		if _, ok := insertedIDs[msg.originalMessageID]; ok {
 			dlqIDs = append(dlqIDs, msg.id)
 		}
@@ -529,7 +562,7 @@ func (pq *PGQueue) reinsertDLQChannel(
 
 // insertDLQChannelMessages batch-inserts DLQ messages back into the channel message table.
 // Returns the set of message IDs that were actually inserted (ON CONFLICT skips duplicates).
-func (pq *PGQueue) insertDLQChannelMessages(
+func (pq *Queue) insertDLQChannelMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -578,14 +611,20 @@ func (pq *PGQueue) insertDLQChannelMessages(
 }
 
 // reinsertDLQPubSub re-creates subscription records for pub/sub DLQ messages.
-// The original message still exists in pgqueue_msg_ (only the subscription was
-// deleted when moved to DLQ), so only the subscription records are re-created.
+// The original message normally still exists in pgqueue_msg_ (only the
+// subscription was deleted when moved to DLQ), so only the subscription records
+// are re-created.
+//
+// DLQ entries whose original message has since been garbage-collected are
+// skipped and left in the DLQ: re-creating a subscription row for a missing
+// message would raise a foreign-key error that rolls back the entire replay,
+// so one stale entry could otherwise block every other entry.
 //
 // Each DLQ entry is replayed to the exact subscriber that failed (recorded in
 // subscriber_id), so subscribers that processed the message successfully are
 // never re-delivered it. ON CONFLICT DO NOTHING additionally protects any
 // subscriber whose row still exists.
-func (pq *PGQueue) reinsertDLQPubSub(
+func (pq *Queue) reinsertDLQPubSub(
 	ctx context.Context,
 	tx *sql.Tx,
 	queueName, tableName string,
@@ -595,7 +634,17 @@ func (pq *PGQueue) reinsertDLQPubSub(
 		return 0, nil
 	}
 
-	records, replayedIDs, err := pq.resolvePubSubDLQRecords(ctx, tx, queueName, dlqMessages)
+	// Drop DLQ rows whose original message no longer exists so the foreign-key
+	// insert below cannot fail and abort the whole replay.
+	live, err := pq.filterExistingMessages(ctx, tx, tableName, dlqMessages)
+	if err != nil {
+		return 0, err
+	}
+	if len(live) == 0 {
+		return 0, nil
+	}
+
+	records, replayedIDs, err := pq.resolvePubSubDLQRecords(ctx, tx, queueName, live)
 	if err != nil {
 		return 0, err
 	}
@@ -615,7 +664,52 @@ func (pq *PGQueue) reinsertDLQPubSub(
 		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
 	}
 
-	return len(replayedIDs), nil
+	return len(records), nil
+}
+
+// filterExistingMessages returns the subset of DLQ rows whose original message
+// still exists in the per-queue message table.
+func (pq *Queue) filterExistingMessages(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+	dlqMessages []dlqRow,
+) ([]dlqRow, error) {
+	ids := make([]uuid.UUID, 0, len(dlqMessages))
+	for _, msg := range dlqMessages {
+		ids = append(ids, msg.originalMessageID)
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(
+		`SELECT id FROM pgqueue_msg_%s WHERE id = ANY($1::uuid[])`, tableName,
+	)
+	rows, err := tx.QueryContext(ctx, query, uuidSliceToStringSlice(ids))
+	if err != nil {
+		return nil, fmt.Errorf("failed to check existing messages: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	existing := make(map[uuid.UUID]struct{})
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan message id: %w", err)
+		}
+		existing[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate message ids: %w", err)
+	}
+
+	live := make([]dlqRow, 0, len(dlqMessages))
+	for _, msg := range dlqMessages {
+		if _, ok := existing[msg.originalMessageID]; ok {
+			live = append(live, msg)
+		}
+	}
+
+	return live, nil
 }
 
 // resolvePubSubDLQRecords maps pub/sub DLQ rows to the subscription records to
@@ -626,7 +720,7 @@ func (pq *PGQueue) reinsertDLQPubSub(
 // currently-active subscribers; such a row is only marked for deletion when at
 // least one active subscriber exists, so a replay with no subscribers leaves it
 // in the DLQ rather than silently dropping it.
-func (pq *PGQueue) resolvePubSubDLQRecords(
+func (pq *Queue) resolvePubSubDLQRecords(
 	ctx context.Context,
 	tx *sql.Tx,
 	queueName string,
@@ -635,12 +729,24 @@ func (pq *PGQueue) resolvePubSubDLQRecords(
 	var legacySubscribers []Subscriber
 	legacyLoaded := false
 
+	// seen deduplicates subscription records: two DLQ entries can describe the
+	// same (message, subscriber) failed delivery, which needs re-creating only
+	// once. The redundant DLQ rows are still deleted.
+	seen := make(map[subRecord]struct{}, len(dlqMessages))
 	records := make([]subRecord, 0, len(dlqMessages))
 	replayedIDs := make([]uuid.UUID, 0, len(dlqMessages))
 
+	addRecord := func(rec subRecord) {
+		if _, dup := seen[rec]; dup {
+			return
+		}
+		seen[rec] = struct{}{}
+		records = append(records, rec)
+	}
+
 	for _, msg := range dlqMessages {
 		if msg.subscriberID.Valid {
-			records = append(records, subRecord{
+			addRecord(subRecord{
 				messageID:    msg.originalMessageID,
 				subscriberID: msg.subscriberID.String,
 			})
@@ -662,7 +768,7 @@ func (pq *PGQueue) resolvePubSubDLQRecords(
 			continue // leave the DLQ row in place; nothing to replay to
 		}
 		for _, sub := range legacySubscribers {
-			records = append(records, subRecord{
+			addRecord(subRecord{
 				messageID:    msg.originalMessageID,
 				subscriberID: sub.SubscriberID,
 			})
@@ -673,7 +779,7 @@ func (pq *PGQueue) resolvePubSubDLQRecords(
 	return records, replayedIDs, nil
 }
 
-func (pq *PGQueue) logReplayIfNeeded(
+func (pq *Queue) logReplayIfNeeded(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,

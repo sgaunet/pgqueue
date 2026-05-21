@@ -16,9 +16,7 @@ func TestGarbageCollector(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "gc-test", pgqueue.ChannelOptions{
-		MaxRetries: 3,
-	})
+	err := pq.CreateChannel(ctx, "gc-test", pgqueue.WithQueueMaxRetries(3))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -36,7 +34,7 @@ func TestGarbageCollector(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "gc-test", msg.ID); err != nil {
+		if err := pq.AckChannel(ctx, "gc-test", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -82,9 +80,7 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "gc-timeout-test", pgqueue.ChannelOptions{
-		MaxRetries: 3,
-	})
+	err := pq.CreateChannel(ctx, "gc-timeout-test", pgqueue.WithQueueMaxRetries(3))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -150,9 +146,7 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "gc-zero-ttl-test", pgqueue.ChannelOptions{
-		MaxRetries: 3,
-	})
+	err := pq.CreateChannel(ctx, "gc-zero-ttl-test", pgqueue.WithQueueMaxRetries(3))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -168,7 +162,7 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 		t.Fatalf("failed to consume message: %v", err)
 	}
 
-	if err := pq.AckChannel(ctx, "gc-zero-ttl-test", msg.ID); err != nil {
+	if err := pq.AckChannel(ctx, "gc-zero-ttl-test", msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack message: %v", err)
 	}
 
@@ -221,9 +215,7 @@ func TestGarbageCollectorParallel(t *testing.T) {
 	const numQueues = 5
 	for i := 0; i < numQueues; i++ {
 		name := "gc-parallel-" + string(rune('a'+i))
-		err := pq.CreateChannel(ctx, name, pgqueue.ChannelOptions{
-			MaxRetries: 3,
-		})
+		err := pq.CreateChannel(ctx, name, pgqueue.WithQueueMaxRetries(3))
 		if err != nil {
 			t.Fatalf("failed to create channel %s: %v", name, err)
 		}
@@ -239,7 +231,7 @@ func TestGarbageCollectorParallel(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, name, msg.ID); err != nil {
+		if err := pq.AckChannel(ctx, name, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -285,7 +277,7 @@ func TestGarbageCollectorPubSub(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test topic
-	err := pq.CreateTopic(ctx, "gc-pubsub-test", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "gc-pubsub-test")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -312,7 +304,7 @@ func TestGarbageCollectorPubSub(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to consume message for %s: %v", sub, err)
 			}
-			if err := pq.AckTopic(ctx, "gc-pubsub-test", sub, msg.ID); err != nil {
+			if err := pq.AckTopic(ctx, "gc-pubsub-test", sub, msg.Receipt()); err != nil {
 				t.Fatalf("failed to ack message for %s: %v", sub, err)
 			}
 		}
@@ -360,7 +352,7 @@ func TestGarbageCollectorPubSubPartialAck(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test topic
-	err := pq.CreateTopic(ctx, "gc-pubsub-partial", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "gc-pubsub-partial")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -386,7 +378,7 @@ func TestGarbageCollectorPubSubPartialAck(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume message for sub-1: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "gc-pubsub-partial", "sub-1", msg.ID); err != nil {
+		if err := pq.AckTopic(ctx, "gc-pubsub-partial", "sub-1", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message for sub-1: %v", err)
 		}
 	}
@@ -423,7 +415,7 @@ func TestPurgeQueue(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "purge-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "purge-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -515,7 +507,7 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "gc-pubsub-vt", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "gc-pubsub-vt")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -574,7 +566,7 @@ func TestGarbageCollectorMaxPendingAge(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("channel", func(t *testing.T) {
-		err := pq.CreateChannel(ctx, "gc-maxage-ch", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "gc-maxage-ch")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -619,7 +611,7 @@ func TestGarbageCollectorMaxPendingAge(t *testing.T) {
 	})
 
 	t.Run("pubsub", func(t *testing.T) {
-		err := pq.CreateTopic(ctx, "gc-maxage-ps", pgqueue.TopicOptions{})
+		err := pq.CreateTopic(ctx, "gc-maxage-ps")
 		if err != nil {
 			t.Fatalf("failed to create topic: %v", err)
 		}
@@ -672,9 +664,7 @@ func TestGarbageCollectorDLQRetention(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "gc-dlq-ret", pgqueue.ChannelOptions{
-		MaxRetries: 1,
-	})
+	err := pq.CreateChannel(ctx, "gc-dlq-ret", pgqueue.WithQueueMaxRetries(1))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -691,7 +681,7 @@ func TestGarbageCollectorDLQRetention(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
-		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.ID, "fail"); err != nil {
+		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.Receipt(), "fail"); err != nil {
 			t.Fatalf("first nack failed: %v", err)
 		}
 		// Second consume + nack: exceeds max retries -> DLQ
@@ -699,7 +689,7 @@ func TestGarbageCollectorDLQRetention(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume for DLQ: %v", err)
 		}
-		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.ID, "fail again"); err != nil {
+		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.Receipt(), "fail again"); err != nil {
 			t.Fatalf("second nack failed: %v", err)
 		}
 	}
@@ -745,7 +735,7 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 
 	// Create two channels
 	for _, name := range []string{"gc-policy-a", "gc-policy-b"} {
-		err := pq.CreateChannel(ctx, name, pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, name)
 		if err != nil {
 			t.Fatalf("failed to create channel %s: %v", name, err)
 		}
@@ -761,7 +751,7 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to consume from %s: %v", name, err)
 			}
-			if err := pq.AckChannel(ctx, name, msg.ID); err != nil {
+			if err := pq.AckChannel(ctx, name, msg.Receipt()); err != nil {
 				t.Fatalf("failed to ack in %s: %v", name, err)
 			}
 		}

@@ -9,7 +9,7 @@ import (
 )
 
 // GetStats returns statistics for a queue.
-func (pq *PGQueue) GetStats(
+func (pq *Queue) GetStats(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -51,7 +51,7 @@ func (pq *PGQueue) GetStats(
 }
 
 // GetQueueDepth returns the number of pending messages in a queue.
-func (pq *PGQueue) GetQueueDepth(
+func (pq *Queue) GetQueueDepth(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -94,7 +94,7 @@ func (pq *PGQueue) GetQueueDepth(
 }
 
 // GetSubscriberLag returns lag statistics for a specific subscriber on a topic.
-func (pq *PGQueue) GetSubscriberLag(
+func (pq *Queue) GetSubscriberLag(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
@@ -153,7 +153,7 @@ func (pq *PGQueue) GetSubscriberLag(
 }
 
 // GetDLQStats returns statistics about messages in the dead letter queue.
-func (pq *PGQueue) GetDLQStats(
+func (pq *Queue) GetDLQStats(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -214,7 +214,7 @@ func (pq *PGQueue) GetDLQStats(
 }
 
 // getChannelStats gets statistics for a channel queue.
-func (pq *PGQueue) getChannelStats(
+func (pq *Queue) getChannelStats(
 	ctx context.Context,
 	tableName string,
 	stats *QueueStats,
@@ -260,7 +260,7 @@ func (pq *PGQueue) getChannelStats(
 }
 
 // getPubSubStats gets statistics for a pub/sub topic.
-func (pq *PGQueue) getPubSubStats(
+func (pq *Queue) getPubSubStats(
 	ctx context.Context,
 	tableName string,
 	stats *QueueStats,
@@ -306,7 +306,7 @@ func (pq *PGQueue) getPubSubStats(
 }
 
 // GetSubscriberHealth returns detailed health information for a specific subscriber on a topic.
-func (pq *PGQueue) GetSubscriberHealth(
+func (pq *Queue) GetSubscriberHealth(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
@@ -372,7 +372,7 @@ func (pq *PGQueue) GetSubscriberHealth(
 // A subscriber is unhealthy if it has messages stuck in processing (visibility timeout
 // expired) or pending messages older than the given threshold.
 // Note: this executes one query per topic due to the table-per-queue design.
-func (pq *PGQueue) GetUnhealthySubscribers(
+func (pq *Queue) GetUnhealthySubscribers(
 	ctx context.Context,
 	threshold time.Duration,
 ) ([]SubscriberHealth, error) {
@@ -417,7 +417,7 @@ func (pq *PGQueue) GetUnhealthySubscribers(
 	return unhealthy, nil
 }
 
-func (pq *PGQueue) findUnhealthyForTopic(
+func (pq *Queue) findUnhealthyForTopic(
 	ctx context.Context,
 	topicName, tableName string,
 	cutoff time.Time,

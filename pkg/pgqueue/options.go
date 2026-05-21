@@ -1,0 +1,157 @@
+package pgqueue
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// QueueOption is a per-queue creation option applied when calling CreateChannel
+// or CreateTopic.
+type QueueOption func(*queueCreateOpts)
+
+// queueCreateOpts holds the resolved per-queue creation options.
+type queueCreateOpts struct {
+	maxMessageSize int
+	ttl            time.Duration
+	maxRetries     int
+}
+
+// WithQueueMaxRetries overrides the default maximum retry count for a specific
+// channel or topic.
+func WithQueueMaxRetries(n int) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.maxRetries = n
+	}
+}
+
+// WithQueueTTL overrides the default message TTL for a specific channel or topic.
+// Zero means no expiry.
+func WithQueueTTL(d time.Duration) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.ttl = d
+	}
+}
+
+// WithQueueMaxMessageSize overrides the default maximum message size for a
+// specific channel or topic.
+func WithQueueMaxMessageSize(bytes int) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.maxMessageSize = bytes
+	}
+}
+
+// applyQueueOptions applies functional options onto a zero queueCreateOpts.
+func applyQueueOptions(opts []QueueOption) queueCreateOpts {
+	o := queueCreateOpts{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+
+// PublishOption is a per-publish option applied to a single publish call.
+type PublishOption func(*publishOpts)
+
+// publishOpts holds the resolved per-message publish options.
+type publishOpts struct {
+	messageID uuid.UUID
+	metadata  map[string]any
+}
+
+// WithMessageID sets a specific message ID for deduplication. If not set, a
+// new UUIDv7 is generated automatically. When a message with the same ID
+// already exists, ErrDuplicateMessageID is returned.
+func WithMessageID(id uuid.UUID) PublishOption {
+	return func(o *publishOpts) {
+		o.messageID = id
+	}
+}
+
+// WithMessageMetadata attaches arbitrary metadata to a published message. The
+// metadata is stored as JSONB and returned with consumed messages.
+func WithMessageMetadata(m map[string]any) PublishOption {
+	return func(o *publishOpts) {
+		o.metadata = m
+	}
+}
+
+// applyPublishOptions applies functional options onto a zero publishOpts.
+func applyPublishOptions(opts []PublishOption) publishOpts {
+	o := publishOpts{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// ConsumeOption is a per-consume option applied to Receive*/Consume* calls.
+type ConsumeOption func(*consumeOpts)
+
+// consumeOpts holds the resolved per-consume options.
+type consumeOpts struct {
+	visibilityTimeout time.Duration
+	concurrency       int
+	pollInterval      time.Duration
+}
+
+// WithVisibilityTimeout sets the visibility timeout for a consumed message.
+// The message becomes eligible for redelivery if not acknowledged within this
+// duration.
+func WithVisibilityTimeout(d time.Duration) ConsumeOption {
+	return func(o *consumeOpts) {
+		o.visibilityTimeout = d
+	}
+}
+
+// WithConcurrency sets the number of parallel workers for handler-based consume
+// APIs (ConsumeChannel/ConsumeTopic). It is ignored by single-shot
+// ReceiveChannel/ReceiveTopic.
+func WithConcurrency(n int) ConsumeOption {
+	return func(o *consumeOpts) {
+		o.concurrency = n
+	}
+}
+
+// WithPollInterval sets the polling interval between successive consume attempts
+// when no message is available.
+func WithPollInterval(d time.Duration) ConsumeOption {
+	return func(o *consumeOpts) {
+		o.pollInterval = d
+	}
+}
+
+// defaultVisibilityTimeout is the default visibility timeout used by
+// ReceiveChannel and ReceiveTopic when WithVisibilityTimeout is not provided.
+const defaultVisibilityTimeout = 30 * time.Second
+
+// applyConsumeOptions applies functional options onto a consumeOpts with
+// defaults filled in.
+func applyConsumeOptions(opts []ConsumeOption) consumeOpts {
+	o := consumeOpts{
+		visibilityTimeout: defaultVisibilityTimeout,
+	}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// NackOption is a per-nack option applied to Nack and NackBatch calls.
+type NackOption func(*nackOpts)
+
+// nackOpts holds the resolved per-nack options.
+type nackOpts struct {
+	retryDelay time.Duration
+}
+
+// WithRetryDelay overrides the computed backoff delay before the nacked message
+// becomes eligible for redelivery (FR-023). Zero means use the default backoff
+// policy.
+func WithRetryDelay(d time.Duration) NackOption {
+	return func(o *nackOpts) {
+		o.retryDelay = d
+	}
+}
+

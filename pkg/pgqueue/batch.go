@@ -28,7 +28,7 @@ const (
 //
 // Note: batch ack/nack operations require the pgx driver (jackc/pgx); lib/pq is not
 // supported for operations that use ANY($1::uuid[]) array parameters.
-func (pq *PGQueue) PublishBatch(
+func (pq *Queue) PublishBatch(
 	ctx context.Context,
 	queueName string,
 	messages []PublishMessage,
@@ -78,17 +78,18 @@ func (pq *PGQueue) PublishBatch(
 
 // AckChannelBatch acknowledges multiple messages from a channel in a single operation.
 // Returns ErrMessageAlreadyAcked only if no messages were updated.
-// If some but not all IDs were in processing state, the rest are silently skipped
-// and nil is returned (partial success).
-func (pq *PGQueue) AckChannelBatch(
+// Receipts that were not in processing state under their claim token (including
+// expired claims) are silently skipped and nil is returned (partial success);
+// batch operations do not surface ErrClaimExpired per receipt.
+func (pq *Queue) AckChannelBatch(
 	ctx context.Context,
 	channelName string,
-	messageIDs []uuid.UUID,
+	receipts []Receipt,
 ) error {
-	if len(messageIDs) == 0 {
+	if len(receipts) == 0 {
 		return nil
 	}
-	if err := validateBatchSize(len(messageIDs)); err != nil {
+	if err := validateBatchSize(len(receipts)); err != nil {
 		return err
 	}
 
@@ -104,13 +105,16 @@ func (pq *PGQueue) AckChannelBatch(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_msg_%s
+		UPDATE pgqueue_msg_%s AS m
 		SET status = '%s', processed_at = NOW()
-		WHERE id = ANY($1::uuid[])
-		  AND status = '%s'
+		FROM unnest($1::uuid[], $2::uuid[]) AS u(id, claim_id)
+		WHERE m.id = u.id
+		  AND m.claim_id = u.claim_id
+		  AND m.status = '%s'
 	`, queueMeta.TableName, MessageStatusCompleted, MessageStatusProcessing)
 
-	result, err := pq.db.ExecContext(ctx, query, uuidSliceToStringSlice(messageIDs))
+	ids, claims := receiptsToIDClaimSlices(receipts)
+	result, err := pq.db.ExecContext(ctx, query, ids, claims)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge messages: %w", err)
 	}
@@ -128,21 +132,22 @@ func (pq *PGQueue) AckChannelBatch(
 
 // AckTopicBatch acknowledges multiple messages for a subscriber in a single operation.
 // Returns ErrMessageAlreadyAcked only if no messages were updated.
-// If some but not all IDs were in processing state, the rest are silently skipped
-// and nil is returned (partial success).
-func (pq *PGQueue) AckTopicBatch(
+// Receipts that were not in processing state under their claim token (including
+// expired claims) are silently skipped and nil is returned (partial success);
+// batch operations do not surface ErrClaimExpired per receipt.
+func (pq *Queue) AckTopicBatch(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
-	messageIDs []uuid.UUID,
+	receipts []Receipt,
 ) error {
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return err
 	}
-	if len(messageIDs) == 0 {
+	if len(receipts) == 0 {
 		return nil
 	}
-	if err := validateBatchSize(len(messageIDs)); err != nil {
+	if err := validateBatchSize(len(receipts)); err != nil {
 		return err
 	}
 
@@ -158,16 +163,17 @@ func (pq *PGQueue) AckTopicBatch(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		UPDATE pgqueue_sub_%s
+		UPDATE pgqueue_sub_%s AS s
 		SET status = '%s', acked_at = NOW()
-		WHERE message_id = ANY($1::uuid[])
-		  AND subscriber_id = $2
-		  AND status = '%s'
+		FROM unnest($1::uuid[], $2::uuid[]) AS u(message_id, claim_id)
+		WHERE s.message_id = u.message_id
+		  AND s.claim_id = u.claim_id
+		  AND s.subscriber_id = $3
+		  AND s.status = '%s'
 	`, queueMeta.TableName, MessageStatusAcked, MessageStatusProcessing)
 
-	result, err := pq.db.ExecContext(
-		ctx, query, uuidSliceToStringSlice(messageIDs), subscriberID,
-	)
+	ids, claims := receiptsToIDClaimSlices(receipts)
+	result, err := pq.db.ExecContext(ctx, query, ids, claims, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge messages: %w", err)
 	}
@@ -186,18 +192,18 @@ func (pq *PGQueue) AckTopicBatch(
 // NackChannelBatch negatively acknowledges multiple messages from a channel.
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
-func (pq *PGQueue) NackChannelBatch(
+func (pq *Queue) NackChannelBatch(
 	ctx context.Context,
 	channelName string,
-	messageIDs []uuid.UUID,
+	receipts []Receipt,
 	errorMsg string,
 ) error {
 	errorMsg = truncateErrorMsg(errorMsg)
 
-	if len(messageIDs) == 0 {
+	if len(receipts) == 0 {
 		return nil
 	}
-	if err := validateBatchSize(len(messageIDs)); err != nil {
+	if err := validateBatchSize(len(receipts)); err != nil {
 		return err
 	}
 
@@ -218,7 +224,7 @@ func (pq *PGQueue) NackChannelBatch(
 	defer func() { _ = tx.Rollback() }()
 
 	states, err := pq.fetchBatchMessageStates(
-		ctx, tx, queueMeta.TableName, messageIDs,
+		ctx, tx, queueMeta.TableName, receipts,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get message states: %w", err)
@@ -241,11 +247,11 @@ func (pq *PGQueue) NackChannelBatch(
 // NackTopicBatch negatively acknowledges multiple messages for a subscriber from a topic.
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
-func (pq *PGQueue) NackTopicBatch(
+func (pq *Queue) NackTopicBatch(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
-	messageIDs []uuid.UUID,
+	receipts []Receipt,
 	errorMsg string,
 ) error {
 	errorMsg = truncateErrorMsg(errorMsg)
@@ -253,10 +259,10 @@ func (pq *PGQueue) NackTopicBatch(
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return err
 	}
-	if len(messageIDs) == 0 {
+	if len(receipts) == 0 {
 		return nil
 	}
-	if err := validateBatchSize(len(messageIDs)); err != nil {
+	if err := validateBatchSize(len(receipts)); err != nil {
 		return err
 	}
 
@@ -272,7 +278,7 @@ func (pq *PGQueue) NackTopicBatch(
 	defer func() { _ = tx.Rollback() }()
 
 	states, err := pq.fetchBatchSubStates(
-		ctx, tx, queueMeta.TableName, messageIDs, subscriberID,
+		ctx, tx, queueMeta.TableName, receipts, subscriberID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get subscription states: %w", err)
@@ -297,7 +303,7 @@ func (pq *PGQueue) NackTopicBatch(
 }
 
 // getTopicMetadata retrieves topic metadata, translating not-found to ErrTopicNotFound.
-func (pq *PGQueue) getTopicMetadata(
+func (pq *Queue) getTopicMetadata(
 	ctx context.Context,
 	topicName string,
 ) (*QueueMetadata, error) {
@@ -314,7 +320,7 @@ func (pq *PGQueue) getTopicMetadata(
 }
 
 // processNackBatch partitions messages into retry vs DLQ and processes each group.
-func (pq *PGQueue) processNackBatch(
+func (pq *Queue) processNackBatch(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -396,7 +402,7 @@ func prepareBatchMessages(messages []PublishMessage) ([]uuid.UUID, [][]byte, err
 }
 
 // publishBatchToChannel inserts multiple messages into a channel using multi-row INSERT.
-func (pq *PGQueue) publishBatchToChannel(
+func (pq *Queue) publishBatchToChannel(
 	ctx context.Context,
 	tableName string,
 	ids []uuid.UUID,
@@ -449,7 +455,7 @@ func (pq *PGQueue) publishBatchToChannel(
 }
 
 // publishBatchToPubSub inserts multiple messages and subscription records in a transaction.
-func (pq *PGQueue) publishBatchToPubSub(
+func (pq *Queue) publishBatchToPubSub(
 	ctx context.Context,
 	topicName, tableName string,
 	ids []uuid.UUID,
@@ -486,7 +492,7 @@ func (pq *PGQueue) publishBatchToPubSub(
 	return nil
 }
 
-func (pq *PGQueue) insertBatchPubSubMessages(
+func (pq *Queue) insertBatchPubSubMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -536,7 +542,7 @@ type subRecord struct {
 
 // batchCreateSubscriptionRecords creates subscription records for the cross
 // product of the given messages and subscribers.
-func (pq *PGQueue) batchCreateSubscriptionRecords(
+func (pq *Queue) batchCreateSubscriptionRecords(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -559,7 +565,7 @@ func (pq *PGQueue) batchCreateSubscriptionRecords(
 // insertSubscriptionRecords inserts subscription rows, chunked to stay within
 // PostgreSQL's parameter limit. ON CONFLICT DO NOTHING makes it idempotent and
 // tolerant of duplicate pairs within records.
-func (pq *PGQueue) insertSubscriptionRecords(
+func (pq *Queue) insertSubscriptionRecords(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -612,22 +618,26 @@ type batchDLQMessage struct {
 	metadataJSON sql.NullString
 }
 
-func (pq *PGQueue) fetchBatchMessageStates(
+func (pq *Queue) fetchBatchMessageStates(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
-	messageIDs []uuid.UUID,
+	receipts []Receipt,
 ) ([]batchMessageState, error) {
+	// Match (id, claim_id) pairs: a receipt whose claim token no longer matches
+	// (the message was reclaimed by another consumer) is simply not returned.
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		SELECT id, retry_count, max_retries, payload, metadata
-		FROM pgqueue_msg_%s
-		WHERE id = ANY($1::uuid[])
-		  AND status = '%s'
-		FOR UPDATE
+		SELECT m.id, m.retry_count, m.max_retries, m.payload, m.metadata
+		FROM pgqueue_msg_%s AS m
+		JOIN unnest($1::uuid[], $2::uuid[]) AS u(id, claim_id)
+		  ON m.id = u.id AND m.claim_id = u.claim_id
+		WHERE m.status = '%s'
+		FOR UPDATE OF m
 	`, tableName, MessageStatusProcessing)
 
-	rows, err := tx.QueryContext(ctx, query, uuidSliceToStringSlice(messageIDs))
+	ids, claims := receiptsToIDClaimSlices(receipts)
+	rows, err := tx.QueryContext(ctx, query, ids, claims)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages: %w", err)
 	}
@@ -651,7 +661,7 @@ func (pq *PGQueue) fetchBatchMessageStates(
 	return states, nil
 }
 
-func (pq *PGQueue) batchRetryMessages(
+func (pq *Queue) batchRetryMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -676,7 +686,7 @@ func (pq *PGQueue) batchRetryMessages(
 	return nil
 }
 
-func (pq *PGQueue) batchMoveToDLQ(
+func (pq *Queue) batchMoveToDLQ(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -731,25 +741,29 @@ type batchSubState struct {
 	metadataJSON sql.NullString
 }
 
-func (pq *PGQueue) fetchBatchSubStates(
+func (pq *Queue) fetchBatchSubStates(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
-	messageIDs []uuid.UUID,
+	receipts []Receipt,
 	subscriberID string,
 ) ([]batchSubState, error) {
+	// Match (message_id, claim_id) pairs: a receipt whose claim token no longer
+	// matches (the subscription was reclaimed) is simply not returned.
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT s.message_id, s.retry_count, m.payload, m.metadata
 		FROM pgqueue_sub_%s s
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
-		WHERE s.message_id = ANY($1::uuid[])
-		  AND s.subscriber_id = $2
+		JOIN unnest($1::uuid[], $2::uuid[]) AS u(message_id, claim_id)
+		  ON s.message_id = u.message_id AND s.claim_id = u.claim_id
+		WHERE s.subscriber_id = $3
 		  AND s.status = '%s'
 		FOR UPDATE OF s
 	`, tableName, tableName, MessageStatusProcessing)
 
-	rows, err := tx.QueryContext(ctx, query, uuidSliceToStringSlice(messageIDs), subscriberID)
+	ids, claims := receiptsToIDClaimSlices(receipts)
+	rows, err := tx.QueryContext(ctx, query, ids, claims, subscriberID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query subscriptions: %w", err)
 	}
@@ -774,7 +788,7 @@ func (pq *PGQueue) fetchBatchSubStates(
 }
 
 // processNackTopicBatch partitions subscriptions into retry vs DLQ and processes each group.
-func (pq *PGQueue) processNackTopicBatch(
+func (pq *Queue) processNackTopicBatch(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName, subscriberID string,
@@ -817,7 +831,7 @@ func (pq *PGQueue) processNackTopicBatch(
 	return nil
 }
 
-func (pq *PGQueue) batchRetrySubscriptions(
+func (pq *Queue) batchRetrySubscriptions(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -843,7 +857,7 @@ func (pq *PGQueue) batchRetrySubscriptions(
 	return nil
 }
 
-func (pq *PGQueue) batchMoveSubToDLQ(
+func (pq *Queue) batchMoveSubToDLQ(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName, subscriberID string,
@@ -902,4 +916,18 @@ func uuidSliceToStringSlice(ids []uuid.UUID) []string {
 		result[i] = id.String()
 	}
 	return result
+}
+
+// receiptsToIDClaimSlices splits receipts into index-aligned message-ID and
+// claim-ID string slices, for use as the two PostgreSQL uuid[] parameters of an
+// unnest(...) join (pgx driver).
+func receiptsToIDClaimSlices(receipts []Receipt) ([]string, []string) {
+	ids := make([]string, len(receipts))
+	claims := make([]string, len(receipts))
+	for i, r := range receipts {
+		ids[i] = r.MessageID.String()
+		claims[i] = r.ClaimID.String()
+	}
+
+	return ids, claims
 }

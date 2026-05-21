@@ -27,17 +27,16 @@ func TestPublish_PoolExhaustion(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Re-initialize PGQueue with the constrained pool
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB:                db,
-		MaxMessageSize:    testMaxMessageSize,
-		DefaultMaxRetries: testDefaultMaxRetries,
-	})
+	// Re-initialize Queue with the constrained pool
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithMaxMessageSize(testMaxMessageSize),
+		pgqueue.WithDefaultMaxRetries(testDefaultMaxRetries),
+	)
 	if err != nil {
 		t.Fatalf("failed to re-init pgqueue: %v", err)
 	}
 
-	err = pq.CreateChannel(ctx, "pool-exhaust", pgqueue.ChannelOptions{})
+	err = pq.CreateChannel(ctx, "pool-exhaust")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -96,18 +95,15 @@ func TestPublish_LargePayload(t *testing.T) {
 	const largeSize = 10 * 1024 * 1024 // 10MB
 
 	// Re-initialize with large max message size
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB:                db,
-		MaxMessageSize:    largeSize,
-		DefaultMaxRetries: testDefaultMaxRetries,
-	})
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithMaxMessageSize(largeSize),
+		pgqueue.WithDefaultMaxRetries(testDefaultMaxRetries),
+	)
 	if err != nil {
 		t.Fatalf("failed to re-init pgqueue: %v", err)
 	}
 
-	err = pq.CreateChannel(ctx, "large-payload", pgqueue.ChannelOptions{
-		MaxMessageSize: largeSize,
-	})
+	err = pq.CreateChannel(ctx, "large-payload", pgqueue.WithQueueMaxMessageSize(largeSize))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -142,7 +138,7 @@ func TestPubSub_SubscriberChurn(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "churn-topic", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "churn-topic")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -195,7 +191,7 @@ func TestPubSub_SubscriberChurn(t *testing.T) {
 				break
 			}
 			payloads = append(payloads, string(msg.Payload))
-			if err := pq.AckTopic(ctx, "churn-topic", subscriberID, msg.ID); err != nil {
+			if err := pq.AckTopic(ctx, "churn-topic", subscriberID, msg.Receipt()); err != nil {
 				t.Fatalf("subscriber %s: ack error: %v", subscriberID, err)
 			}
 		}
@@ -245,7 +241,7 @@ func TestPublish_InvalidMetadata(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "meta-fail", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "meta-fail")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -253,8 +249,7 @@ func TestPublish_InvalidMetadata(t *testing.T) {
 	t.Run("channel_value", func(t *testing.T) {
 		msgID, _ := pgqueue.NewUUIDv7()
 		_, err := pq.PublishWithID(ctx, "meta-fail", msgID, []byte("test"),
-			map[string]any{"bad": make(chan int)},
-		)
+			map[string]any{"bad": make(chan int)})
 		if err == nil {
 			t.Fatal("expected error for channel metadata, got nil")
 		}
@@ -266,8 +261,7 @@ func TestPublish_InvalidMetadata(t *testing.T) {
 	t.Run("func_value", func(t *testing.T) {
 		msgID, _ := pgqueue.NewUUIDv7()
 		_, err := pq.PublishWithID(ctx, "meta-fail", msgID, []byte("test"),
-			map[string]any{"bad": func() {}},
-		)
+			map[string]any{"bad": func() {}})
 		if err == nil {
 			t.Fatal("expected error for func metadata, got nil")
 		}
@@ -285,7 +279,7 @@ func TestPublish_ContextTimeout(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "ctx-timeout", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "ctx-timeout")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -328,7 +322,7 @@ func TestPublishWithID_ConcurrentDuplicates(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "dedup-concurrent", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "dedup-concurrent")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -396,7 +390,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("binary_null_bytes", func(t *testing.T) {
-		err := pq.CreateChannel(ctx, "binary-null", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "binary-null")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -419,7 +413,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 	})
 
 	t.Run("non_utf8", func(t *testing.T) {
-		err := pq.CreateChannel(ctx, "binary-nonutf8", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "binary-nonutf8")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -442,7 +436,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 	})
 
 	t.Run("empty_payload", func(t *testing.T) {
-		err := pq.CreateChannel(ctx, "binary-empty", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "binary-empty")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -468,7 +462,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 	})
 
 	t.Run("mixed_binary_text", func(t *testing.T) {
-		err := pq.CreateChannel(ctx, "binary-mixed", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "binary-mixed")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}

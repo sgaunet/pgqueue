@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/google/uuid"
 )
 
 // getQueueTTL extracts the TTL from queue config JSON, falling back to the
-// default TTL from PGQueue config. Returns 0 if no TTL is configured.
-func (pq *PGQueue) getQueueTTL(configJSON []byte) time.Duration {
+// default TTL from Queue config. Returns 0 if no TTL is configured.
+func (pq *Queue) getQueueTTL(configJSON []byte) time.Duration {
 	var cfg struct {
 		TTL time.Duration `json:"TTL"`
 	}
@@ -30,23 +30,85 @@ func (pq *PGQueue) getQueueTTL(configJSON []byte) time.Duration {
 	return pq.config.DefaultTTL
 }
 
-// parseMetadataJSON parses a nullable JSON string into a metadata map.
-func parseMetadataJSON(s sql.NullString) map[string]any {
+// parseMetadataJSON parses a nullable JSON string into a metadata map. Corrupt
+// metadata is logged and treated as absent rather than failing the surrounding
+// consume, so a single bad row cannot wedge a consumer.
+func (pq *Queue) parseMetadataJSON(s sql.NullString) map[string]any {
 	if !s.Valid || s.String == "" {
 		return nil
 	}
 
 	var m map[string]any
 	if err := json.Unmarshal([]byte(s.String), &m); err != nil {
+		pq.logError("failed to parse message metadata; dropping it", "error", err)
 		return nil
 	}
 
 	return m
 }
 
+// classifyClaimMiss explains why an Ack/Nack matched no row. statusQuery must
+// SELECT (status TEXT, claim_id UUID) for the targeted row. It returns
+// ErrClaimExpired when the row is still processing under a different claim
+// token, ErrMessageNotFound when the row no longer exists, and
+// ErrMessageAlreadyAcked otherwise (already completed/acked).
+func classifyClaimMiss(
+	ctx context.Context,
+	q queryRower,
+	statusQuery string,
+	expectedClaim uuid.UUID,
+	args ...any,
+) error {
+	var status string
+	var claimID uuid.NullUUID
+	err := q.QueryRowContext(ctx, statusQuery, args...).Scan(&status, &claimID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrMessageNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("failed to classify claim miss: %w", err)
+	}
+	if MessageStatus(status) == MessageStatusProcessing &&
+		claimID.Valid && claimID.UUID != expectedClaim {
+		return ErrClaimExpired
+	}
+
+	return ErrMessageAlreadyAcked
+}
+
+// classifyChannelAckMiss classifies a failed channel Ack/Nack for the receipt.
+func classifyChannelAckMiss(
+	ctx context.Context,
+	q queryRower,
+	tableName string,
+	r Receipt,
+) error {
+	query := fmt.Sprintf(
+		`SELECT status, claim_id FROM pgqueue_msg_%s WHERE id = $1`, tableName,
+	)
+
+	return classifyClaimMiss(ctx, q, query, r.ClaimID, r.MessageID)
+}
+
+// classifyTopicAckMiss classifies a failed topic Ack/Nack for the given
+// subscriber and receipt.
+func classifyTopicAckMiss(
+	ctx context.Context,
+	q queryRower,
+	tableName, subscriberID string,
+	r Receipt,
+) error {
+	query := fmt.Sprintf(
+		`SELECT status, claim_id FROM pgqueue_sub_%s WHERE message_id = $1 AND subscriber_id = $2`,
+		tableName,
+	)
+
+	return classifyClaimMiss(ctx, q, query, r.ClaimID, r.MessageID, subscriberID)
+}
+
 // Metadata query methods
 
-func (pq *PGQueue) getQueueMetadata(
+func (pq *Queue) getQueueMetadata(
 	ctx context.Context,
 	queueType, queueName string,
 ) (*QueueMetadata, error) {
@@ -76,10 +138,33 @@ func (pq *PGQueue) getQueueMetadata(
 		return nil, fmt.Errorf("failed to scan queue metadata: %w", err)
 	}
 
+	// Populate the table-name cache. Only the immutable table_name field is
+	// cached; mutable fields (paused, config) are always read fresh from the DB.
+	if pq.mdcache != nil {
+		pq.mdcache.set(queueType, queueName, meta.TableName)
+	}
+
 	return &meta, nil
 }
 
-func (pq *PGQueue) createQueueMetadata(
+// cachedTableName returns the physical table name for the given queue, using the
+// metadata cache when available to avoid a database round-trip. When the cache
+// misses it falls back to a targeted SELECT of just the table_name column.
+func (pq *Queue) cachedTableName(ctx context.Context, queueType, queueName string) (string, error) {
+	if pq.mdcache != nil {
+		if name, ok := pq.mdcache.get(queueType, queueName); ok {
+			return name, nil
+		}
+	}
+	// Cache miss: fetch and store.
+	meta, err := pq.getQueueMetadata(ctx, queueType, queueName)
+	if err != nil {
+		return "", err
+	}
+	return meta.TableName, nil
+}
+
+func (pq *Queue) createQueueMetadata(
 	ctx context.Context,
 	tx *sql.Tx,
 	queueType, queueName, tableName string,
@@ -116,7 +201,7 @@ func (pq *PGQueue) createQueueMetadata(
 // countQueues returns the total number of queues (channels and topics) currently
 // registered in pgqueue_metadata. The count runs inside the supplied transaction
 // so it is consistent with the metadata insert that follows.
-func (pq *PGQueue) countQueues(ctx context.Context, tx *sql.Tx) (int, error) {
+func (pq *Queue) countQueues(ctx context.Context, tx *sql.Tx) (int, error) {
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pgqueue_metadata`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("failed to count queues: %w", err)
@@ -125,24 +210,36 @@ func (pq *PGQueue) countQueues(ctx context.Context, tx *sql.Tx) (int, error) {
 	return count, nil
 }
 
+// pgUniqueViolation is the PostgreSQL SQLSTATE for a unique-constraint
+// violation.
+const pgUniqueViolation = "23505"
+
+// sqlStater is satisfied by the error types of PostgreSQL drivers that expose
+// the SQLSTATE as a string (notably pgx's *pgconn.PgError). Matching this local
+// interface keeps pgqueue free of a compile-time dependency on any specific
+// driver.
+type sqlStater interface {
+	SQLState() string
+}
+
 // isUniqueViolation reports whether err is a PostgreSQL unique-constraint
-// violation (SQLSTATE 23505).
+// violation (SQLSTATE 23505). It is driver-agnostic: pgx errors are matched via
+// the sqlStater interface, while drivers whose SQLSTATE accessor has a
+// different shape (such as lib/pq) are matched on the error text.
 func isUniqueViolation(err error) bool {
 	if err == nil {
 		return false
 	}
-	// pgx surfaces a typed *pgconn.PgError; prefer the exact SQLSTATE check.
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.Code == "23505"
+	var s sqlStater
+	if errors.As(err, &s) {
+		return s.SQLState() == pgUniqueViolation
 	}
-	// Fallback for non-pgx drivers (e.g. lib/pq), which is not a dependency
-	// here and cannot be type-asserted: match the SQLSTATE / message text.
 	errStr := err.Error()
-	return strings.Contains(errStr, "23505") || strings.Contains(errStr, "unique constraint")
+	return strings.Contains(errStr, pgUniqueViolation) ||
+		strings.Contains(errStr, "unique constraint")
 }
 
-func (pq *PGQueue) checkTableNameNotExists(
+func (pq *Queue) checkTableNameNotExists(
 	ctx context.Context,
 	tableName string,
 ) error {
@@ -165,7 +262,7 @@ func (pq *PGQueue) checkTableNameNotExists(
 	return nil
 }
 
-func (pq *PGQueue) listQueuesRaw(
+func (pq *Queue) listQueuesRaw(
 	ctx context.Context,
 	queueType string,
 ) ([]QueueMetadata, error) {
@@ -209,7 +306,7 @@ func (pq *PGQueue) listQueuesRaw(
 
 // Subscriber query methods
 
-func (pq *PGQueue) registerSubscriber(
+func (pq *Queue) registerSubscriber(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) (*Subscriber, error) {
@@ -237,7 +334,7 @@ func (pq *PGQueue) registerSubscriber(
 	return &sub, nil
 }
 
-func (pq *PGQueue) unregisterSubscriber(
+func (pq *Queue) unregisterSubscriber(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
@@ -262,7 +359,7 @@ func (pq *PGQueue) unregisterSubscriber(
 	return nil
 }
 
-func (pq *PGQueue) getActiveSubscribers(
+func (pq *Queue) getActiveSubscribers(
 	ctx context.Context,
 	tx *sql.Tx,
 	topicName string,
@@ -311,7 +408,7 @@ func (pq *PGQueue) getActiveSubscribers(
 
 // Delete query methods
 
-func (pq *PGQueue) deleteQueueMetadata(
+func (pq *Queue) deleteQueueMetadata(
 	ctx context.Context,
 	tx *sql.Tx,
 	queueType, queueName string,
@@ -341,7 +438,7 @@ func (pq *PGQueue) deleteQueueMetadata(
 
 // Replay log query methods
 
-func (pq *PGQueue) createReplayLog(
+func (pq *Queue) createReplayLog(
 	ctx context.Context,
 	queueType, queueName, replayType string,
 	replayParams []byte,
@@ -368,7 +465,7 @@ func (pq *PGQueue) createReplayLog(
 	return nil
 }
 
-func (pq *PGQueue) getReplayHistory(
+func (pq *Queue) getReplayHistory(
 	ctx context.Context,
 	queueType, queueName string,
 	limit int,

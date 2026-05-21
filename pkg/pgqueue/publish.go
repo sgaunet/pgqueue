@@ -11,7 +11,7 @@ import (
 
 // Publish publishes a message to a topic or channel.
 // Returns the message ID (UUIDv7) on success.
-func (pq *PGQueue) Publish(
+func (pq *Queue) Publish(
 	ctx context.Context,
 	queueName string,
 	payload []byte,
@@ -23,7 +23,7 @@ func (pq *PGQueue) Publish(
 // If messageID is the zero value (uuid.Nil), a new UUIDv7 will be generated.
 // payload must not be nil (use []byte{} for an empty payload).
 // metadata is optional and can be nil.
-func (pq *PGQueue) PublishWithID(
+func (pq *Queue) PublishWithID(
 	ctx context.Context,
 	queueName string,
 	messageID uuid.UUID,
@@ -81,7 +81,7 @@ func (pq *PGQueue) PublishWithID(
 	)
 }
 
-func (pq *PGQueue) resolveQueueMetadata(
+func (pq *Queue) resolveQueueMetadata(
 	ctx context.Context,
 	queueName string,
 ) (*QueueMetadata, error) {
@@ -124,7 +124,7 @@ func (pq *PGQueue) resolveQueueMetadata(
 	}
 }
 
-func (pq *PGQueue) validatePayloadSize(
+func (pq *Queue) validatePayloadSize(
 	queueMeta *QueueMetadata,
 	payload []byte,
 ) error {
@@ -148,7 +148,7 @@ func (pq *PGQueue) validatePayloadSize(
 	return nil
 }
 
-func (pq *PGQueue) resolveMaxRetries(
+func (pq *Queue) resolveMaxRetries(
 	queueMeta *QueueMetadata,
 ) int {
 	var channelOpts struct {
@@ -164,7 +164,7 @@ func (pq *PGQueue) resolveMaxRetries(
 }
 
 // publishToPubSub publishes a message to a pub/sub topic.
-func (pq *PGQueue) publishToPubSub(
+func (pq *Queue) publishToPubSub(
 	ctx context.Context,
 	topicName, tableName string,
 	messageID uuid.UUID,
@@ -210,13 +210,12 @@ func (pq *PGQueue) publishToPubSub(
 	return nil
 }
 
-func (pq *PGQueue) createSubscriptionRecords(
+func (pq *Queue) createSubscriptionRecords(
 	ctx context.Context,
 	tx *sql.Tx,
 	topicName, tableName string,
 	messageID uuid.UUID,
 ) error {
-	// Get active subscribers
 	subscribers, err := pq.getActiveSubscribers(ctx, tx, topicName)
 	if err != nil {
 		return fmt.Errorf("failed to get active subscribers: %w", err)
@@ -226,34 +225,134 @@ func (pq *PGQueue) createSubscriptionRecords(
 		return nil
 	}
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
-	insertSub := fmt.Sprintf(`
-		INSERT INTO pgqueue_sub_%s (message_id, subscriber_id, status)
-		VALUES ($1, $2, '%s')
-		ON CONFLICT (message_id, subscriber_id) DO NOTHING
-	`, tableName, MessageStatusPending)
-
-	stmt, err := tx.PrepareContext(ctx, insertSub)
-	if err != nil {
-		return fmt.Errorf("failed to prepare subscription insert: %w", err)
-	}
-	defer func() { _ = stmt.Close() }()
-
+	// Reuse the chunked multi-row insert so a topic with many subscribers
+	// costs one round trip per chunk instead of one per subscriber.
+	records := make([]subRecord, 0, len(subscribers))
 	for _, sub := range subscribers {
-		if _, err := stmt.ExecContext(
-			ctx, messageID, sub.SubscriberID,
-		); err != nil {
-			return fmt.Errorf(
-				"failed to create subscription record: %w", err,
-			)
-		}
+		records = append(records, subRecord{
+			messageID:    messageID,
+			subscriberID: sub.SubscriberID,
+		})
+	}
+
+	if err := pq.insertSubscriptionRecords(ctx, tx, tableName, records); err != nil {
+		return fmt.Errorf("failed to create subscription records: %w", err)
 	}
 
 	return nil
 }
 
+// PublishChannel publishes a single message to a point-to-point channel.
+// Returns the message ID (UUIDv7) on success.
+//
+// Use WithMessageID to supply a deterministic ID for deduplication, and
+// WithMessageMetadata to attach metadata to the message.
+func (pq *Queue) PublishChannel(
+	ctx context.Context,
+	name string,
+	payload []byte,
+	opts ...PublishOption,
+) (uuid.UUID, error) {
+	if err := pq.checkClosed(); err != nil {
+		return uuid.UUID{}, err
+	}
+	o := applyPublishOptions(opts)
+	return pq.publishTyped(ctx, name, QueueTypeChannel, payload, o.messageID, o.metadata)
+}
+
+// PublishTopic publishes a single message to a pub/sub topic, delivering it
+// to all active subscribers.
+// Returns the message ID (UUIDv7) on success.
+func (pq *Queue) PublishTopic(
+	ctx context.Context,
+	name string,
+	payload []byte,
+	opts ...PublishOption,
+) (uuid.UUID, error) {
+	if err := pq.checkClosed(); err != nil {
+		return uuid.UUID{}, err
+	}
+	o := applyPublishOptions(opts)
+	return pq.publishTyped(ctx, name, QueueTypePubSub, payload, o.messageID, o.metadata)
+}
+
+// publishTyped is the shared implementation for PublishChannel/PublishTopic.
+func (pq *Queue) publishTyped(
+	ctx context.Context,
+	name string,
+	queueType QueueType,
+	payload []byte,
+	messageID uuid.UUID,
+	metadata map[string]any,
+) (uuid.UUID, error) {
+	if payload == nil {
+		return uuid.UUID{}, ErrNilPayload
+	}
+
+	queueMeta, err := pq.getQueueMetadata(ctx, string(queueType), name)
+	if err != nil {
+		return uuid.UUID{}, fmt.Errorf("%s: %w", name, err)
+	}
+	if err := pq.validatePayloadSize(queueMeta, payload); err != nil {
+		return uuid.UUID{}, err
+	}
+	if messageID == uuid.Nil {
+		messageID, err = NewUUIDv7()
+		if err != nil {
+			return uuid.UUID{}, fmt.Errorf("failed to generate message ID: %w", err)
+		}
+	}
+	var metadataJSON []byte
+	if metadata != nil {
+		metadataJSON, err = json.Marshal(metadata)
+		if err != nil {
+			return uuid.UUID{}, fmt.Errorf("failed to marshal metadata: %w", err)
+		}
+	}
+
+	if queueType == QueueTypePubSub {
+		return messageID, pq.publishToPubSub(
+			ctx, queueMeta.QueueName, queueMeta.TableName,
+			messageID, payload, metadataJSON,
+		)
+	}
+	maxRetries := pq.resolveMaxRetries(queueMeta)
+	return messageID, pq.publishToChannel(
+		ctx, queueMeta.TableName, messageID, payload, metadataJSON, maxRetries,
+	)
+}
+
+// PublishChannelBatch publishes multiple messages to a point-to-point channel
+// in a single atomic operation. Returns message IDs in the same order as the
+// input messages.
+func (pq *Queue) PublishChannelBatch(
+	ctx context.Context,
+	name string,
+	msgs []PublishMessage,
+) ([]uuid.UUID, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
+	// Delegate to the existing batch implementation which resolves queue type
+	// from metadata.
+	return pq.PublishBatch(ctx, name, msgs)
+}
+
+// PublishTopicBatch publishes multiple messages to a pub/sub topic in a single
+// atomic operation. Returns message IDs in the same order as the input messages.
+func (pq *Queue) PublishTopicBatch(
+	ctx context.Context,
+	name string,
+	msgs []PublishMessage,
+) ([]uuid.UUID, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
+	return pq.PublishBatch(ctx, name, msgs)
+}
+
 // publishToChannel publishes a message to a point-to-point channel.
-func (pq *PGQueue) publishToChannel(
+func (pq *Queue) publishToChannel(
 	ctx context.Context,
 	tableName string,
 	messageID uuid.UUID,

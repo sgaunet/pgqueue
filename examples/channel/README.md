@@ -17,7 +17,7 @@ This example demonstrates point-to-point messaging using pgqueue channels.
 
 **Point-to-Point**: Each message is delivered to exactly one consumer. If multiple consumers are running, they compete for messages (load balancing).
 
-**Visibility Timeout**: When a message is consumed, it becomes invisible to other consumers for 30 seconds, ensuring exactly-once processing.
+**Visibility Timeout**: When a message is consumed, it becomes invisible to other consumers for 30 seconds. If the consumer crashes before acknowledging, the message is redelivered once the timeout expires (at-least-once delivery), so handlers should be idempotent.
 
 **Retry Logic**: Failed messages are automatically retried up to `MaxRetries` times before moving to the Dead Letter Queue (DLQ).
 

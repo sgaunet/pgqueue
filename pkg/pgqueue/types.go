@@ -33,7 +33,10 @@ const (
 	MessageStatusAcked MessageStatus = "acked"
 )
 
-// Config holds the configuration for PGQueue.
+// Config holds the configuration for Queue.
+//
+// Deprecated: Use New(ctx, db, ...Option) with functional options instead.
+// Config is retained for backward compatibility with existing callers.
 type Config struct {
 	DB                *sql.DB       // Database connection (user-managed)
 	MaxMessageSize    int           // Maximum message size in bytes (default: 1024)
@@ -60,6 +63,7 @@ type ChannelOptions struct {
 // Message represents a message in the queue.
 type Message struct {
 	ID                uuid.UUID
+	ClaimID           uuid.UUID // Per-claim fencing token; rotates on every (re)delivery.
 	Payload           []byte
 	CreatedAt         time.Time
 	Status            MessageStatus
@@ -69,6 +73,46 @@ type Message struct {
 	ProcessedAt       *time.Time
 	ErrorMessage      *string
 	Metadata          map[string]any
+
+	// receipt is the pre-populated Receipt set by ReceiveChannel/ReceiveTopic.
+	// When set it carries the queue binding so the queue-agnostic Ack/Nack
+	// methods work without a queue-name argument. It is unexported so the
+	// struct can still be instantiated by callers without this field.
+	receipt Receipt
+}
+
+// Receipt is the credential a consumer must present to acknowledge a message.
+// It pairs the message ID with the claim token (ClaimID) issued by the consume
+// call that delivered the message. Ack/Nack only act on a message whose current
+// claim token still matches: if the consumer's visibility timeout lapsed and the
+// message was redelivered to someone else, the stale receipt is rejected with
+// ErrClaimExpired instead of corrupting the new consumer's work.
+//
+// QueueName and QueueType carry the queue binding so the queue-agnostic Ack/Nack
+// methods do not require the caller to supply the queue name again.
+// SubscriberID is populated for topic messages; it is empty for channel messages.
+type Receipt struct {
+	MessageID    uuid.UUID
+	ClaimID      uuid.UUID
+	QueueName    string    // queue/topic name; populated by Receive* methods
+	QueueType    QueueType // QueueTypeChannel or QueueTypePubSub
+	SubscriberID string    // populated for topic subscriptions; empty for channels
+}
+
+// Receipt returns the acknowledgement credential for this message. When the
+// message was obtained via ReceiveChannel or ReceiveTopic, the returned Receipt
+// carries the queue binding and can be passed directly to the queue-agnostic
+// Ack/Nack methods.
+//
+// When using the legacy ConsumeFromChannel/ConsumeFromTopic APIs, the Receipt
+// will not carry the queue binding; pass it to AckChannel/NackChannel or
+// AckTopic/NackTopic instead.
+func (m *Message) Receipt() Receipt {
+	// If a pre-populated receipt was set by Receive*, return it.
+	if m.receipt.QueueName != "" {
+		return m.receipt
+	}
+	return Receipt{MessageID: m.ID, ClaimID: m.ClaimID}
 }
 
 // QueueMetadata holds information about a queue.

@@ -22,7 +22,7 @@ func TestPublishAfterConnectionLoss(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "error-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "error-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -73,14 +73,14 @@ func TestAckNonExistentMessage(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "ack-error-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "ack-error-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
 	// Try to ack non-existent message
 	fakeID, _ := pgqueue.NewUUIDv7()
-	err = pq.AckChannel(ctx, "ack-error-test", fakeID)
+	err = pq.AckChannel(ctx, "ack-error-test", pgqueue.Receipt{MessageID: fakeID})
 	if err == nil {
 		t.Error("expected error when acking non-existent message, got nil")
 	}
@@ -94,25 +94,25 @@ func TestDuplicateQueueCreation(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel
-	err := pq.CreateChannel(ctx, "duplicate-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "duplicate-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
 	// Try to create the same channel again
-	err = pq.CreateChannel(ctx, "duplicate-test", pgqueue.ChannelOptions{})
+	err = pq.CreateChannel(ctx, "duplicate-test")
 	if err == nil {
 		t.Error("expected error when creating duplicate channel, got nil")
 	}
 
 	// Create a topic
-	err = pq.CreateTopic(ctx, "duplicate-topic", pgqueue.TopicOptions{})
+	err = pq.CreateTopic(ctx, "duplicate-topic")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
 
 	// Try to create the same topic again
-	err = pq.CreateTopic(ctx, "duplicate-topic", pgqueue.TopicOptions{})
+	err = pq.CreateTopic(ctx, "duplicate-topic")
 	if err == nil {
 		t.Error("expected error when creating duplicate topic, got nil")
 	}
@@ -125,19 +125,19 @@ func TestTableNameCollision(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel with a hyphenated name
-	err := pq.CreateChannel(ctx, "my-queue", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "my-queue")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
 	// Creating a channel whose sanitized table name collides should fail
-	err = pq.CreateChannel(ctx, "my_queue", pgqueue.ChannelOptions{})
+	err = pq.CreateChannel(ctx, "my_queue")
 	if !errors.Is(err, pgqueue.ErrQueueAlreadyExists) {
 		t.Errorf("expected ErrQueueAlreadyExists, got %v", err)
 	}
 
 	// Also test cross-type collision: topic with colliding table name
-	err = pq.CreateTopic(ctx, "my_queue", pgqueue.TopicOptions{})
+	err = pq.CreateTopic(ctx, "my_queue")
 	if !errors.Is(err, pgqueue.ErrQueueAlreadyExists) {
 		t.Errorf("expected cross-type ErrQueueAlreadyExists, got %v", err)
 	}
@@ -161,12 +161,12 @@ func TestInvalidQueueNames(t *testing.T) {
 	}
 
 	for _, name := range invalidNames {
-		err := pq.CreateChannel(ctx, name, pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, name)
 		if err == nil {
 			t.Errorf("expected error for invalid channel name %q, got nil", name)
 		}
 
-		err = pq.CreateTopic(ctx, name, pgqueue.TopicOptions{})
+		err = pq.CreateTopic(ctx, name)
 		if err == nil {
 			t.Errorf("expected error for invalid topic name %q, got nil", name)
 		}
@@ -181,9 +181,7 @@ func TestMessageSizeExceedsLimit(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel with small message size limit
-	err := pq.CreateChannel(ctx, "size-test", pgqueue.ChannelOptions{
-		MaxMessageSize: 100, // 100 bytes limit
-	})
+	err := pq.CreateChannel(ctx, "size-test", pgqueue.WithQueueMaxMessageSize(100))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -208,7 +206,7 @@ func TestPublishWithDuplicateMessageID(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "dedup-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "dedup-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -244,7 +242,7 @@ func TestConsumeWithExpiredContext(t *testing.T) {
 	ctx := context.Background()
 
 	// Create and publish to a channel
-	err := pq.CreateChannel(ctx, "context-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "context-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -273,7 +271,7 @@ func TestReplayWithoutConfirmation(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel and publish a message
-	err := pq.CreateChannel(ctx, "replay-confirm-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "replay-confirm-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -288,7 +286,7 @@ func TestReplayWithoutConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to consume message: %v", err)
 	}
-	if err := pq.AckChannel(ctx, "replay-confirm-test", msg.ID); err != nil {
+	if err := pq.AckChannel(ctx, "replay-confirm-test", msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack message: %v", err)
 	}
 
@@ -328,9 +326,7 @@ func TestNackExceedsMaxRetries(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel with max retries = 2
-	err := pq.CreateChannel(ctx, "max-retry-test", pgqueue.ChannelOptions{
-		MaxRetries: 2,
-	})
+	err := pq.CreateChannel(ctx, "max-retry-test", pgqueue.WithQueueMaxRetries(2))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -350,7 +346,7 @@ func TestNackExceedsMaxRetries(t *testing.T) {
 		if msg == nil {
 			t.Fatalf("consume returned nil on attempt %d", i+1)
 		}
-		if err := pq.NackChannel(ctx, "max-retry-test", msg.ID, "test failure"); err != nil {
+		if err := pq.NackChannel(ctx, "max-retry-test", msg.Receipt(), "test failure"); err != nil {
 			t.Fatalf("failed to nack message on attempt %d: %v", i+1, err)
 		}
 	}
@@ -385,18 +381,18 @@ func TestInvalidSubscriberID(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "sub-id-test", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "sub-id-test")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
 
 	invalidIDs := []string{
-		"",                  // empty
-		"sub with spaces",   // space
-		"sub@id",            // special char
-		"sub/id",            // slash
-		"sub.id",            // dot
-		"sub\x00id",         // null byte
+		"",                        // empty
+		"sub with spaces",         // space
+		"sub@id",                  // special char
+		"sub/id",                  // slash
+		"sub.id",                  // dot
+		"sub\x00id",               // null byte
 		string(make([]byte, 129)), // too long (129 chars, filled with null bytes)
 	}
 
@@ -446,7 +442,7 @@ func TestVisibilityTimeoutBounds(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "vis-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "vis-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -518,7 +514,7 @@ func TestPurgeQueueWithoutConfirmation(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel
-	err := pq.CreateChannel(ctx, "purge-confirm-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "purge-confirm-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -555,9 +551,7 @@ func TestInitWithNilDatabase(t *testing.T) {
 	ctx := context.Background()
 
 	// Try to initialize with nil database
-	_, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB: nil,
-	})
+	_, err := pgqueue.New(ctx, nil)
 	if err == nil {
 		t.Error("expected error when initializing with nil database, got nil")
 	}
@@ -576,8 +570,7 @@ func TestInitWithUnsupportedPGVersion(t *testing.T) {
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(testWaitLogOccurrence).
-				WithStartupTimeout(testStartupTimeout)),
-	)
+				WithStartupTimeout(testStartupTimeout)))
 	if err != nil {
 		t.Fatalf("failed to start postgres 16 container: %v", err)
 	}
@@ -598,11 +591,10 @@ func TestInitWithUnsupportedPGVersion(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	_, err = pgqueue.Init(ctx, pgqueue.Config{
-		DB:                db,
-		MaxMessageSize:    testMaxMessageSize,
-		DefaultMaxRetries: testDefaultMaxRetries,
-	})
+	_, err = pgqueue.New(ctx, db,
+		pgqueue.WithMaxMessageSize(testMaxMessageSize),
+		pgqueue.WithDefaultMaxRetries(testDefaultMaxRetries),
+	)
 	if err == nil {
 		t.Fatal("expected error for PostgreSQL 16, got nil")
 	}
@@ -619,7 +611,7 @@ func TestConcurrentPublish(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "concurrent-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "concurrent-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}

@@ -41,8 +41,7 @@ func setupTestContainer(t *testing.T) (*sql.DB, func()) {
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(testWaitLogOccurrence).
-				WithStartupTimeout(testStartupTimeout)),
-	)
+				WithStartupTimeout(testStartupTimeout)))
 	if err != nil {
 		t.Fatalf("failed to start postgres container: %v", err)
 	}
@@ -68,7 +67,7 @@ func setupTestContainer(t *testing.T) (*sql.DB, func()) {
 }
 
 // setupTestDB creates a PostgreSQL container and returns a PGQueue instance and raw DB handle.
-func setupTestDB(t *testing.T) (*pgqueue.PGQueue, *sql.DB, func()) {
+func setupTestDB(t *testing.T) (*pgqueue.Queue, *sql.DB, func()) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -78,11 +77,10 @@ func setupTestDB(t *testing.T) (*pgqueue.PGQueue, *sql.DB, func()) {
 		t.Fatalf("failed to initialize schema: %v", err)
 	}
 
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB:                db,
-		MaxMessageSize:    testMaxMessageSize,
-		DefaultMaxRetries: testDefaultMaxRetries,
-	})
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithMaxMessageSize(testMaxMessageSize),
+		pgqueue.WithDefaultMaxRetries(testDefaultMaxRetries),
+	)
 	if err != nil {
 		t.Fatalf("failed to init pgqueue: %v", err)
 	}
@@ -111,9 +109,7 @@ func TestCreateChannel(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel
-	err := pq.CreateChannel(ctx, "test-channel", pgqueue.ChannelOptions{
-		MaxMessageSize: 2048,
-	})
+	err := pq.CreateChannel(ctx, "test-channel", pgqueue.WithQueueMaxMessageSize(2048))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -128,12 +124,12 @@ func TestCreateChannel(t *testing.T) {
 		t.Fatalf("expected 1 channel, got %d", len(channels))
 	}
 
-	if channels[0].QueueName != "test-channel" {
-		t.Errorf("expected channel name 'test-channel', got '%s'", channels[0].QueueName)
+	if channels[0] != "test-channel" {
+		t.Errorf("expected channel name 'test-channel', got '%s'", channels[0])
 	}
 
 	// Try creating duplicate channel (should fail)
-	err = pq.CreateChannel(ctx, "test-channel", pgqueue.ChannelOptions{})
+	err = pq.CreateChannel(ctx, "test-channel")
 	if err == nil {
 		t.Fatal("expected error when creating duplicate channel")
 	}
@@ -146,7 +142,7 @@ func TestPublishAndConsumeChannel(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel
-	err := pq.CreateChannel(ctx, "orders", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "orders")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -175,7 +171,7 @@ func TestPublishAndConsumeChannel(t *testing.T) {
 	}
 
 	// Acknowledge the message
-	err = pq.AckChannel(ctx, "orders", msg.ID)
+	err = pq.AckChannel(ctx, "orders", msg.Receipt())
 	if err != nil {
 		t.Fatalf("failed to acknowledge message: %v", err)
 	}
@@ -197,7 +193,7 @@ func TestCreateTopic(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a topic
-	err := pq.CreateTopic(ctx, "notifications", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "notifications")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -212,8 +208,8 @@ func TestCreateTopic(t *testing.T) {
 		t.Fatalf("expected 1 topic, got %d", len(topics))
 	}
 
-	if topics[0].QueueName != "notifications" {
-		t.Errorf("expected topic name 'notifications', got '%s'", topics[0].QueueName)
+	if topics[0] != "notifications" {
+		t.Errorf("expected topic name 'notifications', got '%s'", topics[0])
 	}
 }
 
@@ -224,7 +220,7 @@ func TestPubSubFanout(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a topic
-	err := pq.CreateTopic(ctx, "events", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "events")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -263,7 +259,7 @@ func TestPubSubFanout(t *testing.T) {
 		}
 
 		// Acknowledge the message
-		err = pq.AckTopic(ctx, "events", sub, msg.ID)
+		err = pq.AckTopic(ctx, "events", sub, msg.Receipt())
 		if err != nil {
 			t.Fatalf("failed to ack for %s: %v", sub, err)
 		}
@@ -280,7 +276,7 @@ func TestMessageOrdering(t *testing.T) {
 
 	t.Run("channel_ordering", func(t *testing.T) {
 		// Create a channel
-		err := pq.CreateChannel(ctx, "ordered-channel", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "ordered-channel")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -313,7 +309,7 @@ func TestMessageOrdering(t *testing.T) {
 			}
 
 			// Ack the message
-			err = pq.AckChannel(ctx, "ordered-channel", msg.ID)
+			err = pq.AckChannel(ctx, "ordered-channel", msg.Receipt())
 			if err != nil {
 				t.Fatalf("failed to ack message %d: %v", i, err)
 			}
@@ -322,7 +318,7 @@ func TestMessageOrdering(t *testing.T) {
 
 	t.Run("topic_ordering", func(t *testing.T) {
 		// Create a topic
-		err := pq.CreateTopic(ctx, "ordered-topic", pgqueue.TopicOptions{})
+		err := pq.CreateTopic(ctx, "ordered-topic")
 		if err != nil {
 			t.Fatalf("failed to create topic: %v", err)
 		}
@@ -362,7 +358,7 @@ func TestMessageOrdering(t *testing.T) {
 			}
 
 			// Ack the message
-			err = pq.AckTopic(ctx, "ordered-topic", subscriberID, msg.ID)
+			err = pq.AckTopic(ctx, "ordered-topic", subscriberID, msg.Receipt())
 			if err != nil {
 				t.Fatalf("failed to ack message %d: %v", i, err)
 			}
@@ -377,7 +373,7 @@ func TestDeleteChannel(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel and publish a message
-	err := pq.CreateChannel(ctx, "delete-me", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "delete-me")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -419,7 +415,7 @@ func TestDeleteChannel(t *testing.T) {
 	}
 
 	// Verify we can recreate the same channel
-	err = pq.CreateChannel(ctx, "delete-me", pgqueue.ChannelOptions{})
+	err = pq.CreateChannel(ctx, "delete-me")
 	if err != nil {
 		t.Fatalf("failed to recreate channel after delete: %v", err)
 	}
@@ -432,7 +428,7 @@ func TestDeleteTopic(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a topic with a subscriber
-	err := pq.CreateTopic(ctx, "delete-topic", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "delete-topic")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -498,7 +494,7 @@ func TestDeleteChannelNotConfirmed(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "no-delete", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "no-delete")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -544,9 +540,7 @@ func TestChannelTTLEnforcedOnConsume(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel with a very short TTL
-	err := pq.CreateChannel(ctx, "ttl-test", pgqueue.ChannelOptions{
-		TTL: 1 * time.Millisecond,
-	})
+	err := pq.CreateChannel(ctx, "ttl-test", pgqueue.WithQueueTTL(1))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -572,8 +566,7 @@ func TestChannelTTLEnforcedOnConsume(t *testing.T) {
 	// Verify the message still exists in the table (not deleted, just filtered)
 	var count int
 	err = db.QueryRowContext(ctx,
-		fmt.Sprintf("SELECT COUNT(*) FROM pgqueue_msg_ttl_test WHERE status = '%s'", pgqueue.MessageStatusPending),
-	).Scan(&count)
+		fmt.Sprintf("SELECT COUNT(*) FROM pgqueue_msg_ttl_test WHERE status = '%s'", pgqueue.MessageStatusPending)).Scan(&count)
 	if err != nil {
 		t.Fatalf("failed to count messages: %v", err)
 	}
@@ -589,7 +582,7 @@ func TestChannelNoTTLDeliversAllMessages(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a channel without TTL (TTL=0 means no expiration)
-	err := pq.CreateChannel(ctx, "no-ttl", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "no-ttl")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -616,9 +609,7 @@ func TestTopicTTLEnforcedOnConsume(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a topic with a very short TTL
-	err := pq.CreateTopic(ctx, "ttl-topic", pgqueue.TopicOptions{
-		TTL: 1 * time.Millisecond,
-	})
+	err := pq.CreateTopic(ctx, "ttl-topic", pgqueue.WithQueueTTL(1))
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -654,7 +645,7 @@ func TestPauseResumeChannel(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "pause-ch", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "pause-ch")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -666,7 +657,7 @@ func TestPauseResumeChannel(t *testing.T) {
 	}
 
 	// Pause the queue
-	err = pq.PauseQueue(ctx, "pause-ch", pgqueue.QueueTypeChannel)
+	err = pq.PauseChannel(ctx, "pause-ch")
 	if err != nil {
 		t.Fatalf("failed to pause queue: %v", err)
 	}
@@ -684,7 +675,7 @@ func TestPauseResumeChannel(t *testing.T) {
 	}
 
 	// Resume the queue
-	err = pq.ResumeQueue(ctx, "pause-ch", pgqueue.QueueTypeChannel)
+	err = pq.ResumeChannel(ctx, "pause-ch")
 	if err != nil {
 		t.Fatalf("failed to resume queue: %v", err)
 	}
@@ -705,7 +696,7 @@ func TestPauseResumeTopic(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "pause-topic", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "pause-topic")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -721,7 +712,7 @@ func TestPauseResumeTopic(t *testing.T) {
 	}
 
 	// Pause
-	err = pq.PauseQueue(ctx, "pause-topic", pgqueue.QueueTypePubSub)
+	err = pq.PauseTopic(ctx, "pause-topic")
 	if err != nil {
 		t.Fatalf("failed to pause: %v", err)
 	}
@@ -733,7 +724,7 @@ func TestPauseResumeTopic(t *testing.T) {
 	}
 
 	// Resume
-	err = pq.ResumeQueue(ctx, "pause-topic", pgqueue.QueueTypePubSub)
+	err = pq.ResumeTopic(ctx, "pause-topic")
 	if err != nil {
 		t.Fatalf("failed to resume: %v", err)
 	}
@@ -754,7 +745,7 @@ func TestIsQueuePaused(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "pause-check", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "pause-check")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -769,7 +760,7 @@ func TestIsQueuePaused(t *testing.T) {
 	}
 
 	// Pause
-	err = pq.PauseQueue(ctx, "pause-check", pgqueue.QueueTypeChannel)
+	err = pq.PauseChannel(ctx, "pause-check")
 	if err != nil {
 		t.Fatalf("failed to pause: %v", err)
 	}
@@ -783,7 +774,7 @@ func TestIsQueuePaused(t *testing.T) {
 	}
 
 	// Resume
-	err = pq.ResumeQueue(ctx, "pause-check", pgqueue.QueueTypeChannel)
+	err = pq.ResumeChannel(ctx, "pause-check")
 	if err != nil {
 		t.Fatalf("failed to resume: %v", err)
 	}
@@ -803,7 +794,7 @@ func TestResubscribePreservesCreatedAt(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "resub-test", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "resub-test")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -817,8 +808,7 @@ func TestResubscribePreservesCreatedAt(t *testing.T) {
 	var originalCreatedAt time.Time
 	err = db.QueryRowContext(ctx,
 		"SELECT created_at FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
-		"resub-test", "sub-1",
-	).Scan(&originalCreatedAt)
+		"resub-test", "sub-1").Scan(&originalCreatedAt)
 	if err != nil {
 		t.Fatalf("failed to get original created_at: %v", err)
 	}
@@ -840,8 +830,7 @@ func TestResubscribePreservesCreatedAt(t *testing.T) {
 	var newCreatedAt time.Time
 	err = db.QueryRowContext(ctx,
 		"SELECT created_at FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
-		"resub-test", "sub-1",
-	).Scan(&newCreatedAt)
+		"resub-test", "sub-1").Scan(&newCreatedAt)
 	if err != nil {
 		t.Fatalf("failed to get new created_at: %v", err)
 	}
@@ -855,8 +844,7 @@ func TestResubscribePreservesCreatedAt(t *testing.T) {
 	var active bool
 	err = db.QueryRowContext(ctx,
 		"SELECT active FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
-		"resub-test", "sub-1",
-	).Scan(&active)
+		"resub-test", "sub-1").Scan(&active)
 	if err != nil {
 		t.Fatalf("failed to get active state: %v", err)
 	}
@@ -871,7 +859,7 @@ func TestPauseNonExistentQueue(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.PauseQueue(ctx, "ghost-queue", pgqueue.QueueTypeChannel)
+	err := pq.PauseChannel(ctx, "ghost-queue")
 	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
 		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
 	}
@@ -884,9 +872,7 @@ func TestNackTopicMovesToDLQ(t *testing.T) {
 	ctx := context.Background()
 
 	// Create topic with max 1 retry
-	err := pq.CreateTopic(ctx, "nack-dlq-topic", pgqueue.TopicOptions{
-		MaxRetries: 1,
-	})
+	err := pq.CreateTopic(ctx, "nack-dlq-topic", pgqueue.WithQueueMaxRetries(1))
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -905,7 +891,7 @@ func TestNackTopicMovesToDLQ(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
-	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.ID, "transient error")
+	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.Receipt(), "transient error")
 	if err != nil {
 		t.Fatalf("first nack failed: %v", err)
 	}
@@ -915,7 +901,7 @@ func TestNackTopicMovesToDLQ(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to consume after retry: %v", err)
 	}
-	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.ID, "permanent error")
+	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.Receipt(), "permanent error")
 	if err != nil {
 		t.Fatalf("second nack failed: %v", err)
 	}
@@ -945,7 +931,7 @@ func TestConcurrentConsumeExactlyOnce(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateChannel(ctx, "concurrent-consume", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "concurrent-consume")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -979,7 +965,7 @@ func TestConcurrentConsumeExactlyOnce(t *testing.T) {
 				if msg == nil {
 					return // Queue empty
 				}
-				if err := pq.AckChannel(ctx, "concurrent-consume", msg.ID); err != nil {
+				if err := pq.AckChannel(ctx, "concurrent-consume", msg.Receipt()); err != nil {
 					t.Errorf("ack error: %v", err)
 					return
 				}
@@ -1010,7 +996,7 @@ func TestUnsubscribe(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("unsubscribe_stops_new_deliveries", func(t *testing.T) {
-		err := pq.CreateTopic(ctx, "unsub-test", pgqueue.TopicOptions{})
+		err := pq.CreateTopic(ctx, "unsub-test")
 		if err != nil {
 			t.Fatalf("failed to create topic: %v", err)
 		}
@@ -1045,7 +1031,7 @@ func TestUnsubscribe(t *testing.T) {
 			if msg == nil {
 				t.Fatalf("sub-active expected message %d, got nil", i)
 			}
-			if err := pq.AckTopic(ctx, "unsub-test", "sub-active", msg.ID); err != nil {
+			if err := pq.AckTopic(ctx, "unsub-test", "sub-active", msg.Receipt()); err != nil {
 				t.Fatalf("sub-active ack failed: %v", err)
 			}
 		}
@@ -1061,7 +1047,7 @@ func TestUnsubscribe(t *testing.T) {
 		if string(msg.Payload) != "before-unsub" {
 			t.Errorf("sub-leaving expected 'before-unsub', got '%s'", msg.Payload)
 		}
-		if err := pq.AckTopic(ctx, "unsub-test", "sub-leaving", msg.ID); err != nil {
+		if err := pq.AckTopic(ctx, "unsub-test", "sub-leaving", msg.Receipt()); err != nil {
 			t.Fatalf("sub-leaving ack failed: %v", err)
 		}
 
@@ -1076,7 +1062,7 @@ func TestUnsubscribe(t *testing.T) {
 	})
 
 	t.Run("unsubscribed_can_ack_pending", func(t *testing.T) {
-		err := pq.CreateTopic(ctx, "unsub-ack", pgqueue.TopicOptions{})
+		err := pq.CreateTopic(ctx, "unsub-ack")
 		if err != nil {
 			t.Fatalf("failed to create topic: %v", err)
 		}
@@ -1103,13 +1089,13 @@ func TestUnsubscribe(t *testing.T) {
 		}
 
 		// Ack should still work
-		if err := pq.AckTopic(ctx, "unsub-ack", "sub-x", msg.ID); err != nil {
+		if err := pq.AckTopic(ctx, "unsub-ack", "sub-x", msg.Receipt()); err != nil {
 			t.Fatalf("ack after unsubscribe should succeed: %v", err)
 		}
 	})
 
 	t.Run("resubscribe_reactivates", func(t *testing.T) {
-		err := pq.CreateTopic(ctx, "unsub-resub", pgqueue.TopicOptions{})
+		err := pq.CreateTopic(ctx, "unsub-resub")
 		if err != nil {
 			t.Fatalf("failed to create topic: %v", err)
 		}
@@ -1125,8 +1111,7 @@ func TestUnsubscribe(t *testing.T) {
 		var active bool
 		err = db.QueryRowContext(ctx,
 			"SELECT active FROM pgqueue_subscribers WHERE topic_name = $1 AND subscriber_id = $2",
-			"unsub-resub", "sub-r",
-		).Scan(&active)
+			"unsub-resub", "sub-r").Scan(&active)
 		if err != nil {
 			t.Fatalf("failed to query active state: %v", err)
 		}
@@ -1160,7 +1145,7 @@ func TestMessageMetadataRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("channel_metadata", func(t *testing.T) {
-		err := pq.CreateChannel(ctx, "meta-ch", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "meta-ch")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -1212,7 +1197,7 @@ func TestMessageMetadataRoundTrip(t *testing.T) {
 	})
 
 	t.Run("topic_metadata", func(t *testing.T) {
-		err := pq.CreateTopic(ctx, "meta-topic", pgqueue.TopicOptions{})
+		err := pq.CreateTopic(ctx, "meta-topic")
 		if err != nil {
 			t.Fatalf("failed to create topic: %v", err)
 		}
@@ -1242,7 +1227,7 @@ func TestMessageMetadataRoundTrip(t *testing.T) {
 	})
 
 	t.Run("nil_metadata", func(t *testing.T) {
-		err := pq.CreateChannel(ctx, "meta-nil", pgqueue.ChannelOptions{})
+		err := pq.CreateChannel(ctx, "meta-nil")
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -1271,7 +1256,7 @@ func TestPublishToTopicNoSubscribers(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "no-subs-topic", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "no-subs-topic")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -1288,8 +1273,7 @@ func TestPublishToTopicNoSubscribers(t *testing.T) {
 	// Message should exist in message table
 	var msgCount int
 	err = db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM pgqueue_msg_no_subs_topic",
-	).Scan(&msgCount)
+		"SELECT COUNT(*) FROM pgqueue_msg_no_subs_topic").Scan(&msgCount)
 	if err != nil {
 		t.Fatalf("failed to count messages: %v", err)
 	}
@@ -1300,8 +1284,7 @@ func TestPublishToTopicNoSubscribers(t *testing.T) {
 	// No subscription records should exist
 	var subCount int
 	err = db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM pgqueue_sub_no_subs_topic",
-	).Scan(&subCount)
+		"SELECT COUNT(*) FROM pgqueue_sub_no_subs_topic").Scan(&subCount)
 	if err != nil {
 		t.Fatalf("failed to count subscriptions: %v", err)
 	}
@@ -1330,7 +1313,7 @@ func TestPublishToTopicNoSubscribers(t *testing.T) {
 	}
 
 	// No more messages — the orphan message has no subscription record
-	if err := pq.AckTopic(ctx, "no-subs-topic", "late-sub", msg.ID); err != nil {
+	if err := pq.AckTopic(ctx, "no-subs-topic", "late-sub", msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack: %v", err)
 	}
 	msg, err = pq.ConsumeFromTopic(ctx, "no-subs-topic", "late-sub", 30*time.Second)
@@ -1348,7 +1331,7 @@ func TestAckTopicWithoutConsume(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "ack-no-consume", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "ack-no-consume")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -1364,7 +1347,7 @@ func TestAckTopicWithoutConsume(t *testing.T) {
 	// Try to ack without consuming — subscription is in 'pending' state, not 'processing'.
 	// AckTopic requires status='processing', so rows=0 and it returns ErrMessageAlreadyAcked
 	// (this sentinel covers both "never consumed" and "already acked" cases).
-	err = pq.AckTopic(ctx, "ack-no-consume", "sub-eager", msgID)
+	err = pq.AckTopic(ctx, "ack-no-consume", "sub-eager", pgqueue.Receipt{MessageID: msgID})
 	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
 		t.Fatalf("expected ErrMessageAlreadyAcked, got: %v", err)
 	}

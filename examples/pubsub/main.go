@@ -39,8 +39,7 @@ func run() error {
 	// Open database connection with pgx driver
 	db, err := sql.Open(
 		"pgx",
-		"postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable",
-	)
+		"postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable")
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -52,18 +51,17 @@ func run() error {
 	}
 
 	// Initialize pgqueue
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB:                db,
-		MaxMessageSize:    maxMessageSize,
-		DefaultMaxRetries: defaultMaxRetries,
-	})
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithMaxMessageSize(maxMessageSize),
+		pgqueue.WithDefaultMaxRetries(defaultMaxRetries),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize pgqueue: %w", err)
 	}
 
 	// Create a topic for user events
 	topicName := "user-events"
-	err = pq.CreateTopic(ctx, topicName, pgqueue.TopicOptions{})
+	err = pq.CreateTopic(ctx, topicName)
 	if err != nil {
 		log.Printf("topic might already exist: %v", err)
 	}
@@ -96,18 +94,16 @@ func run() error {
 
 	fmt.Println("\nExample completed successfully!")
 	fmt.Println(
-		"Note: Each subscriber processes the same events independently (fan-out pattern)",
-	)
+		"Note: Each subscriber processes the same events independently (fan-out pattern)")
 
 	return nil
 }
 
 func registerSubscribers(
 	ctx context.Context,
-	pq *pgqueue.PGQueue,
+	pq *pgqueue.Queue,
 	topicName string,
-	subscribers []string,
-) {
+	subscribers []string) {
 	fmt.Println("Registering subscribers...")
 	for _, subscriberID := range subscribers {
 		err := pq.Subscribe(ctx, topicName, subscriberID)
@@ -121,9 +117,8 @@ func registerSubscribers(
 
 func publishEvents(
 	ctx context.Context,
-	pq *pgqueue.PGQueue,
-	topicName string,
-) {
+	pq *pgqueue.Queue,
+	topicName string) {
 	events := []string{
 		"user.registered: user_id=1001, email=alice@example.com",
 		"user.registered: user_id=1002, email=bob@example.com",
@@ -146,10 +141,9 @@ func publishEvents(
 
 func printSubscriberStats(
 	ctx context.Context,
-	pq *pgqueue.PGQueue,
+	pq *pgqueue.Queue,
 	topicName string,
-	subscribers []string,
-) {
+	subscribers []string) {
 	fmt.Println("\nSubscriber Statistics:")
 	for _, subscriberID := range subscribers {
 		lag, err := pq.GetSubscriberLag(ctx, topicName, subscriberID)
@@ -169,10 +163,9 @@ func printSubscriberStats(
 
 func consumeEvents(
 	ctx context.Context,
-	pq *pgqueue.PGQueue,
+	pq *pgqueue.Queue,
 	topicName, subscriberID string,
-	wg *sync.WaitGroup,
-) {
+	wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	fmt.Printf("[%s] Starting...\n", subscriberID)
@@ -188,8 +181,7 @@ func consumeEvents(
 		default:
 			// Consume next event for this subscriber
 			msg, err := pq.ConsumeFromTopic(
-				ctx, topicName, subscriberID, visibilityTimeout,
-			)
+				ctx, topicName, subscriberID, visibilityTimeout)
 			if err != nil {
 				log.Printf("[%s] error consuming: %v", subscriberID, err)
 				time.Sleep(pollInterval)
@@ -204,23 +196,20 @@ func consumeEvents(
 
 			// Process the event (each subscriber handles it differently)
 			processTime := time.Duration(
-				baseProcessingTime+subscriberID[0]%3*baseProcessingTime,
-			) * time.Millisecond
+				baseProcessingTime+subscriberID[0]%3*baseProcessingTime) * time.Millisecond
 			fmt.Printf(
-				"[%s] Processing: %s\n", subscriberID, string(msg.Payload),
-			)
+				"[%s] Processing: %s\n", subscriberID, string(msg.Payload))
 			time.Sleep(processTime) // Simulate varying processing times
 
 			// Acknowledge successful processing
-			err = pq.AckTopic(ctx, topicName, subscriberID, msg.ID)
+			err = pq.AckTopic(ctx, topicName, subscriberID, msg.Receipt())
 			if err != nil {
 				log.Printf("[%s] error acking: %v", subscriberID, err)
 				continue
 			}
 
 			fmt.Printf(
-				"[%s] Completed: %s\n", subscriberID, string(msg.Payload),
-			)
+				"[%s] Completed: %s\n", subscriberID, string(msg.Payload))
 		}
 	}
 }

@@ -10,6 +10,12 @@ var (
 	// ErrDBRequired is returned when a nil database connection is provided.
 	ErrDBRequired = errors.New("database connection is required")
 
+	// ErrInvalidConfig is returned by Init when the Config contains a negative
+	// value for a numeric field.
+	ErrInvalidConfig = errors.New(
+		"invalid config: numeric fields must not be negative",
+	)
+
 	// ErrInvalidQueueName is returned when a queue name contains invalid characters.
 	ErrInvalidQueueName = errors.New(
 		"invalid queue name: must contain only alphanumeric characters, underscores, and dashes",
@@ -48,6 +54,12 @@ var (
 
 	// ErrMessageAlreadyAcked is returned when attempting to ack a message that was already acknowledged.
 	ErrMessageAlreadyAcked = errors.New("message not found or already acknowledged")
+
+	// ErrClaimExpired is returned by Ack/Nack when the receipt's claim token no
+	// longer matches the message: its visibility timeout lapsed and it was
+	// redelivered to another consumer. The caller's processing result must be
+	// discarded — the message now belongs to whoever holds the current claim.
+	ErrClaimExpired = errors.New("message claim expired: reassigned to another consumer")
 
 	// ErrReplayMessageNotFound is returned when a message targeted for replay cannot be found.
 	ErrReplayMessageNotFound = errors.New("message not found")
@@ -103,5 +115,21 @@ var (
 	// than the version this build of pgqueue requires. Run InitSchema to migrate.
 	ErrSchemaOutdated = errors.New(
 		"pgqueue schema is outdated: run InitSchema to migrate",
+	)
+
+	// ErrQueueEmpty is returned by single-shot consume operations when no
+	// message is currently available. It is an expected, non-fatal signal:
+	// callers should treat it as "try again later", not as a failure.
+	ErrQueueEmpty = errors.New("queue is empty: no message currently available")
+
+	// ErrQueueClosed is returned by any operation invoked after Close has been
+	// called on the pgqueue handle.
+	ErrQueueClosed = errors.New("pgqueue handle is closed")
+
+	// ErrReceiptMissingQueueType is returned by the queue-agnostic Ack/Nack
+	// when a Receipt was not populated by ReceiveChannel or ReceiveTopic and
+	// therefore does not carry the required queue binding.
+	ErrReceiptMissingQueueType = errors.New(
+		"receipt missing QueueType: use AckChannel/AckTopic or obtain the receipt via ReceiveChannel/ReceiveTopic",
 	)
 )

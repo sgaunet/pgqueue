@@ -35,8 +35,7 @@ func run() error {
 	// Open database connection with pgx driver
 	db, err := sql.Open(
 		"pgx",
-		"postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable",
-	)
+		"postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable")
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -48,20 +47,17 @@ func run() error {
 	}
 
 	// Initialize pgqueue
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-		DB:                db,
-		MaxMessageSize:    maxMessageSize,
-		DefaultMaxRetries: defaultMaxRetries,
-	})
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithMaxMessageSize(maxMessageSize),
+		pgqueue.WithDefaultMaxRetries(defaultMaxRetries),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize pgqueue: %w", err)
 	}
 
 	// Create a channel for order processing
 	channelName := "orders"
-	err = pq.CreateChannel(ctx, channelName, pgqueue.ChannelOptions{
-		MaxRetries: channelMaxRetries,
-	})
+	err = pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(channelMaxRetries))
 	if err != nil {
 		log.Printf("channel might already exist: %v", err)
 	}
@@ -83,9 +79,8 @@ func run() error {
 
 func publishOrders(
 	ctx context.Context,
-	pq *pgqueue.PGQueue,
-	channelName string,
-) {
+	pq *pgqueue.Queue,
+	channelName string) {
 	orders := []string{
 		"order-001: 2x Widget A",
 		"order-002: 1x Widget B",
@@ -108,9 +103,8 @@ func publishOrders(
 
 func printStats(
 	ctx context.Context,
-	pq *pgqueue.PGQueue,
-	channelName string,
-) {
+	pq *pgqueue.Queue,
+	channelName string) {
 	stats, err := pq.GetStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		log.Printf("failed to get stats: %v", err)
@@ -125,9 +119,8 @@ func printStats(
 
 func consumeOrders(
 	ctx context.Context,
-	pq *pgqueue.PGQueue,
-	channelName string,
-) {
+	pq *pgqueue.Queue,
+	channelName string) {
 	fmt.Println("Starting order processor...")
 
 	for {
@@ -158,20 +151,18 @@ func consumeOrders(
 		// Simulate occasional failures
 		if msg.RetryCount > 0 && msg.RetryCount%2 == 0 {
 			err = pq.NackChannel(
-				ctx, channelName, msg.ID, "simulated processing error",
-			)
+				ctx, channelName, msg.Receipt(), "simulated processing error")
 			if err != nil {
 				log.Printf("error nacking message: %v", err)
 			}
 			fmt.Printf(
 				"Failed to process (retry %d/%d): %s\n",
-				msg.RetryCount+1, msg.MaxRetries, string(msg.Payload),
-			)
+				msg.RetryCount+1, msg.MaxRetries, string(msg.Payload))
 			continue
 		}
 
 		// Acknowledge successful processing
-		err = pq.AckChannel(ctx, channelName, msg.ID)
+		err = pq.AckChannel(ctx, channelName, msg.Receipt())
 		if err != nil {
 			log.Printf("error acking message: %v", err)
 			continue

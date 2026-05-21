@@ -13,7 +13,7 @@ import (
 // Subscribe registers a subscriber for a topic.
 // The subscriberID must be 1-128 characters containing only alphanumeric characters,
 // underscores, and dashes (matching the pattern [a-zA-Z0-9_-]+).
-func (pq *PGQueue) Subscribe(
+func (pq *Queue) Subscribe(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
@@ -40,7 +40,7 @@ func (pq *PGQueue) Subscribe(
 }
 
 // Unsubscribe removes a subscriber from a topic.
-func (pq *PGQueue) Unsubscribe(
+func (pq *Queue) Unsubscribe(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
@@ -57,8 +57,12 @@ func (pq *PGQueue) Unsubscribe(
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
-	err = pq.unregisterSubscriber(ctx, topicName, subscriberID)
-	if err != nil {
+	// Unsubscribe is soft: it stops new messages from being routed to this
+	// subscriber but leaves its outstanding rows so an in-flight message can
+	// still be drained. The garbage collector reaps those leftover rows once
+	// the subscriber stays inactive (see GarbageCollector.purgeInactiveSubscriptions),
+	// so an abandoned subscriber cannot pin messages indefinitely.
+	if err := pq.unregisterSubscriber(ctx, topicName, subscriberID); err != nil {
 		return fmt.Errorf("failed to unsubscribe: %w", err)
 	}
 
@@ -67,7 +71,7 @@ func (pq *PGQueue) Unsubscribe(
 
 // ConsumeFromTopic retrieves the next available message for a subscriber from a topic.
 // Returns nil message if no messages available.
-func (pq *PGQueue) ConsumeFromTopic(
+func (pq *Queue) ConsumeFromTopic(
 	ctx context.Context,
 	topicName, subscriberID string,
 	visibilityTimeout time.Duration,
@@ -126,10 +130,15 @@ func (pq *PGQueue) ConsumeFromTopic(
 }
 
 // AckTopic acknowledges a message for a subscriber.
-func (pq *PGQueue) AckTopic(
+//
+// The receipt must carry the claim token issued by the ConsumeFromTopic call
+// that delivered the message (use msg.Receipt()). If the claim has expired —
+// the visibility timeout lapsed and the message was redelivered to this
+// subscriber — AckTopic returns ErrClaimExpired and does nothing.
+func (pq *Queue) AckTopic(
 	ctx context.Context,
 	topicName, subscriberID string,
-	messageID uuid.UUID,
+	r Receipt,
 ) error {
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return err
@@ -151,10 +160,11 @@ func (pq *PGQueue) AckTopic(
 		SET status = '%s', acked_at = NOW()
 		WHERE message_id = $1
 		  AND subscriber_id = $2
+		  AND claim_id = $3
 		  AND status = '%s'
 	`, queueMeta.TableName, MessageStatusAcked, MessageStatusProcessing)
 
-	result, err := pq.db.ExecContext(ctx, query, messageID, subscriberID)
+	result, err := pq.db.ExecContext(ctx, query, r.MessageID, subscriberID, r.ClaimID)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge message: %w", err)
 	}
@@ -164,7 +174,7 @@ func (pq *PGQueue) AckTopic(
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		return ErrMessageAlreadyAcked
+		return classifyTopicAckMiss(ctx, pq.db, queueMeta.TableName, subscriberID, r)
 	}
 
 	return nil
@@ -172,10 +182,13 @@ func (pq *PGQueue) AckTopic(
 
 // NackTopic negatively acknowledges a message for a subscriber (retry or move to DLQ).
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
-func (pq *PGQueue) NackTopic(
+//
+// The receipt must carry the claim token from the consume call that delivered
+// the message; a stale claim returns ErrClaimExpired (see AckTopic).
+func (pq *Queue) NackTopic(
 	ctx context.Context,
 	topicName, subscriberID string,
-	messageID uuid.UUID,
+	r Receipt,
 	errorMsg string,
 ) error {
 	errorMsg = truncateErrorMsg(errorMsg)
@@ -201,7 +214,7 @@ func (pq *PGQueue) NackTopic(
 	defer func() { _ = tx.Rollback() }()
 
 	state, err := pq.getProcessingSubState(
-		ctx, tx, queueMeta.TableName, messageID, subscriberID,
+		ctx, tx, queueMeta.TableName, r, subscriberID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get subscription state: %w", err)
@@ -212,14 +225,14 @@ func (pq *PGQueue) NackTopic(
 	if state.retryCount+1 > maxRetry {
 		if err := pq.moveSubToDLQ(
 			ctx, tx, queueMeta.TableName,
-			messageID, subscriberID, errorMsg, state,
+			r.MessageID, subscriberID, errorMsg, state,
 		); err != nil {
 			return fmt.Errorf("failed to move to DLQ: %w", err)
 		}
 	} else {
 		if err := pq.retrySubscription(
 			ctx, tx, queueMeta.TableName,
-			messageID, subscriberID, errorMsg,
+			r.MessageID, subscriberID, errorMsg,
 		); err != nil {
 			return fmt.Errorf("failed to retry subscription: %w", err)
 		}
@@ -238,11 +251,11 @@ type subState struct {
 	metadataJSON sql.NullString
 }
 
-func (pq *PGQueue) getProcessingSubState(
+func (pq *Queue) getProcessingSubState(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
-	messageID uuid.UUID,
+	r Receipt,
 	subscriberID string,
 ) (*subState, error) {
 	//nolint:gosec // G201: table name validated by queueNameRegex
@@ -252,17 +265,19 @@ func (pq *PGQueue) getProcessingSubState(
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
 		WHERE s.message_id = $1
 		  AND s.subscriber_id = $2
+		  AND s.claim_id = $3
 		  AND s.status = '%s'
 		FOR UPDATE OF s
 	`, tableName, tableName, MessageStatusProcessing)
 
 	var state subState
 
-	err := tx.QueryRowContext(ctx, query, messageID, subscriberID).Scan(
+	err := tx.QueryRowContext(ctx, query, r.MessageID, subscriberID, r.ClaimID).Scan(
 		&state.retryCount, &state.payload, &state.metadataJSON,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrMessageNotFound
+		// No processing row under this claim: explain why (expired vs. gone).
+		return nil, classifyTopicAckMiss(ctx, tx, tableName, subscriberID, r)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query subscription: %w", err)
@@ -271,7 +286,7 @@ func (pq *PGQueue) getProcessingSubState(
 	return &state, nil
 }
 
-func (pq *PGQueue) moveSubToDLQ(
+func (pq *Queue) moveSubToDLQ(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -308,7 +323,7 @@ func (pq *PGQueue) moveSubToDLQ(
 	return nil
 }
 
-func (pq *PGQueue) retrySubscription(
+func (pq *Queue) retrySubscription(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -334,7 +349,19 @@ func (pq *PGQueue) retrySubscription(
 	return nil
 }
 
-func (pq *PGQueue) fetchPendingTopicMessage(
+// topicCandidate is one consumable subscription row scanned from a topic.
+type topicCandidate struct {
+	subID        uuid.UUID
+	msgID        uuid.UUID
+	payload      []byte
+	createdAt    time.Time
+	status       string
+	retryCount   int
+	metadataJSON sql.NullString
+	errorMessage sql.NullString
+}
+
+func (pq *Queue) fetchPendingTopicMessage(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName, subscriberID string,
@@ -342,20 +369,53 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 	ttl time.Duration,
 	maxRetries int,
 ) (*Message, *time.Time, error) {
+	query, args := topicConsumeQuery(tableName, subscriberID, ttl)
+
+	// Loop so an exhausted timed-out subscription is moved to the DLQ and
+	// skipped rather than redelivered forever — see fetchPendingChannelMessage.
+	for {
+		var row topicCandidate
+		err := tx.QueryRowContext(ctx, query, args...).Scan(
+			&row.subID, &row.msgID, &row.payload, &row.createdAt,
+			&row.status, &row.retryCount, &row.metadataJSON, &row.errorMessage,
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, nil
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to query subscription: %w", err)
+		}
+
+		retryCount, dlqd, err := pq.reclaimTopicAttempt(
+			ctx, tx, tableName, subscriberID, row, maxRetries,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		if dlqd {
+			continue
+		}
+
+		return pq.claimTopicSubscription(
+			ctx, tx, tableName, visibilityTimeout, row, retryCount, maxRetries,
+		)
+	}
+}
+
+// topicConsumeQuery builds the SELECT for the next consumable subscription. A
+// subscription is consumable when pending, or when still processing but its
+// visibility timeout has expired — see channelConsumeQuery.
+func topicConsumeQuery(tableName, subscriberID string, ttl time.Duration) (string, []any) {
 	ttlClause := ""
 	args := []any{subscriberID}
-
 	if ttl > 0 {
 		ttlClause = "AND m.created_at > NOW() - make_interval(secs => $2)"
 		args = append(args, ttl.Seconds())
 	}
 
-	// A subscription is consumable when pending, or when still processing but
-	// its visibility timeout has expired — see fetchPendingChannelMessage.
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT s.id, s.message_id, m.payload, m.created_at,
-		       s.retry_count, m.metadata, s.error_message
+		       s.status, s.retry_count, m.metadata, s.error_message
 		FROM pgqueue_sub_%s s
 		JOIN pgqueue_msg_%s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
@@ -367,73 +427,84 @@ func (pq *PGQueue) fetchPendingTopicMessage(
 		FOR UPDATE OF s SKIP LOCKED
 	`, tableName, tableName, MessageStatusPending, MessageStatusProcessing, ttlClause)
 
-	var subID uuid.UUID
-	var msgID uuid.UUID
-	var payload []byte
-	var createdAt time.Time
-	var retryCount int
-	var metadataJSON sql.NullString
-	var errorMessage sql.NullString
+	return query, args
+}
 
-	err := tx.QueryRowContext(ctx, query, args...).Scan(
-		&subID, &msgID, &payload, &createdAt,
-		&retryCount, &metadataJSON, &errorMessage,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, nil
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query subscription: %w", err)
+// reclaimTopicAttempt accounts for a redelivery when a subscription was picked
+// up in 'processing' state — a visibility timeout where the previous consumer
+// never acked. It returns the retry count to claim with; if the retries are now
+// exhausted it moves the subscription to the DLQ and reports dlqd=true.
+func (pq *Queue) reclaimTopicAttempt(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName, subscriberID string,
+	row topicCandidate,
+	maxRetries int,
+) (int, bool, error) {
+	retryCount := row.retryCount
+	if MessageStatus(row.status) != MessageStatusProcessing {
+		return retryCount, false, nil
 	}
 
-	return pq.claimTopicSubscription(
-		ctx, tx, tableName, visibilityTimeout,
-		subID, msgID, payload, createdAt, retryCount, metadataJSON, errorMessage,
-		maxRetries,
-	)
+	if retryCount+1 > maxRetries {
+		if err := pq.moveSubToDLQ(
+			ctx, tx, tableName, row.msgID, subscriberID, errReasonVisibilityTimeout,
+			&subState{retryCount: retryCount, payload: row.payload, metadataJSON: row.metadataJSON},
+		); err != nil {
+			return 0, false, fmt.Errorf("failed to move timed-out subscription to DLQ: %w", err)
+		}
+
+		return 0, true, nil
+	}
+
+	return retryCount + 1, false, nil
 }
 
 //nolint:gosec // G201: table name validated by queueNameRegex
-func (pq *PGQueue) claimTopicSubscription(
+func (pq *Queue) claimTopicSubscription(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	visibilityTimeout time.Duration,
-	subID, msgID uuid.UUID,
-	payload []byte,
-	createdAt time.Time,
+	row topicCandidate,
 	retryCount int,
-	metadataJSON sql.NullString,
-	errorMessage sql.NullString,
 	maxRetries int,
 ) (*Message, *time.Time, error) {
 	// Visibility deadline computed on the database clock; see claimChannelMessage.
+	// retry_count is written back so a reclaim-driven increment is persisted. A
+	// fresh claim_id is minted on every (re)delivery so a previous consumer
+	// whose visibility timeout lapsed cannot acknowledge this reassigned message.
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
-		SET status = '%s', visibility_timeout = NOW() + make_interval(secs => $1)
+		SET status = '%s',
+		    retry_count = $3,
+		    claim_id = uuidv7(),
+		    visibility_timeout = NOW() + make_interval(secs => $1)
 		WHERE id = $2
-		RETURNING visibility_timeout
+		RETURNING visibility_timeout, claim_id
 	`, tableName, MessageStatusProcessing)
 
 	var visTimeout time.Time
+	var claimID uuid.UUID
 	if err := tx.QueryRowContext(
-		ctx, updateQuery, visibilityTimeout.Seconds(), subID,
-	).Scan(&visTimeout); err != nil {
+		ctx, updateQuery, visibilityTimeout.Seconds(), row.subID, retryCount,
+	).Scan(&visTimeout, &claimID); err != nil {
 		return nil, nil, fmt.Errorf("failed to update subscription: %w", err)
 	}
 
 	msg := &Message{
-		ID:         msgID,
-		Payload:    payload,
-		CreatedAt:  createdAt,
+		ID:         row.msgID,
+		ClaimID:    claimID,
+		Payload:    row.payload,
+		CreatedAt:  row.createdAt,
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
 		MaxRetries: maxRetries,
-		Metadata:   parseMetadataJSON(metadataJSON),
+		Metadata:   pq.parseMetadataJSON(row.metadataJSON),
 	}
 
-	if errorMessage.Valid {
-		msg.ErrorMessage = &errorMessage.String
+	if row.errorMessage.Valid {
+		msg.ErrorMessage = &row.errorMessage.String
 	}
 
 	return msg, &visTimeout, nil

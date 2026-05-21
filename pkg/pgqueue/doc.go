@@ -1,12 +1,15 @@
 /*
-Package pgqueue provides a PostgreSQL-based message queue library with exactly-once delivery guarantees.
+Package pgqueue provides a PostgreSQL-based message queue library with
+at-least-once delivery.
 
 pgqueue supports two messaging patterns:
   - Channels: Point-to-point queuing where each message is consumed by a single worker
   - Pub/Sub: Fan-out messaging where all subscribers receive each message
 
 Key Features:
-  - Exactly-once delivery semantics using visibility timeouts
+  - At-least-once delivery via visibility timeouts; a message whose consumer
+    crashes before acknowledging is redelivered (handlers should be idempotent).
+    Publishing with an explicit ID deduplicates enqueues.
   - UUIDv7 time-ordered message IDs
   - Dead letter queue (DLQ) for failed messages
   - Message replay capabilities
@@ -23,7 +26,7 @@ Basic Usage:
 	// handle err
 	msg, err := pq.ConsumeFromChannel(ctx, "orders", 30*time.Second)
 	// handle err
-	_ = pq.AckChannel(ctx, "orders", msg.ID)
+	_ = pq.AckChannel(ctx, "orders", msg.Receipt())
 
 For complete examples, see the examples/ directory.
 */

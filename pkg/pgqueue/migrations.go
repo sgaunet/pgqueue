@@ -12,7 +12,7 @@ import (
 // IMPORTANT: when adding a new entry to the migrations slice below, bump this
 // constant to match that entry's version number. An init() check enforces that
 // SchemaVersion equals the last migration's version.
-const SchemaVersion = 2
+const SchemaVersion = 1
 
 // migrationAdvisoryLockKey is a fixed PostgreSQL advisory-lock key (the ASCII
 // bytes of "pgqueue") used to serialize schema migrations across processes.
@@ -38,10 +38,8 @@ CREATE TABLE IF NOT EXISTS pgqueue_schema_version (
 // also patch the dynamically-named per-queue tables (pgqueue_msg_*, pgqueue_dlq_*,
 // pgqueue_sub_*) by discovering them from pgqueue_metadata at apply time. Newly
 // created queues already get the current table shape from createChannelTables /
-// createPubSubTables, so a migration only needs to patch pre-existing tables.
-//
-// migrateV2 is a worked example of this dynamic fan-out: it uses queueTableNames
-// to ALTER every existing per-queue DLQ table.
+// createPubSubTables, so a future migration only needs to patch pre-existing
+// tables.
 type migration struct {
 	version int
 	name    string
@@ -50,8 +48,12 @@ type migration struct {
 
 // migrations is the ordered, append-only list of schema migrations. Each run of
 // InitSchema applies every entry whose version is greater than the version
-// currently recorded in the database. Never reorder, renumber, or edit the
-// behaviour of an already-released entry: only append.
+// currently recorded in the database.
+//
+// This is the v1 baseline: the project's pre-release migration history was
+// collapsed into a single initial migration. From the first release onward this
+// list is strictly append-only — never reorder, renumber, or edit the behaviour
+// of an already-released entry.
 var migrations = []migration{
 	{
 		version: 1,
@@ -63,12 +65,6 @@ var migrations = []migration{
 
 			return nil
 		},
-	},
-	{
-		// The last migration's version must equal SchemaVersion (checked by init).
-		version: SchemaVersion,
-		name:    "table-name uniqueness and pub/sub DLQ subscriber tracking",
-		apply:   migrateV2,
 	},
 }
 
@@ -89,64 +85,6 @@ func init() {
 			"pgqueue: SchemaVersion is %d but the last migration is %d",
 			SchemaVersion, last))
 	}
-}
-
-// migrateV2 enforces table-name uniqueness on pgqueue_metadata and adds a
-// subscriber_id column to every existing dead-letter-queue table.
-//
-//   - The UNIQUE(table_name) constraint closes a collision where queue names
-//     differing only by dash vs. underscore (e.g. "a-b" and "a_b") sanitize to
-//     the same physical table name.
-//   - subscriber_id lets pub/sub DLQ entries record which subscriber failed, so
-//     ReplayDLQ can re-deliver to exactly that subscriber. The column is left
-//     NULL for channel DLQ entries, which have no subscriber.
-func migrateV2(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx,
-		`ALTER TABLE pgqueue_metadata
-		 ADD CONSTRAINT pgqueue_metadata_table_name_key UNIQUE (table_name)`,
-	); err != nil {
-		return fmt.Errorf("failed to add table_name unique constraint: %w", err)
-	}
-
-	tables, err := queueTableNames(ctx, tx)
-	if err != nil {
-		return err
-	}
-	for _, t := range tables {
-		// t was validated by queueNameRegex when the queue was created.
-		stmt := "ALTER TABLE pgqueue_dlq_" + t + //nolint:gosec // G201: validated table name.
-			" ADD COLUMN IF NOT EXISTS subscriber_id TEXT"
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("failed to add subscriber_id to pgqueue_dlq_%s: %w", t, err)
-		}
-	}
-
-	return nil
-}
-
-// queueTableNames returns the sanitized table_name of every queue registered in
-// pgqueue_metadata. Migrations use it to fan schema changes out across the
-// dynamically-created per-queue tables.
-func queueTableNames(ctx context.Context, tx *sql.Tx) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT table_name FROM pgqueue_metadata`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list queue tables: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var tables []string
-	for rows.Next() {
-		var t string
-		if err := rows.Scan(&t); err != nil {
-			return nil, fmt.Errorf("failed to scan queue table name: %w", err)
-		}
-		tables = append(tables, t)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate queue tables: %w", err)
-	}
-
-	return tables, nil
 }
 
 // queryRower is satisfied by *sql.DB, *sql.Conn, and *sql.Tx, letting

@@ -10,24 +10,26 @@ import (
 )
 
 const (
-	defaultGCInterval         = 5 * time.Minute
-	defaultGCMaxWorkers       = 10
-	gcSlowCollectThreshold    = 100 * time.Millisecond // L5: named constant for slow GC logging
+	defaultGCInterval      = 5 * time.Minute
+	defaultGCMaxWorkers    = 10
+	maxGCMaxWorkers        = 100                    // upper bound to cap goroutine/connection fan-out
+	gcSlowCollectThreshold = 100 * time.Millisecond // L5: named constant for slow GC logging
 )
 
 // GarbageCollector handles automatic cleanup of old messages.
 type GarbageCollector struct {
-	pq       *PGQueue
+	pq       *Queue
 	config   GarbageCollectorConfig
 	stopChan chan struct{}
 	stopOnce sync.Once
 	started  atomic.Bool
 	wg       sync.WaitGroup
+	mu       sync.Mutex // serializes Start and Stop so wg.Add never races wg.Wait
 }
 
 // NewGarbageCollector creates a new garbage collector instance.
 func NewGarbageCollector(
-	pq *PGQueue,
+	pq *Queue,
 	config GarbageCollectorConfig,
 ) *GarbageCollector {
 	// Set defaults
@@ -39,6 +41,9 @@ func NewGarbageCollector(
 	}
 	if config.MaxWorkers <= 0 {
 		config.MaxWorkers = defaultGCMaxWorkers
+	}
+	if config.MaxWorkers > maxGCMaxWorkers {
+		config.MaxWorkers = maxGCMaxWorkers
 	}
 
 	return &GarbageCollector{
@@ -54,6 +59,8 @@ func NewGarbageCollector(
 // A GarbageCollector cannot be restarted after Stop() or context cancellation;
 // create a new instance via NewGarbageCollector instead.
 func (gc *GarbageCollector) Start(ctx context.Context) {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
 	if !gc.started.CompareAndSwap(false, true) {
 		return
 	}
@@ -64,6 +71,8 @@ func (gc *GarbageCollector) Start(ctx context.Context) {
 // Stop gracefully stops the garbage collector.
 // Safe to call multiple times or before Start().
 func (gc *GarbageCollector) Stop() {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
 	gc.stopOnce.Do(func() { close(gc.stopChan) })
 	gc.wg.Wait()
 }
@@ -98,12 +107,12 @@ func (gc *GarbageCollector) PurgeQueue(
 // Collect performs a single garbage collection pass.
 func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	// Get all queues
-	topics, err := gc.pq.ListTopics(ctx)
+	topics, err := gc.pq.listQueues(ctx, QueueTypePubSub)
 	if err != nil {
 		return fmt.Errorf("failed to list topics: %w", err)
 	}
 
-	channels, err := gc.pq.ListChannels(ctx)
+	channels, err := gc.pq.listQueues(ctx, QueueTypeChannel)
 	if err != nil {
 		return fmt.Errorf("failed to list channels: %w", err)
 	}
@@ -159,6 +168,19 @@ func (gc *GarbageCollector) run(ctx context.Context) {
 
 	ticker := time.NewTicker(gc.config.Interval)
 	defer ticker.Stop()
+
+	// Run an initial pass immediately so cleanup and timed-out-message recovery
+	// do not wait a full interval after Start.
+	select {
+	case <-ctx.Done():
+		return
+	case <-gc.stopChan:
+		return
+	default:
+		if err := gc.Collect(ctx); err != nil {
+			gc.pq.logError("garbage collection error", "error", err)
+		}
+	}
 
 	for {
 		select {
@@ -222,6 +244,14 @@ func (gc *GarbageCollector) collectQueue(
 
 	if err := gc.applyRetentionPolicy(ctx, queue, policy); err != nil {
 		return fmt.Errorf("failed to apply retention policy: %w", err)
+	}
+
+	if queue.QueueType == QueueTypePubSub {
+		if err := gc.purgeInactiveSubscriptions(
+			ctx, queue.QueueName, queue.TableName,
+		); err != nil {
+			return fmt.Errorf("failed to purge inactive subscriptions: %w", err)
+		}
 	}
 
 	return gc.resetTimedOutEntries(ctx, queue)
@@ -394,7 +424,10 @@ func (gc *GarbageCollector) purgeDLQMessages(
 	return nil
 }
 
-// resetTimedOutMessages resets messages with expired visibility timeouts.
+// resetTimedOutMessages resets messages with expired visibility timeouts back
+// to pending. The redelivery counts as a retry attempt (retry_count is
+// incremented) so a message whose consumer keeps crashing still reaches the
+// DLQ; this keeps the GC consistent with the reclaim done by ConsumeFromChannel.
 func (gc *GarbageCollector) resetTimedOutMessages(
 	ctx context.Context,
 	tableName string,
@@ -403,6 +436,7 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = '%s',
+		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL
 		WHERE status = '%s'
 		AND visibility_timeout IS NOT NULL
@@ -422,7 +456,9 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	return nil
 }
 
-// resetTimedOutSubscriptions resets subscriptions with expired visibility timeouts.
+// resetTimedOutSubscriptions resets subscriptions with expired visibility
+// timeouts back to pending, incrementing retry_count so the redelivery counts
+// as a retry attempt — consistent with the reclaim done by ConsumeFromTopic.
 func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	ctx context.Context,
 	tableName string,
@@ -431,6 +467,7 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = '%s',
+		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL
 		WHERE status = '%s'
 		AND visibility_timeout IS NOT NULL
@@ -447,6 +484,41 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	rows, _ := result.RowsAffected()
 	if rows > 0 {
 		gc.pq.logInfo("reset timed-out subscriptions", "count", rows, "table", tableName)
+	}
+
+	return nil
+}
+
+// purgeInactiveSubscriptions deletes leftover subscription rows belonging to
+// subscribers that have unsubscribed (pgqueue_subscribers.active = FALSE).
+//
+// Unsubscribe is intentionally soft — it lets an in-flight message be drained —
+// so it leaves these rows behind. Without this reaping step an abandoned
+// subscriber's un-acked rows would pin their parent messages forever, because
+// purgeCompletedMessages only deletes a message once every subscription row for
+// it is acked. A re-subscribe flips the subscriber back to active before the
+// next GC pass, sparing its rows.
+func (gc *GarbageCollector) purgeInactiveSubscriptions(
+	ctx context.Context,
+	queueName, tableName string,
+) error {
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		DELETE FROM pgqueue_sub_%s
+		WHERE subscriber_id IN (
+			SELECT subscriber_id FROM pgqueue_subscribers
+			WHERE topic_name = $1 AND active = FALSE
+		)
+	`, tableName)
+
+	result, err := gc.pq.db.ExecContext(ctx, query, queueName)
+	if err != nil {
+		return fmt.Errorf("failed to purge inactive subscriptions: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows > 0 {
+		gc.pq.logInfo("purged inactive subscriptions", "count", rows, "table", tableName)
 	}
 
 	return nil

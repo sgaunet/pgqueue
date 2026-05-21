@@ -15,7 +15,7 @@ func TestGetStats(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "stats-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "stats-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestGetStats(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "stats-test", msg.ID); err != nil {
+		if err := pq.AckChannel(ctx, "stats-test", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -78,7 +78,7 @@ func TestGetQueueDepth(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "depth-test", pgqueue.ChannelOptions{})
+	err := pq.CreateChannel(ctx, "depth-test")
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestGetSubscriberLag(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test topic
-	err := pq.CreateTopic(ctx, "lag-test", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "lag-test")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestGetSubscriberLag(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "lag-test", "subscriber-1", msg.ID); err != nil {
+		if err := pq.AckTopic(ctx, "lag-test", "subscriber-1", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -193,9 +193,7 @@ func TestGetDLQStats(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a test channel with max retries
-	err := pq.CreateChannel(ctx, "dlq-stats-test", pgqueue.ChannelOptions{
-		MaxRetries: 1,
-	})
+	err := pq.CreateChannel(ctx, "dlq-stats-test", pgqueue.WithQueueMaxRetries(1))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
@@ -221,7 +219,7 @@ func TestGetDLQStats(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to consume message: %v", err)
 			}
-			if err := pq.NackChannel(ctx, "dlq-stats-test", msg.ID, "test failure"); err != nil {
+			if err := pq.NackChannel(ctx, "dlq-stats-test", msg.Receipt(), "test failure"); err != nil {
 				t.Fatalf("failed to nack message: %v", err)
 			}
 		}
@@ -256,7 +254,7 @@ func TestGetSubscriberHealth(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "health-test", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "health-test")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -281,7 +279,7 @@ func TestGetSubscriberHealth(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "health-test", "sub-healthy", msg.ID); err != nil {
+		if err := pq.AckTopic(ctx, "health-test", "sub-healthy", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -328,7 +326,7 @@ func TestGetSubscriberHealthStuckMessages(t *testing.T) {
 
 	ctx := context.Background()
 
-	err := pq.CreateTopic(ctx, "stuck-test", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "stuck-test")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -378,11 +376,11 @@ func TestGetUnhealthySubscribers(t *testing.T) {
 	ctx := context.Background()
 
 	// Create two topics
-	err := pq.CreateTopic(ctx, "unhealthy-a", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "unhealthy-a")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
-	err = pq.CreateTopic(ctx, "unhealthy-b", pgqueue.TopicOptions{})
+	err = pq.CreateTopic(ctx, "unhealthy-b")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}
@@ -416,7 +414,7 @@ func TestGetUnhealthySubscribers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "unhealthy-a", "sub-ok", msg.ID); err != nil {
+		if err := pq.AckTopic(ctx, "unhealthy-a", "sub-ok", msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack: %v", err)
 		}
 	}
@@ -488,7 +486,7 @@ func TestPubSubStats(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a topic
-	err := pq.CreateTopic(ctx, "pubsub-stats-test", pgqueue.TopicOptions{})
+	err := pq.CreateTopic(ctx, "pubsub-stats-test")
 	if err != nil {
 		t.Fatalf("failed to create topic: %v", err)
 	}

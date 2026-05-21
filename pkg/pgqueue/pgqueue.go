@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // baseSchemaSQL contains the DDL for creating the base schema tables required by pgqueue.
@@ -25,11 +26,14 @@ CREATE TABLE IF NOT EXISTS pgqueue_metadata (
     paused BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(queue_type, queue_name)
+    UNIQUE(queue_type, queue_name),
+    -- UNIQUE(table_name) closes a collision where queue names differing only by
+    -- dash vs. underscore (e.g. "a-b" and "a_b") sanitize to the same physical
+    -- table name. Its index also serves table_name lookups.
+    UNIQUE(table_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pgqueue_metadata_type_name ON pgqueue_metadata(queue_type, queue_name);
-CREATE INDEX IF NOT EXISTS idx_pgqueue_metadata_table_name ON pgqueue_metadata(table_name);
 
 -- Subscribers table for pub/sub topics
 CREATE TABLE IF NOT EXISTS pgqueue_subscribers (
@@ -59,12 +63,20 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_queue ON pgqueue_replay_log(qu
 CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_log(created_at);
 `
 
-// PGQueue is the main struct for the message queue system.
-type PGQueue struct {
-	db     *sql.DB
-	config Config
-	logger *slog.Logger
+// Queue is the main struct for the message queue system.
+type Queue struct {
+	db       *sql.DB
+	config   Config         // legacy config field; kept for backward-compat accessors
+	cfg      queueConfig    // canonical config built from functional options
+	logger   *slog.Logger
+	closed   atomic.Bool    // set to true after Close() is called
+	mdcache  *metadataCache // per-queue table-name cache (immutable fields only)
 }
+
+// PGQueue is a backward-compatible alias for Queue.
+//
+// Deprecated: Use Queue instead.
+type PGQueue = Queue
 
 // queueNameRegex validates queue names (alphanumeric, underscore, dash).
 var queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -123,49 +135,90 @@ func InitSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// Init initializes the PGQueue system with the provided configuration.
-func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
-	if cfg.DB == nil {
-		return nil, ErrDBRequired
+// minPGVersionNum is PostgreSQL 18 in server_version_num form, the lowest
+// version pgqueue supports (uuidv7() is native from PostgreSQL 18 onward).
+const minPGVersionNum = 180000
+
+// validateConfig rejects a Config with a negative numeric field: a negative
+// MaxMessageSize would make every publish fail, and the others have no
+// meaningful negative interpretation.
+func validateConfig(cfg Config) error {
+	if cfg.MaxMessageSize < 0 || cfg.DefaultMaxRetries < 0 ||
+		cfg.DefaultTTL < 0 || cfg.MaxQueues < 0 {
+		return ErrInvalidConfig
 	}
 
-	// Set defaults
-	if cfg.MaxMessageSize == 0 {
-		cfg.MaxMessageSize = 1024 // 1KB default
-	}
-	if cfg.DefaultMaxRetries == 0 {
-		cfg.DefaultMaxRetries = 3
-	}
+	return nil
+}
 
-	// Test database connection
-	if err := cfg.DB.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
+// checkDBReady verifies the database is reachable and runs a supported
+// PostgreSQL version.
+func checkDBReady(ctx context.Context, db *sql.DB) error {
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
 	}
-
-	// Check PostgreSQL version (18+ required for uuidv7())
-	const minPGVersionNum = 180000 // PostgreSQL 18
 
 	var versionStr string
-	if err := cfg.DB.QueryRowContext(ctx, "SHOW server_version_num").Scan(&versionStr); err != nil {
-		return nil, fmt.Errorf("failed to check PostgreSQL version: %w", err)
+	if err := db.QueryRowContext(ctx, "SHOW server_version_num").Scan(&versionStr); err != nil {
+		return fmt.Errorf("failed to check PostgreSQL version: %w", err)
 	}
 	versionNum, err := strconv.Atoi(versionStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse PostgreSQL version number %q: %w", versionStr, err)
+		return fmt.Errorf("failed to parse PostgreSQL version number %q: %w", versionStr, err)
 	}
 	if versionNum < minPGVersionNum {
-		return nil, fmt.Errorf("%w: got %d", ErrUnsupportedPGVersion, versionNum)
+		return fmt.Errorf("%w: got %d", ErrUnsupportedPGVersion, versionNum)
 	}
 
-	pq := &PGQueue{
-		db:     cfg.DB,
-		config: cfg,
-		logger: cfg.Logger,
+	return nil
+}
+
+// New creates a Queue using functional options. It is the preferred constructor.
+//
+// New returns ErrSchemaNotInitialized if InitSchema has not been run, and
+// ErrSchemaOutdated if the database schema is behind the current SchemaVersion.
+// Call InitSchema first on every application start to ensure the schema is
+// up to date.
+//
+// Example:
+//
+//	pq, err := pgqueue.New(ctx, db,
+//	    pgqueue.WithMaxMessageSize(1024*1024),
+//	    pgqueue.WithDefaultMaxRetries(5),
+//	)
+func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
+	if db == nil {
+		return nil, ErrDBRequired
 	}
 
-	// Fail fast with a clear error if InitSchema has not been run, or was run
-	// by an older build, rather than surfacing raw "column does not exist"
-	// errors later from individual operations.
+	cfg := applyConfigOptions(opts)
+	if cfg.maxMessageSize < 0 || cfg.defaultMaxRetries < 0 ||
+		int64(cfg.defaultTTL) < 0 || cfg.maxQueues < 0 {
+		return nil, ErrInvalidConfig
+	}
+
+	if err := checkDBReady(ctx, db); err != nil {
+		return nil, err
+	}
+
+	// Build the legacy Config for backward-compat accessor methods.
+	legacyCfg := Config{
+		DB:                db,
+		MaxMessageSize:    cfg.maxMessageSize,
+		DefaultMaxRetries: cfg.defaultMaxRetries,
+		DefaultTTL:        cfg.defaultTTL,
+		MaxQueues:         cfg.maxQueues,
+		Logger:            cfg.logger,
+	}
+
+	pq := &Queue{
+		db:      db,
+		config:  legacyCfg,
+		cfg:     cfg,
+		logger:  cfg.logger,
+		mdcache: newMetadataCache(),
+	}
+
 	if err := pq.checkSchemaReady(ctx); err != nil {
 		return nil, err
 	}
@@ -173,27 +226,65 @@ func Init(ctx context.Context, cfg Config) (*PGQueue, error) {
 	return pq, nil
 }
 
-// CreateTopic creates a new pub/sub topic with the specified options.
-func (pq *PGQueue) CreateTopic(
-	ctx context.Context,
-	name string,
-	opts TopicOptions,
-) error {
-	return pq.createQueue(ctx, QueueTypePubSub, name, opts)
+// Init initializes the Queue system with the provided configuration.
+//
+// Deprecated: Use New(ctx, db, ...Option) with functional options instead.
+// Init is retained for backward compatibility.
+func Init(ctx context.Context, cfg Config) (*Queue, error) {
+	if cfg.DB == nil {
+		return nil, ErrDBRequired
+	}
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+
+	opts := configFromLegacy(cfg)
+	return New(ctx, cfg.DB, opts...)
 }
 
-// CreateChannel creates a new point-to-point channel with the specified options.
-func (pq *PGQueue) CreateChannel(
+// CreateChannel creates a new point-to-point channel.
+// Per-queue settings (TTL, max retries, message size) are controlled via
+// WithQueueMaxRetries, WithQueueTTL, and WithQueueMaxMessageSize options.
+func (pq *Queue) CreateChannel(
 	ctx context.Context,
 	name string,
-	opts ChannelOptions,
+	opts ...QueueOption,
 ) error {
-	return pq.createQueue(ctx, QueueTypeChannel, name, opts)
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
+	o := applyQueueOptions(opts)
+	co := ChannelOptions{
+		MaxMessageSize: o.maxMessageSize,
+		TTL:            o.ttl,
+		MaxRetries:     o.maxRetries,
+	}
+	return pq.createQueue(ctx, QueueTypeChannel, name, co)
+}
+
+// CreateTopic creates a new pub/sub topic.
+// Per-queue settings are controlled via WithQueueMaxRetries, WithQueueTTL, and
+// WithQueueMaxMessageSize options.
+func (pq *Queue) CreateTopic(
+	ctx context.Context,
+	name string,
+	opts ...QueueOption,
+) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
+	o := applyQueueOptions(opts)
+	to := TopicOptions{
+		MaxMessageSize: o.maxMessageSize,
+		TTL:            o.ttl,
+		MaxRetries:     o.maxRetries,
+	}
+	return pq.createQueue(ctx, QueueTypePubSub, name, to)
 }
 
 // DeleteTopic deletes a pub/sub topic and all associated resources.
 // Requires confirm=true as a safety measure to prevent accidental deletion.
-func (pq *PGQueue) DeleteTopic(
+func (pq *Queue) DeleteTopic(
 	ctx context.Context,
 	name string,
 	confirm bool,
@@ -203,7 +294,7 @@ func (pq *PGQueue) DeleteTopic(
 
 // DeleteChannel deletes a point-to-point channel and all associated resources.
 // Requires confirm=true as a safety measure to prevent accidental deletion.
-func (pq *PGQueue) DeleteChannel(
+func (pq *Queue) DeleteChannel(
 	ctx context.Context,
 	name string,
 	confirm bool,
@@ -211,45 +302,92 @@ func (pq *PGQueue) DeleteChannel(
 	return pq.deleteQueue(ctx, QueueTypeChannel, name, confirm)
 }
 
-// ListTopics returns all pub/sub topics.
-func (pq *PGQueue) ListTopics(
-	ctx context.Context,
-) ([]QueueMetadata, error) {
-	return pq.listQueues(ctx, QueueTypePubSub)
+// ListTopics returns the names of all pub/sub topics.
+func (pq *Queue) ListTopics(ctx context.Context) ([]string, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
+	rows, err := pq.listQueues(ctx, QueueTypePubSub)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(rows))
+	for i, r := range rows {
+		names[i] = r.QueueName
+	}
+	return names, nil
 }
 
-// ListChannels returns all point-to-point channels.
-func (pq *PGQueue) ListChannels(
-	ctx context.Context,
-) ([]QueueMetadata, error) {
-	return pq.listQueues(ctx, QueueTypeChannel)
+// ListChannels returns the names of all point-to-point channels.
+func (pq *Queue) ListChannels(ctx context.Context) ([]string, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
+	rows, err := pq.listQueues(ctx, QueueTypeChannel)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(rows))
+	for i, r := range rows {
+		names[i] = r.QueueName
+	}
+	return names, nil
 }
 
-// Close is a no-op placeholder for future resource cleanup.
-// It does NOT close the underlying *sql.DB, which is owned by the caller.
-// If a GarbageCollector is running, the caller must stop it before closing
-// the database connection. Example:
+// Close marks the Queue as closed. After Close returns, all public operations
+// will return ErrQueueClosed. It does NOT close the underlying *sql.DB, which
+// is owned and managed by the caller. Stop any GarbageCollector before calling
+// Close; example:
 //
 //	gc.Stop()       // stop GC first
-//	pq.Close()      // then close pgqueue
-//	db.Close()      // then close the database
-func (pq *PGQueue) Close() error {
+//	pq.Close()      // then mark queue closed
+//	db.Close()      // then close the database connection
+//
+// Close is idempotent: calling it multiple times is safe and returns nil.
+func (pq *Queue) Close() error {
+	pq.closed.Store(true)
 	return nil
 }
 
 // PauseQueue prevents new messages from being consumed from the specified queue.
 // Publishing is still allowed while paused.
-func (pq *PGQueue) PauseQueue(ctx context.Context, queueName string, queueType QueueType) error {
+//
+// Deprecated: Use PauseChannel or PauseTopic instead.
+func (pq *Queue) PauseQueue(ctx context.Context, queueName string, queueType QueueType) error {
 	return pq.setQueuePaused(ctx, queueName, queueType, true)
 }
 
 // ResumeQueue allows message consumption again for the specified queue.
-func (pq *PGQueue) ResumeQueue(ctx context.Context, queueName string, queueType QueueType) error {
+//
+// Deprecated: Use ResumeChannel or ResumeTopic instead.
+func (pq *Queue) ResumeQueue(ctx context.Context, queueName string, queueType QueueType) error {
 	return pq.setQueuePaused(ctx, queueName, queueType, false)
 }
 
+// PauseChannel pauses a point-to-point channel, preventing new messages from
+// being consumed. Publishing is still allowed while paused.
+func (pq *Queue) PauseChannel(ctx context.Context, name string) error {
+	return pq.setQueuePaused(ctx, name, QueueTypeChannel, true)
+}
+
+// ResumeChannel resumes a paused channel, allowing message consumption again.
+func (pq *Queue) ResumeChannel(ctx context.Context, name string) error {
+	return pq.setQueuePaused(ctx, name, QueueTypeChannel, false)
+}
+
+// PauseTopic pauses a pub/sub topic, preventing new messages from being consumed
+// by any subscriber. Publishing is still allowed while paused.
+func (pq *Queue) PauseTopic(ctx context.Context, name string) error {
+	return pq.setQueuePaused(ctx, name, QueueTypePubSub, true)
+}
+
+// ResumeTopic resumes a paused pub/sub topic, allowing message consumption again.
+func (pq *Queue) ResumeTopic(ctx context.Context, name string) error {
+	return pq.setQueuePaused(ctx, name, QueueTypePubSub, false)
+}
+
 // IsQueuePaused returns whether the specified queue is currently paused.
-func (pq *PGQueue) IsQueuePaused(ctx context.Context, queueName string, queueType QueueType) (bool, error) {
+func (pq *Queue) IsQueuePaused(ctx context.Context, queueName string, queueType QueueType) (bool, error) {
 	meta, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
@@ -261,7 +399,15 @@ func (pq *PGQueue) IsQueuePaused(ctx context.Context, queueName string, queueTyp
 	return meta.Paused, nil
 }
 
-func (pq *PGQueue) setQueuePaused(ctx context.Context, queueName string, queueType QueueType, paused bool) error {
+// checkClosed returns ErrQueueClosed if Close has been called.
+func (pq *Queue) checkClosed() error {
+	if pq.closed.Load() {
+		return ErrQueueClosed
+	}
+	return nil
+}
+
+func (pq *Queue) setQueuePaused(ctx context.Context, queueName string, queueType QueueType, paused bool) error {
 	result, err := pq.db.ExecContext(ctx,
 		`UPDATE pgqueue_metadata SET paused = $1, updated_at = NOW()
 		 WHERE queue_type = $2 AND queue_name = $3`,
@@ -284,7 +430,7 @@ func (pq *PGQueue) setQueuePaused(ctx context.Context, queueName string, queueTy
 
 // checkSchemaReady verifies the database schema has been created by InitSchema
 // and is at least at the version this build of pgqueue requires.
-func (pq *PGQueue) checkSchemaReady(ctx context.Context) error {
+func (pq *Queue) checkSchemaReady(ctx context.Context) error {
 	schemaVer, err := pq.GetSchemaVersion(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to check schema version: %w", err)
@@ -301,20 +447,20 @@ func (pq *PGQueue) checkSchemaReady(ctx context.Context) error {
 	return nil
 }
 
-func (pq *PGQueue) logInfo(msg string, args ...any) {
+func (pq *Queue) logInfo(msg string, args ...any) {
 	if pq.logger != nil {
 		pq.logger.Info(msg, args...)
 	}
 }
 
-func (pq *PGQueue) logError(msg string, args ...any) {
+func (pq *Queue) logError(msg string, args ...any) {
 	if pq.logger != nil {
 		pq.logger.Error(msg, args...)
 	}
 }
 
 // createQueue is the internal implementation for creating queues.
-func (pq *PGQueue) createQueue(
+func (pq *Queue) createQueue(
 	ctx context.Context,
 	queueType QueueType,
 	name string,
@@ -348,6 +494,42 @@ func (pq *PGQueue) createQueue(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := pq.createQueueInTx(
+		ctx, tx, queueType, name, tableName, configJSON,
+	); err != nil {
+		return err
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// createQueueInTx performs the transactional part of queue creation: it takes
+// the migration lock, enforces the queue cap, and writes the metadata row and
+// per-queue tables.
+func (pq *Queue) createQueueInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	queueType QueueType,
+	name, tableName string,
+	configJSON []byte,
+) error {
+	// Take a shared lock on the migration advisory key so queue creation cannot
+	// run its DDL concurrently with a schema migration, which holds the same key
+	// exclusively. A migration's dynamic fan-out across per-queue tables snapshots
+	// pgqueue_metadata once; without this lock a queue created mid-migration could
+	// be missed. Concurrent createQueue calls share the lock freely. The lock is
+	// released when this transaction ends.
+	if _, err := tx.ExecContext(ctx,
+		"SELECT pg_advisory_xact_lock_shared($1)", migrationAdvisoryLockKey,
+	); err != nil {
+		return fmt.Errorf("failed to acquire migration lock: %w", err)
+	}
+
 	// Enforce the optional cap on the total number of queues to guard against
 	// table-space exhaustion when queue creation is exposed to untrusted input.
 	if err := pq.enforceMaxQueues(ctx, tx); err != nil {
@@ -355,21 +537,15 @@ func (pq *PGQueue) createQueue(
 	}
 
 	// Create metadata entry
-	_, err = pq.createQueueMetadata(
+	if _, err := pq.createQueueMetadata(
 		ctx, tx, string(queueType), name, tableName, configJSON,
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("failed to create queue metadata: %w", err)
 	}
 
 	// Create queue tables based on type
 	if err := pq.createQueueTables(ctx, tx, queueType, tableName); err != nil {
 		return err
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
@@ -382,8 +558,13 @@ const createQueueAdvisoryLockKey int64 = 0x70677175_65_6371
 
 // enforceMaxQueues serializes queue creation and checks the MaxQueues cap
 // within the given transaction. It is a no-op when no cap is configured.
-func (pq *PGQueue) enforceMaxQueues(ctx context.Context, tx *sql.Tx) error {
-	if pq.config.MaxQueues <= 0 {
+func (pq *Queue) enforceMaxQueues(ctx context.Context, tx *sql.Tx) error {
+	// Use the functional-options config if available, else fall back to legacy.
+	maxQueues := pq.cfg.maxQueues
+	if maxQueues == 0 {
+		maxQueues = pq.config.MaxQueues
+	}
+	if maxQueues <= 0 {
 		return nil
 	}
 	// Serialize concurrent createQueue calls so the count check cannot race
@@ -397,14 +578,14 @@ func (pq *PGQueue) enforceMaxQueues(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return err
 	}
-	if count >= pq.config.MaxQueues {
-		return fmt.Errorf("limit is %d: %w", pq.config.MaxQueues, ErrMaxQueuesReached)
+	if count >= maxQueues {
+		return fmt.Errorf("limit is %d: %w", maxQueues, ErrMaxQueuesReached)
 	}
 
 	return nil
 }
 
-func (pq *PGQueue) createQueueTables(
+func (pq *Queue) createQueueTables(
 	ctx context.Context,
 	tx *sql.Tx,
 	queueType QueueType,
@@ -424,7 +605,7 @@ func (pq *PGQueue) createQueueTables(
 }
 
 // deleteQueue is the internal implementation for deleting queues.
-func (pq *PGQueue) deleteQueue(
+func (pq *Queue) deleteQueue(
 	ctx context.Context,
 	queueType QueueType,
 	name string,
@@ -464,10 +645,16 @@ func (pq *PGQueue) deleteQueue(
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
+	// Invalidate the metadata cache entry for the deleted queue so subsequent
+	// operations do not serve stale table-name mappings.
+	if pq.mdcache != nil {
+		pq.mdcache.invalidate(string(queueType), name)
+	}
+
 	return nil
 }
 
-func (pq *PGQueue) executeDelete(
+func (pq *Queue) executeDelete(
 	ctx context.Context,
 	tx *sql.Tx,
 	queueType QueueType,
@@ -506,7 +693,7 @@ func (pq *PGQueue) executeDelete(
 // CREATE INDEX IF NOT EXISTS to silently skip the second queue's index.
 const maxQueueNameLength = 28
 
-func (pq *PGQueue) validateQueueName(name string) error {
+func (pq *Queue) validateQueueName(name string) error {
 	if len(name) == 0 || len(name) > maxQueueNameLength {
 		return fmt.Errorf("queue name must be 1-%d characters: %w", maxQueueNameLength, ErrInvalidQueueName)
 	}
@@ -528,7 +715,7 @@ func validateSubscriberID(id string) error {
 	return nil
 }
 
-func (pq *PGQueue) checkQueueNotExists(
+func (pq *Queue) checkQueueNotExists(
 	ctx context.Context,
 	queueType QueueType,
 	name string,
@@ -545,7 +732,7 @@ func (pq *PGQueue) checkQueueNotExists(
 }
 
 // createPubSubTables creates message and subscription tables for a pub/sub topic.
-func (pq *PGQueue) createPubSubTables(
+func (pq *Queue) createPubSubTables(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -583,6 +770,8 @@ func (pq *PGQueue) createPubSubTables(
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			acked_at TIMESTAMPTZ,
 			visibility_timeout TIMESTAMPTZ,
+			available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			claim_id UUID,
 			retry_count INT NOT NULL DEFAULT 0,
 			error_message TEXT,
 			UNIQUE(message_id, subscriber_id),
@@ -602,7 +791,7 @@ func (pq *PGQueue) createPubSubTables(
 	return pq.createDLQTable(ctx, tx, tableName)
 }
 
-func (pq *PGQueue) createPubSubIndexes(
+func (pq *Queue) createPubSubIndexes(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -640,6 +829,14 @@ func (pq *PGQueue) createPubSubIndexes(
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
 			tableName, tableName, MessageStatusProcessing,
 		),
+		// Backoff-optimized index: covers pending subscriptions awaiting
+		// their scheduled redelivery time (available_at).
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_available
+			 ON pgqueue_sub_%s(available_at)
+			 WHERE status = '%s'`,
+			tableName, tableName, MessageStatusPending,
+		),
 	}
 
 	for _, idx := range subIndexes {
@@ -652,7 +849,7 @@ func (pq *PGQueue) createPubSubIndexes(
 }
 
 // createChannelTables creates message table for a point-to-point channel.
-func (pq *PGQueue) createChannelTables(
+func (pq *Queue) createChannelTables(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -667,6 +864,8 @@ func (pq *PGQueue) createChannelTables(
 			retry_count INT NOT NULL DEFAULT 0,
 			max_retries INT,
 			visibility_timeout TIMESTAMPTZ,
+			available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			claim_id UUID,
 			processed_at TIMESTAMPTZ,
 			error_message TEXT,
 			metadata JSONB
@@ -684,7 +883,7 @@ func (pq *PGQueue) createChannelTables(
 	return pq.createDLQTable(ctx, tx, tableName)
 }
 
-func (pq *PGQueue) createChannelIndexes(
+func (pq *Queue) createChannelIndexes(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -719,6 +918,14 @@ func (pq *PGQueue) createChannelIndexes(
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
 			tableName, tableName, MessageStatusProcessing,
 		),
+		// Backoff-optimized index: covers pending messages awaiting their
+		// scheduled redelivery time (available_at).
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_available
+			 ON pgqueue_msg_%s(available_at)
+			 WHERE status = '%s'`,
+			tableName, tableName, MessageStatusPending,
+		),
 	}
 
 	for _, idx := range indexes {
@@ -731,7 +938,7 @@ func (pq *PGQueue) createChannelIndexes(
 }
 
 // createDLQTable creates a dead letter queue table.
-func (pq *PGQueue) createDLQTable(
+func (pq *Queue) createDLQTable(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -767,7 +974,7 @@ func (pq *PGQueue) createDLQTable(
 }
 
 // listQueues is the internal implementation for listing queues.
-func (pq *PGQueue) listQueues(
+func (pq *Queue) listQueues(
 	ctx context.Context,
 	queueType QueueType,
 ) ([]QueueMetadata, error) {
