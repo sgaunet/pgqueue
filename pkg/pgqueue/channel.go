@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -464,9 +465,12 @@ func (pq *Queue) retryMessage(
 	errorMsg string,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
+	// claim_id is cleared so a stale receipt held by the previous consumer
+	// resolves to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	updateQuery := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = '%s',
+		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $2
@@ -481,9 +485,17 @@ func (pq *Queue) retryMessage(
 	return nil
 }
 
+// truncateErrorMsg caps an error message at maxErrorMessageLength bytes. It
+// truncates on a UTF-8 rune boundary: slicing a multi-byte string at an
+// arbitrary byte offset can split a rune and produce invalid UTF-8, which
+// PostgreSQL rejects on a TEXT column. Any trailing partial sequence is dropped.
 func truncateErrorMsg(msg string) string {
-	if len(msg) > maxErrorMessageLength {
-		return msg[:maxErrorMessageLength]
+	if len(msg) <= maxErrorMessageLength {
+		return msg
 	}
-	return msg
+	truncated := msg[:maxErrorMessageLength]
+	for len(truncated) > 0 && !utf8.ValidString(truncated) {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated
 }

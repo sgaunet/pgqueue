@@ -1,7 +1,8 @@
-// Package pgqueue provides consume.go — single-shot consume APIs (ReceiveChannel,
-// ReceiveTopic) plus queue-agnostic Ack/Nack and their batch variants.
-// Handler-based and iterator-based consume loops are reserved for Phase 4 (US2).
 package pgqueue
+
+// consume.go holds the single-shot consume APIs (ReceiveChannel, ReceiveTopic)
+// plus queue-agnostic Ack/Nack and their batch variants. Handler-based and
+// iterator-based consume loops are reserved for Phase 4 (US2).
 
 import "context"
 

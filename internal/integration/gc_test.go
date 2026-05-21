@@ -796,3 +796,72 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 		t.Errorf("gc-policy-b: expected 3 completed retained, got %d", statsB.CompletedCount)
 	}
 }
+
+// TestT019_GCReclaimDoesNotDoubleIncrementRetryCount verifies that the GC does NOT
+// increment retry_count when resetting a timed-out message. Only the consume-path
+// reclaim (which picks up a message still in 'processing' state) increments retry_count.
+//
+// Sequence: consume → timeout → GC reset → consume again.
+//
+// Before fix (GC increments): GC sets retry_count=1, second consume delivers retry_count=1.
+// After fix (GC does NOT increment): GC leaves retry_count=0, second consume picks up
+// status=pending (not processing) so no reclaim-increment; delivers retry_count=0.
+func TestT019_GCReclaimDoesNotDoubleIncrementRetryCount(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "t019-gc-double-retry"
+	// maxRetries=5 gives plenty of headroom so we stay far from DLQ
+	if err := pq.CreateChannel(ctx, queueName, pgqueue.WithQueueMaxRetries(5)); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, queueName, []byte("msg")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// Consume with a very short visibility timeout so it expires quickly
+	_, err := pq.ConsumeFromChannel(ctx, queueName, 1*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+
+	// Wait for the visibility timeout to expire
+	time.Sleep(50 * time.Millisecond)
+
+	// Run GC: this should reset the message to pending WITHOUT incrementing retry_count.
+	// The GC must only flip status→pending and clear claim_id/visibility_timeout.
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("GC collect failed: %v", err)
+	}
+
+	// Verify the GC left retry_count at 0 in the database
+	var dbRetryCountAfterGC int
+	err = db.QueryRowContext(ctx,
+		"SELECT retry_count FROM pgqueue_msg_t019_gc_double_retry LIMIT 1",
+	).Scan(&dbRetryCountAfterGC)
+	if err != nil {
+		t.Fatalf("failed to query retry_count after GC: %v", err)
+	}
+	if dbRetryCountAfterGC != 0 {
+		t.Errorf("GC must not increment retry_count: got %d after GC, want 0", dbRetryCountAfterGC)
+	}
+
+	// Now consume again: message is in pending state so no reclaim-path increment.
+	// The delivered message should have retry_count=0.
+	msg2, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to re-consume: %v", err)
+	}
+	if msg2 == nil {
+		t.Fatal("expected message after GC reset, got nil")
+	}
+
+	// retry_count must be 0: GC didn't increment, pending-path consume doesn't increment.
+	if msg2.RetryCount != 0 {
+		t.Errorf("expected retry_count=0 (GC does not increment), got %d", msg2.RetryCount)
+	}
+}

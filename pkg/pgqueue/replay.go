@@ -166,6 +166,11 @@ func validateReplayOpts(opts ReplayOptions) error {
 	if !opts.Confirm && !opts.DryRun {
 		return ErrConfirmationRequired
 	}
+	// A negative limit is meaningless and would otherwise reach PostgreSQL as an
+	// invalid LIMIT, surfacing an opaque database error instead of a clear one.
+	if opts.Limit < 0 {
+		return ErrInvalidConfig
+	}
 
 	return nil
 }
@@ -269,6 +274,7 @@ func (pq *Queue) buildChannelReplayQuery(tableName string, limit int) string {
 			WHERE id IN (
 				SELECT id FROM pgqueue_msg_%s
 				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
+				ORDER BY id
 				LIMIT %d
 			)
 		`, tableName, MessageStatusPending, tableName, MessageStatusPending, MessageStatusProcessing, limit)
@@ -299,6 +305,7 @@ func (pq *Queue) buildPubSubReplayQuery(tableName string, limit int) string {
 			WHERE id IN (
 				SELECT id FROM pgqueue_sub_%s
 				WHERE created_at >= $1 AND status != '%s' AND status != '%s'
+				ORDER BY id
 				LIMIT %d
 			)
 		`, tableName, MessageStatusPending, tableName, MessageStatusPending, MessageStatusProcessing, limit)
@@ -451,10 +458,15 @@ func (pq *Queue) fetchDLQMessages(
 	}
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
+	// ORDER BY id makes the selected subset deterministic; FOR UPDATE SKIP
+	// LOCKED lets concurrent ReplayDLQ calls each claim a disjoint set of rows
+	// so no DLQ entry is replayed twice or silently dropped.
 	selectQuery := fmt.Sprintf(`
 		SELECT id, original_message_id, subscriber_id, payload, metadata
 		FROM pgqueue_dlq_%s
+		ORDER BY id
 		LIMIT %d
+		FOR UPDATE SKIP LOCKED
 	`, tableName, limit)
 
 	rows, err := tx.QueryContext(ctx, selectQuery)

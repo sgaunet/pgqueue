@@ -669,9 +669,12 @@ func (pq *Queue) batchRetryMessages(
 	errorMsg string,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
+	// claim_id is cleared so stale receipts from the previous consumer
+	// resolve to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = '%s',
+		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $2
@@ -839,9 +842,12 @@ func (pq *Queue) batchRetrySubscriptions(
 	subscriberID, errorMsg string,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
+	// claim_id is cleared so stale receipts from the previous consumer
+	// resolve to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = '%s',
+		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $3

@@ -484,3 +484,58 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 		}
 	})
 }
+
+// TestT022_NackErrorMsgUTF8TruncationBoundary verifies that a nack error message
+// containing multi-byte UTF-8 characters that straddle the 1024-byte truncation
+// boundary is stored as valid UTF-8 text (not a broken sequence).
+func TestT022_NackErrorMsgUTF8TruncationBoundary(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "t022-utf8-trunc"
+	if err := pq.CreateChannel(ctx, queueName, pgqueue.WithQueueMaxRetries(5)); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, queueName, []byte("payload")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	if err != nil || msg == nil {
+		t.Fatalf("consume failed: %v", err)
+	}
+
+	// Build a 1024+ byte string where the 1024th byte is in the MIDDLE of a 3-byte
+	// UTF-8 rune (U+4E16, "世" = 0xE4 0xB8 0x96). If truncated on byte boundary
+	// the result would end with 0xE4 (incomplete sequence); rune-aware truncation
+	// must stop at 1023 bytes to avoid splitting the rune.
+	// Fill 1022 bytes with ASCII 'a', then append "世界" (6 bytes), totalling 1028.
+	errorMsg := strings.Repeat("a", 1022) + "世界"
+
+	if err := pq.NackChannel(ctx, queueName, msg.Receipt(), errorMsg); err != nil {
+		t.Fatalf("nack failed: %v", err)
+	}
+
+	// Read the stored error_message from the database
+	var stored string
+	err = db.QueryRowContext(ctx,
+		"SELECT error_message FROM pgqueue_msg_t022_utf8_trunc WHERE id = $1",
+		msg.ID,
+	).Scan(&stored)
+	if err != nil {
+		t.Fatalf("failed to read stored error_message: %v", err)
+	}
+
+	// Must be valid UTF-8 (no split multi-byte sequences)
+	if strings.ToValidUTF8(stored, "�") != stored {
+		t.Errorf("stored error_message is not valid UTF-8: %q", stored)
+	}
+
+	// Must be <= 1024 bytes
+	if len(stored) > 1024 {
+		t.Errorf("stored error_message too long: %d bytes, want <= 1024", len(stored))
+	}
+}

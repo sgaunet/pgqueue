@@ -1,4 +1,5 @@
-// Package pgqueue provides dlq.go — dead-letter queue inspection APIs.
-// Full implementation of ListDLQMessages/DLQStats is reserved for Phase 8
-// (US6, T060). This file is a stub to satisfy T001.
 package pgqueue
+
+// dlq.go is a placeholder for the dead-letter-queue inspection API
+// (ListDLQMessages / DLQStats). The full implementation is reserved for
+// Phase 8 (US6, T060); this file was created by T001.

@@ -656,3 +656,55 @@ func TestConcurrentPublish(t *testing.T) {
 		t.Errorf("expected %d messages after concurrent publish, got %d", expectedCount, depth)
 	}
 }
+
+// TestT020_StaleReceiptAfterNackRetryIsErrClaimExpired verifies that using a
+// stale receipt (whose claim token has been superseded because the message was
+// nacked and re-queued) returns ErrClaimExpired, not ErrMessageAlreadyAcked.
+func TestT020_StaleReceiptAfterNackRetryIsErrClaimExpired(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "t020-stale-receipt"
+	if err := pq.CreateChannel(ctx, queueName, pgqueue.WithQueueMaxRetries(5)); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, queueName, []byte("msg")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	// First consume: get a receipt
+	msg1, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	if err != nil || msg1 == nil {
+		t.Fatalf("first consume failed: %v", err)
+	}
+	staleReceipt := msg1.Receipt()
+
+	// Nack: message goes back to pending with a new claim_id=NULL (status=pending)
+	if err := pq.NackChannel(ctx, queueName, staleReceipt, "retry"); err != nil {
+		t.Fatalf("nack failed: %v", err)
+	}
+
+	// Second consume: message is redelivered with a NEW claim
+	msg2, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	if err != nil || msg2 == nil {
+		t.Fatalf("second consume failed: %v", err)
+	}
+	// msg1 and msg2 are the same message but with different claim tokens
+	if msg1.ID != msg2.ID {
+		t.Fatalf("expected same message ID, got %v vs %v", msg1.ID, msg2.ID)
+	}
+
+	// Now try to ack using the STALE first receipt: must return ErrClaimExpired
+	err = pq.AckChannel(ctx, queueName, staleReceipt)
+	if !errors.Is(err, pgqueue.ErrClaimExpired) {
+		t.Errorf("expected ErrClaimExpired for stale receipt, got: %v", err)
+	}
+
+	// The valid receipt must still work
+	if err := pq.AckChannel(ctx, queueName, msg2.Receipt()); err != nil {
+		t.Errorf("valid ack should succeed: %v", err)
+	}
+}

@@ -71,9 +71,12 @@ func (gc *GarbageCollector) Start(ctx context.Context) {
 // Stop gracefully stops the garbage collector.
 // Safe to call multiple times or before Start().
 func (gc *GarbageCollector) Stop() {
+	// Release the mutex before waiting on the WaitGroup: holding it across
+	// wg.Wait() would block a concurrent Start() (which needs the lock to call
+	// wg.Add) and risk a deadlock.
 	gc.mu.Lock()
-	defer gc.mu.Unlock()
 	gc.stopOnce.Do(func() { close(gc.stopChan) })
+	gc.mu.Unlock()
 	gc.wg.Wait()
 }
 
@@ -424,10 +427,12 @@ func (gc *GarbageCollector) purgeDLQMessages(
 	return nil
 }
 
-// resetTimedOutMessages resets messages with expired visibility timeouts back
-// to pending. The redelivery counts as a retry attempt (retry_count is
-// incremented) so a message whose consumer keeps crashing still reaches the
-// DLQ; this keeps the GC consistent with the reclaim done by ConsumeFromChannel.
+// resetTimedOutMessages resets messages with expired visibility timeouts back to
+// pending. The GC intentionally does NOT increment retry_count: the consume-path
+// reclaim (fetchPendingChannelMessage / reclaimChannelAttempt) is the sole place
+// that increments retry_count. The GC only flips status→pending, clears claim_id
+// and visibility_timeout so the message becomes available again. FOR UPDATE SKIP
+// LOCKED prevents racing with a consumer that is mid-reclaim on the same row.
 func (gc *GarbageCollector) resetTimedOutMessages(
 	ctx context.Context,
 	tableName string,
@@ -436,12 +441,16 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_msg_%s
 		SET status = '%s',
-		    retry_count = retry_count + 1,
+		    claim_id = NULL,
 		    visibility_timeout = NULL
-		WHERE status = '%s'
-		AND visibility_timeout IS NOT NULL
-		AND visibility_timeout < NOW()
-	`, tableName, MessageStatusPending, MessageStatusProcessing)
+		WHERE id IN (
+			SELECT id FROM pgqueue_msg_%s
+			WHERE status = '%s'
+			  AND visibility_timeout IS NOT NULL
+			  AND visibility_timeout < NOW()
+			FOR UPDATE SKIP LOCKED
+		)
+	`, tableName, MessageStatusPending, tableName, MessageStatusProcessing)
 
 	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {
@@ -457,8 +466,9 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 }
 
 // resetTimedOutSubscriptions resets subscriptions with expired visibility
-// timeouts back to pending, incrementing retry_count so the redelivery counts
-// as a retry attempt — consistent with the reclaim done by ConsumeFromTopic.
+// timeouts back to pending. Like resetTimedOutMessages, the GC does NOT
+// increment retry_count — the consume-path reclaim is the sole incrementer.
+// FOR UPDATE SKIP LOCKED prevents racing with a concurrent consumer.
 func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	ctx context.Context,
 	tableName string,
@@ -467,12 +477,16 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = '%s',
-		    retry_count = retry_count + 1,
+		    claim_id = NULL,
 		    visibility_timeout = NULL
-		WHERE status = '%s'
-		AND visibility_timeout IS NOT NULL
-		AND visibility_timeout < NOW()
-	`, tableName, MessageStatusPending, MessageStatusProcessing)
+		WHERE id IN (
+			SELECT id FROM pgqueue_sub_%s
+			WHERE status = '%s'
+			  AND visibility_timeout IS NOT NULL
+			  AND visibility_timeout < NOW()
+			FOR UPDATE SKIP LOCKED
+		)
+	`, tableName, MessageStatusPending, tableName, MessageStatusProcessing)
 
 	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {

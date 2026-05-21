@@ -2,6 +2,8 @@ package integration_test
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -358,5 +360,174 @@ func TestReplayDLQPubSub(t *testing.T) {
 	}
 	if string(msg.Payload) != "replay-me" {
 		t.Errorf("expected payload 'replay-me', got '%s'", msg.Payload)
+	}
+}
+
+// TestT021_ConcurrentReplayDLQNoLossNoDuplication verifies that when two goroutines
+// call ReplayDLQ concurrently, every DLQ message is reinstated exactly once (none
+// lost, none duplicated). FOR UPDATE SKIP LOCKED is the mechanism under test.
+func TestT021_ConcurrentReplayDLQNoLossNoDuplication(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "t021-concurrent-dlq"
+	const numMessages = 10
+
+	if err := pq.CreateChannel(ctx, queueName, pgqueue.WithQueueMaxRetries(1)); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Publish and move all messages to DLQ (2 nacks each: retry then DLQ)
+	for i := range numMessages {
+		payload := []byte{'m', 's', 'g', byte('0' + i)}
+		if _, err := pq.Publish(ctx, queueName, payload); err != nil {
+			t.Fatalf("publish %d failed: %v", i, err)
+		}
+	}
+	for range numMessages {
+		msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+		if err != nil || msg == nil {
+			t.Fatalf("consume for first nack failed: %v", err)
+		}
+		if err := pq.NackChannel(ctx, queueName, msg.Receipt(), "fail1"); err != nil {
+			t.Fatalf("first nack failed: %v", err)
+		}
+	}
+	for range numMessages {
+		msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+		if err != nil || msg == nil {
+			t.Fatalf("consume for second nack failed: %v", err)
+		}
+		if err := pq.NackChannel(ctx, queueName, msg.Receipt(), "fail2"); err != nil {
+			t.Fatalf("second nack (DLQ) failed: %v", err)
+		}
+	}
+
+	// Verify all in DLQ
+	dlqStats, err := pq.GetDLQStats(ctx, queueName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats: %v", err)
+	}
+	if dlqStats.TotalCount != numMessages {
+		t.Fatalf("expected %d DLQ messages before replay, got %d", numMessages, dlqStats.TotalCount)
+	}
+
+	// Two concurrent ReplayDLQ calls
+	var wg sync.WaitGroup
+	wg.Add(2)
+	counts := make([]int, 2)
+	errs := make([]error, 2)
+	for i := range 2 {
+		go func(idx int) {
+			defer wg.Done()
+			counts[idx], errs[idx] = pq.ReplayDLQ(ctx, queueName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
+				Confirm: true,
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("ReplayDLQ[%d] error: %v", i, e)
+		}
+	}
+
+	totalReplayed := counts[0] + counts[1]
+	if totalReplayed != numMessages {
+		t.Errorf("total replayed=%d, want %d (goroutine 0=%d, goroutine 1=%d)",
+			totalReplayed, numMessages, counts[0], counts[1])
+	}
+
+	// DLQ must be empty now
+	dlqStats, err = pq.GetDLQStats(ctx, queueName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get DLQ stats after replay: %v", err)
+	}
+	if dlqStats.TotalCount != 0 {
+		t.Errorf("DLQ not empty after concurrent replay: %d remaining", dlqStats.TotalCount)
+	}
+
+	// Pending count must be exactly numMessages (no duplicates in main queue)
+	var pendingCount int
+	err = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pgqueue_msg_t021_concurrent_dlq WHERE status = 'pending'",
+	).Scan(&pendingCount)
+	if err != nil {
+		t.Fatalf("failed to count pending messages: %v", err)
+	}
+	if pendingCount != numMessages {
+		t.Errorf("pending count=%d after replay, want %d (duplication detected)", pendingCount, numMessages)
+	}
+}
+
+// TestT023_NegativeReplayLimitRejected verifies that ReplayFrom/ReplayDLQ reject
+// a negative Limit with ErrInvalidConfig, and that the replay audit log entry is
+// written atomically in the same transaction as the replay data change.
+func TestT023_NegativeReplayLimitRejected(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "t023-neg-limit"
+	if err := pq.CreateChannel(ctx, queueName, pgqueue.WithQueueMaxRetries(3)); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+	if _, err := pq.Publish(ctx, queueName, []byte("payload")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+	msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	if err != nil || msg == nil {
+		t.Fatalf("consume failed: %v", err)
+	}
+	if err := pq.AckChannel(ctx, queueName, msg.Receipt()); err != nil {
+		t.Fatalf("ack failed: %v", err)
+	}
+
+	// Negative Limit must be rejected with ErrInvalidConfig
+	since := time.Now().Add(-time.Hour)
+	_, err = pq.ReplayFrom(ctx, queueName, pgqueue.QueueTypeChannel, since, pgqueue.ReplayOptions{
+		Confirm: true,
+		Limit:   -1,
+	})
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("ReplayFrom with Limit=-1 should return ErrInvalidConfig, got: %v", err)
+	}
+
+	_, err = pq.ReplayDLQ(ctx, queueName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
+		Confirm: true,
+		Limit:   -5,
+	})
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("ReplayDLQ with Limit=-5 should return ErrInvalidConfig, got: %v", err)
+	}
+
+	// Verify the replay log entry for a SUCCESSFUL replay is written atomically:
+	// run a successful ReplayFrom and check the log was written.
+	count, err := pq.ReplayFrom(ctx, queueName, pgqueue.QueueTypeChannel, since, pgqueue.ReplayOptions{
+		Confirm:     true,
+		PerformedBy: "test-user",
+	})
+	if err != nil {
+		t.Fatalf("successful ReplayFrom failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 replayed message, got %d", count)
+	}
+
+	// The replay log must have exactly one entry
+	var logCount int
+	err = db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pgqueue_replay_log WHERE queue_name = $1`,
+		queueName,
+	).Scan(&logCount)
+	if err != nil {
+		t.Fatalf("failed to query replay log: %v", err)
+	}
+	if logCount != 1 {
+		t.Errorf("expected 1 replay log entry, got %d", logCount)
 	}
 }

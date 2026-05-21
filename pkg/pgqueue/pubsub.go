@@ -331,9 +331,12 @@ func (pq *Queue) retrySubscription(
 	subscriberID, errorMsg string,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
+	// claim_id is cleared so a stale receipt held by the previous consumer
+	// resolves to ErrClaimExpired rather than ErrMessageAlreadyAcked.
 	query := fmt.Sprintf(`
 		UPDATE pgqueue_sub_%s
 		SET status = '%s',
+		    claim_id = NULL,
 		    retry_count = retry_count + 1,
 		    visibility_timeout = NULL,
 		    error_message = $3
