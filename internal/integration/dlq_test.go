@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // publishOne publishes a single payload to a channel, failing the test on error.

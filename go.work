@@ -4,7 +4,7 @@ use (
 	.
 	./examples
 	./internal/integration
-	./pkg/pgqueue/pglisten
-	./pkg/pgqueue/otelpgqueue
-	./pkg/pgqueue/prompgqueue
+	./otelpgqueue
+	./pglisten
+	./prompgqueue
 )

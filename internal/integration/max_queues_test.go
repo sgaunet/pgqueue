@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // TestCreateQueue_MaxQueuesLimit verifies that Config.MaxQueues caps the total

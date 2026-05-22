@@ -8,7 +8,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // ExampleNew shows the standard initialization sequence: open a database

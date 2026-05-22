@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // testSchemaName is the non-default PostgreSQL schema exercised by these tests.

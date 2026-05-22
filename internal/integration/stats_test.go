@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 func TestGetStats(t *testing.T) {

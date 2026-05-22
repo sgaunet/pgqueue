@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // recordingTracer is a test pgqueue.Tracer that records every span name.
@@ -200,7 +200,7 @@ func TestObservabilityNoopWhenUnregistered(t *testing.T) {
 // TestCoreHasNoObservabilityDependencies verifies FR-019: the core pgqueue
 // package's dependency graph contains no OpenTelemetry or Prometheus packages.
 func TestCoreHasNoObservabilityDependencies(t *testing.T) {
-	cmd := exec.Command("go", "list", "-deps", "./pkg/pgqueue")
+	cmd := exec.Command("go", "list", "-deps", ".")
 	cmd.Dir = "../.." // repo root, where the core module lives
 	out, err := cmd.CombinedOutput()
 	if err != nil {

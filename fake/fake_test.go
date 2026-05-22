@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
-	"github.com/sgaunet/pgqueue/pkg/pgqueue/fake"
+	"github.com/sgaunet/pgqueue"
+	"github.com/sgaunet/pgqueue/fake"
 )
 
 // TestFakeSatisfiesPublishedInterfaces is a compile-time and runtime check that

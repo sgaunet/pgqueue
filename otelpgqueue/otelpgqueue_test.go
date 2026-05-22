@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
-	"github.com/sgaunet/pgqueue/pkg/pgqueue/otelpgqueue"
+	"github.com/sgaunet/pgqueue"
+	"github.com/sgaunet/pgqueue/otelpgqueue"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/embedded"
 )

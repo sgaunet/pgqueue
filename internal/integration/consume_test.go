@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // TestConsumeChannelHandlerAutoAck verifies the handler-based ConsumeChannel

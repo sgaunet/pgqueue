@@ -26,7 +26,7 @@ import (
     "log"
 
     _ "github.com/jackc/pgx/v5/stdlib" // or _ "github.com/lib/pq"
-    "github.com/sgaunet/pgqueue/pkg/pgqueue"
+    "github.com/sgaunet/pgqueue"
 )
 
 func main() {
@@ -98,7 +98,7 @@ import (
     "log"
 
     _ "github.com/jackc/pgx/v5/stdlib"
-    "github.com/sgaunet/pgqueue/pkg/pgqueue"
+    "github.com/sgaunet/pgqueue"
 )
 
 func main() {

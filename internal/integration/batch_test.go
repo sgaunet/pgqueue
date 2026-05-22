@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid" //nolint:depguard // needed for uuid.UUID type
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 func TestPublishBatchChannel(t *testing.T) {

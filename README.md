@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/sgaunet/pgqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/sgaunet/pgqueue/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sgaunet/pgqueue)](https://goreportcard.com/report/github.com/sgaunet/pgqueue)
-[![GoDoc](https://godoc.org/github.com/sgaunet/pgqueue?status.svg)](https://godoc.org/github.com/sgaunet/pgqueue/pkg/pgqueue)
+[![GoDoc](https://godoc.org/github.com/sgaunet/pgqueue?status.svg)](https://godoc.org/github.com/sgaunet/pgqueue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A PostgreSQL-based message queue library for Go with at-least-once delivery.
@@ -54,7 +54,7 @@ import (
     "log"
 
     _ "github.com/jackc/pgx/v5/stdlib" // or _ "github.com/lib/pq"
-    "github.com/sgaunet/pgqueue/pkg/pgqueue"
+    "github.com/sgaunet/pgqueue"
 )
 
 func main() {
@@ -113,25 +113,25 @@ iterator (manual ack/nack) and single-shot `ReceiveChannel` (returns
 
 ```go
 // Push delivery: wake idle consumers in milliseconds via LISTEN/NOTIFY.
-import "github.com/sgaunet/pgqueue/pkg/pgqueue/pglisten"
+import "github.com/sgaunet/pgqueue/pglisten"
 l, _ := pglisten.New(ctx, connString)
 q, _ := pgqueue.New(ctx, db, pgqueue.WithListener(l))
 
 // Observability: opt-in, zero core dependencies.
-import "github.com/sgaunet/pgqueue/pkg/pgqueue/otelpgqueue"
+import "github.com/sgaunet/pgqueue/otelpgqueue"
 q, _ = pgqueue.New(ctx, db,
     pgqueue.WithTracer(otelpgqueue.NewTracer(tracerProvider)),
     pgqueue.WithMetrics(otelpgqueue.NewMetrics(meterProvider)))
 
 // Prometheus adapter: NewMetrics returns an error so a registration
 // failure is surfaced rather than silently dropped.
-import "github.com/sgaunet/pgqueue/pkg/pgqueue/prompgqueue"
+import "github.com/sgaunet/pgqueue/prompgqueue"
 m, err := prompgqueue.NewMetrics(prometheus.DefaultRegisterer)
 if err != nil { /* handle */ }
 q, _ = pgqueue.New(ctx, db, pgqueue.WithMetrics(m))
 
 // Unit-test your code with no database via the in-memory fake.
-import "github.com/sgaunet/pgqueue/pkg/pgqueue/fake"
+import "github.com/sgaunet/pgqueue/fake"
 q := fake.New()
 ```
 

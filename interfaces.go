@@ -16,7 +16,7 @@ type Publisher interface {
 
 // ChannelConsumer is the interface for consuming messages from a point-to-point
 // channel, covering all three consume styles plus acknowledgement. *Queue
-// satisfies this interface; pkg/pgqueue/fake provides an in-memory double.
+// satisfies this interface; the fake provides an in-memory double.
 type ChannelConsumer interface {
 	ConsumeChannel(ctx context.Context, name string, h Handler, opts ...ConsumeOption) error
 	ReceiveChannel(ctx context.Context, name string, opts ...ConsumeOption) (*Message, error)
@@ -25,7 +25,7 @@ type ChannelConsumer interface {
 }
 
 // TopicConsumer is the interface for consuming messages from a pub/sub topic.
-// *Queue satisfies this interface; pkg/pgqueue/fake provides an in-memory double.
+// *Queue satisfies this interface; the fake provides an in-memory double.
 type TopicConsumer interface {
 	ConsumeTopic(ctx context.Context, name, subscriberID string, h Handler, opts ...ConsumeOption) error
 	ReceiveTopic(ctx context.Context, name, subscriberID string, opts ...ConsumeOption) (*Message, error)
@@ -34,7 +34,7 @@ type TopicConsumer interface {
 }
 
 // Compile-time assertions: *Queue must satisfy every published interface
-// (FR-020). The fake in pkg/pgqueue/fake carries the same assertions.
+// (FR-020). The fake package carries the same assertions.
 var (
 	_ Publisher       = (*Queue)(nil)
 	_ ChannelConsumer = (*Queue)(nil)

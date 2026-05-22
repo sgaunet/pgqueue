@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // crashedConsumerTimeout is the visibility timeout used by crashedConsumerClaim;

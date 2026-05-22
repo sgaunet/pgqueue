@@ -1,4 +1,4 @@
-module github.com/sgaunet/pgqueue/pkg/pgqueue/otelpgqueue
+module github.com/sgaunet/pgqueue/otelpgqueue
 
 go 1.25.0
 
@@ -14,4 +14,4 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 )
 
-replace github.com/sgaunet/pgqueue => ../../../
+replace github.com/sgaunet/pgqueue => ../

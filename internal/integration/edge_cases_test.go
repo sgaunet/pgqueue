@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // TestPublish_PoolExhaustion verifies that under extreme connection pool pressure

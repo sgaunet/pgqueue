@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/sgaunet/pgqueue/pkg/pgqueue/fake"
+	"github.com/sgaunet/pgqueue/fake"
 )
 
 // TestClaimReturnsCopyForRedelivery is part of the R-16 regression set: a

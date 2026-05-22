@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sgaunet/pgqueue/pkg/pgqueue/prompgqueue"
+	"github.com/sgaunet/pgqueue/prompgqueue"
 )
 
 // TestNewMetricsRegistrationError is the R-17 regression test: a descriptor

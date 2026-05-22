@@ -130,7 +130,7 @@ func (m *Message) Receipt() Receipt {
 // SetReceipt binds a queue-aware Receipt onto a Message so that m.Receipt()
 // returns the full binding. ReceiveChannel and ReceiveTopic call this
 // internally; it is exported chiefly so in-memory test doubles (the
-// pkg/pgqueue/fake package) can build messages that behave identically to ones
+// fake package) can build messages that behave identically to ones
 // returned by a real Queue.
 func SetReceipt(m *Message, r Receipt) {
 	m.receipt = r

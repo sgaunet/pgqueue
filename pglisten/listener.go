@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
+	"github.com/sgaunet/pgqueue"
 )
 
 // Default reconnect-backoff parameters (R-07).

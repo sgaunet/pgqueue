@@ -9,8 +9,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/sgaunet/pgqueue/pkg/pgqueue"
-	"github.com/sgaunet/pgqueue/pkg/pgqueue/pglisten"
+	"github.com/sgaunet/pgqueue"
+	"github.com/sgaunet/pgqueue/pglisten"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
