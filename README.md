@@ -23,7 +23,7 @@ Driver-agnostic — works with `pgx` **or** `lib/pq`, and forces neither on you.
 - **Message Replay**: replay from a timestamp or the DLQ — transactional, deterministic, and memory-bounded for large backlogs.
 - **Opt-in Observability**: zero-dependency `Tracer` / `MetricsRecorder` hooks; ready-made OpenTelemetry and Prometheus adapters ship as optional sub-modules.
 - **Testable Without a Database**: the `fake` sub-package is an in-memory implementation of the published interfaces for unit tests with no Docker.
-- **Garbage Collection**: automatic cleanup with configurable retention policies.
+- **Garbage Collection**: opt-in background `GarbageCollector` reclaims old rows under configurable retention policies (see [Garbage collection](#garbage-collection)).
 - **Statistics & Monitoring**: track message counts, processing times, and queue depth.
 
 ## Requirements
@@ -138,6 +138,36 @@ q := fake.New()
 > **Metric cardinality:** both observability adapters set a `queue` label/attribute
 > to the queue or topic name. Keep the set of queue names bounded — a per-tenant or
 > otherwise unbounded name set causes unbounded metric cardinality.
+
+## Garbage collection
+
+Garbage collection is **opt-in**. Delivery correctness does not depend on it —
+a crashed consumer's message is still redelivered after the visibility timeout,
+and a retry-exhausted message is still promoted to the DLQ, both on the consume
+path. But *storage reclamation* (purging completed messages, expired DLQ
+entries, acked subscription rows, orphaned topic messages) only happens if you
+run a `GarbageCollector`:
+
+```go
+gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
+    Interval: 5 * time.Minute,
+    DefaultPolicy: pgqueue.RetentionPolicy{
+        CompletedMessageTTL: 24 * time.Hour,      // delete completed messages after 24h
+        MaxPendingAge:       7 * 24 * time.Hour,  // drop deliveries pending longer than 7d
+        DLQRetention:        30 * 24 * time.Hour, // delete DLQ entries after 30d
+    },
+    // Per-queue overrides: Policies map[string]RetentionPolicy{"orders": {...}}
+})
+gc.Start(ctx) // runs in the background until ctx is cancelled or q.Close()
+```
+
+> **`RetentionPolicy` zero value means "keep forever".** Each field defaults to
+> `0`, which *disables* that cleanup — so a `GarbageCollector` with an empty
+> policy reclaims nothing and the tables grow without bound. Set positive
+> durations to enable purging.
+
+`q.Close()` stops every `GarbageCollector` created for the queue (it
+back-registers on construction), so you do not have to track them for shutdown.
 
 ## Architecture
 

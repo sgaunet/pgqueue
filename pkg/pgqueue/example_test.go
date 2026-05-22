@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/sgaunet/pgqueue/pkg/pgqueue"
 )
@@ -149,6 +150,27 @@ func ExampleQueue_ReplayDLQ() {
 		log.Fatal(err)
 	}
 	fmt.Printf("replayed %d messages, skipped %d\n", res.Replayed, res.Skipped)
+}
+
+// ExampleNewGarbageCollector shows how to enable storage retention. The
+// GarbageCollector is opt-in: message redelivery and DLQ promotion work without
+// it, but old completed messages, expired DLQ entries, and acked subscription
+// rows are only reclaimed once one is running. RetentionPolicy fields default
+// to 0 ("keep forever"), so positive durations must be set to enable purging.
+func ExampleNewGarbageCollector() {
+	var (
+		ctx context.Context
+		q   *pgqueue.Queue
+	)
+	gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
+		Interval: 5 * time.Minute,
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			CompletedMessageTTL: 24 * time.Hour,
+			MaxPendingAge:       7 * 24 * time.Hour,
+			DLQRetention:        30 * 24 * time.Hour,
+		},
+	})
+	gc.Start(ctx) // background loop; q.Close() stops it
 }
 
 // process is a placeholder for the caller's message-handling logic.

@@ -13,20 +13,32 @@ Key Features:
   - UUIDv7 time-ordered message IDs
   - Dead letter queue (DLQ) for failed messages
   - Message replay capabilities
-  - Garbage collection for automatic cleanup
+  - Opt-in garbage collection for storage retention (see NewGarbageCollector)
   - Built on PostgreSQL 18+ native features
 
 Basic Usage:
 
-	_ = pgqueue.InitSchema(ctx, db) // once per database
-	pq, err := pgqueue.Init(ctx, pgqueue.Config{DB: db})
+	_ = pgqueue.InitSchema(ctx, db) // once per database; also migrates
+	pq, err := pgqueue.New(ctx, db)
 	// handle err
-	_ = pq.CreateChannel(ctx, "orders", pgqueue.ChannelOptions{})
-	msgID, err := pq.Publish(ctx, "orders", []byte("order-123"))
+	defer pq.Close()
+	_ = pq.CreateChannel(ctx, "orders")
+	msgID, err := pq.PublishChannel(ctx, "orders", []byte("order-123"))
 	// handle err
-	msg, err := pq.ConsumeFromChannel(ctx, "orders", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "orders") // ErrQueueEmpty if none
 	// handle err
-	_ = pq.AckChannel(ctx, "orders", msg.Receipt())
+	_ = pq.Ack(ctx, msg.Receipt())
+
+Per-queue creation options (TTL, max retries, message size) are functional
+options passed to CreateChannel/CreateTopic — WithQueueTTL, WithQueueMaxRetries,
+WithQueueMaxMessageSize.
+
+Storage retention is opt-in. Message redelivery on a crashed consumer and DLQ
+promotion of retry-exhausted messages happen without any extra setup, but old
+rows (completed messages, DLQ entries, acked subscriptions) are only reclaimed
+by a GarbageCollector: construct one with NewGarbageCollector, give it a
+RetentionPolicy with positive durations (the zero value keeps rows forever),
+and call Start. See NewGarbageCollector and RetentionPolicy.
 
 For complete examples, see the examples/ directory.
 */
