@@ -48,10 +48,24 @@ func (pq *Queue) parseMetadataJSON(s sql.NullString) map[string]any {
 }
 
 // classifyClaimMiss explains why an Ack/Nack matched no row. statusQuery must
-// SELECT (status TEXT, claim_id UUID) for the targeted row. It returns
-// ErrClaimExpired when the row is still processing under a different claim
-// token, ErrMessageNotFound when the row no longer exists, and
-// ErrMessageAlreadyAcked otherwise (already completed/acked).
+// SELECT (status TEXT, claim_id UUID) for the targeted row. It returns:
+//
+//   - ErrMessageNotFound — the row no longer exists.
+//   - ErrClaimExpired — the caller held a real claim token (a non-zero
+//     ClaimID, as every delivery mints) but it no longer matches the row.
+//     This covers every way the claim is fenced: redelivered to another
+//     consumer (processing under a new token), or reset to pending by a
+//     retry/nack or the garbage collector (claim_id cleared to NULL). The
+//     caller's processing result is stale.
+//   - ErrMessageAlreadyAcked — the catch-all "not in processing state under
+//     your claim": the receipt's own claim still owns the row but it has left
+//     'processing' (completed/acked), or the caller never held a claim at all
+//     (a zero ClaimID — e.g. acking a message that was never consumed).
+//
+// Earlier revisions returned ErrClaimExpired only for the "processing under a
+// new token" case, so a timed-out message reset to pending by the GC was
+// misreported as ErrMessageAlreadyAcked; keying off the claim token fixes that
+// without reclassifying a never-consumed (zero-claim) ack.
 func classifyClaimMiss(
 	ctx context.Context,
 	q queryRower,
@@ -68,12 +82,20 @@ func classifyClaimMiss(
 	if err != nil {
 		return fmt.Errorf("failed to classify claim miss: %w", err)
 	}
-	if MessageStatus(status) == MessageStatusProcessing &&
-		claimID.Valid && claimID.UUID != expectedClaim {
-		return ErrClaimExpired
+	// No real claim was presented (zero ClaimID): the caller never legitimately
+	// consumed this message, since every delivery mints a non-zero claim. This
+	// is not an expired claim — report the generic sentinel.
+	if expectedClaim == (uuid.UUID{}) {
+		return ErrMessageAlreadyAcked
 	}
-
-	return ErrMessageAlreadyAcked
+	// The caller's own claim still owns the row, but it has left 'processing'.
+	if claimID.Valid && claimID.UUID == expectedClaim &&
+		MessageStatus(status) != MessageStatusProcessing {
+		return ErrMessageAlreadyAcked
+	}
+	// A real claim that no longer matches the row: fenced by a redelivery, a
+	// retry/nack, or a garbage-collector reset.
+	return ErrClaimExpired
 }
 
 // classifyChannelAckMiss classifies a failed channel Ack/Nack for the receipt.
@@ -238,8 +260,12 @@ func isUniqueViolation(err error) bool {
 	if errors.As(err, &s) {
 		return s.SQLState() == pgUniqueViolation
 	}
+	// Error-text fallback for drivers without a SQLState() accessor (lib/pq).
+	// Match the human-readable phrases PostgreSQL uses rather than the bare
+	// "23505" SQLSTATE: a five-digit code can appear incidentally in unrelated
+	// error text (a message id, a table name), which would misclassify it.
 	errStr := err.Error()
-	return strings.Contains(errStr, pgUniqueViolation) ||
+	return strings.Contains(errStr, "duplicate key value") ||
 		strings.Contains(errStr, "unique constraint")
 }
 
@@ -265,9 +291,14 @@ func isTransientError(err error) bool {
 			return true
 		}
 	}
+	// Error-text fallback for drivers without a SQLState() accessor (lib/pq).
+	// Match PostgreSQL's human-readable phrases rather than the bare "40001" /
+	// "40P01" SQLSTATE codes: a short code can appear incidentally in unrelated
+	// error text, which would misclassify a permanent failure as transient and
+	// drive a pointless retry loop.
 	es := err.Error()
-	return strings.Contains(es, pgSerializationFailure) ||
-		strings.Contains(es, pgDeadlockDetected) ||
+	return strings.Contains(es, "could not serialize access") ||
+		strings.Contains(es, "deadlock detected") ||
 		strings.Contains(es, "connection refused") ||
 		strings.Contains(es, "connection reset") ||
 		strings.Contains(es, "bad connection") ||

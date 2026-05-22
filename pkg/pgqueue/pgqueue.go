@@ -459,6 +459,13 @@ func (pq *Queue) ListChannels(ctx context.Context) ([]string, error) {
 //
 // Close does NOT close the *sql.DB, which is owned by the caller. It is
 // idempotent: calling it multiple times is safe and returns nil.
+//
+// Close must not be called from inside a message handler run by
+// ConsumeChannel/ConsumeTopic: it joins the handler-based consume loops, so a
+// handler that calls Close would block waiting for its own worker to finish
+// and deadlock. Trigger shutdown by cancelling the context passed to
+// ConsumeChannel/ConsumeTopic instead, and call Close from the goroutine that
+// owns the Queue.
 func (pq *Queue) Close() error {
 	// Mark closed and snapshot the GC list under gcMu. Setting closed here,
 	// under the same lock trackWorker uses, guarantees no new consume worker
@@ -830,6 +837,12 @@ func (pq *Queue) deleteQueue(
 		pq.mdcache.invalidate(string(queueType), name)
 	}
 
+	// Drop the push-delivery waker for the deleted queue so the notifier's
+	// waker map does not accumulate entries for queues that no longer exist.
+	if pq.notifier != nil {
+		pq.notifier.forget(notifyChannelName(metadata.TableName))
+	}
+
 	return nil
 }
 
@@ -1149,6 +1162,18 @@ func (pq *Queue) createDLQTable(
 
 	if _, err := tx.ExecContext(ctx, dlqIndex); err != nil {
 		return fmt.Errorf("failed to create DLQ index: %w", err)
+	}
+
+	// Index original_message_id: the garbage collector's pub/sub purge queries
+	// (purgeCompletedMessages, purgeOldPendingMessages) and reclaimOrphanTopicMessages
+	// all probe the DLQ with NOT EXISTS (... WHERE original_message_id = m.id);
+	// without this index each pass scans the whole DLQ table.
+	dlqOrigIndex := fmt.Sprintf(`
+		CREATE INDEX IF NOT EXISTS idx_pgqueue_dlq_%s_orig_msg
+		ON %s(original_message_id)`, tableName, pq.dlqTable(tableName))
+
+	if _, err := tx.ExecContext(ctx, dlqOrigIndex); err != nil {
+		return fmt.Errorf("failed to create DLQ original-message index: %w", err)
 	}
 
 	return nil

@@ -269,10 +269,16 @@ func (pq *Queue) countReplayableMessages(
 const defaultReplayPageSize = 100
 
 // replayFromPageResult is the outcome of replaying one keyset page.
+//
+// The page is keyed on the unit that is actually reinstated: message ids for
+// channels, subscription-row ids for topics. Paging on subscription ids is
+// what lets opts.Limit cap topic replays exactly — a topic message fans out to
+// one subscription row per subscriber, so paging on message ids would let one
+// page reinstate up to (subscribers × pageSize) rows and overshoot the limit.
 type replayFromPageResult struct {
 	replayed int       // rows reinstated this page
-	lastID   uuid.UUID // highest message id examined — the next page's cursor
-	fetched  int       // message ids examined this page; zero means exhausted
+	lastID   uuid.UUID // highest candidate id examined — the next page's cursor
+	fetched  int       // candidate ids examined this page; zero means exhausted
 }
 
 // executeReplayFrom replays messages published since a timestamp in
@@ -318,8 +324,9 @@ func (pq *Queue) executeReplayFrom(
 }
 
 // replayFromPage replays one keyset page in a single transaction. It selects a
-// page of message ids published since the cursor, reinstates the corresponding
-// rows, and writes a per-page audit row inside the same transaction.
+// page of candidate ids (message ids for channels, subscription ids for
+// topics) published since the cursor, reinstates the corresponding rows, and
+// writes a per-page audit row inside the same transaction.
 func (pq *Queue) replayFromPage(
 	ctx context.Context,
 	queueName, tableName string,
@@ -335,7 +342,7 @@ func (pq *Queue) replayFromPage(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	ids, err := pq.fetchReplayMessageIDs(ctx, tx, tableName, queueType, since, afterID, pageLimit)
+	ids, err := pq.fetchReplayCandidateIDs(ctx, tx, tableName, queueType, since, afterID, pageLimit)
 	if err != nil {
 		return replayFromPageResult{}, err
 	}
@@ -368,11 +375,17 @@ func (pq *Queue) replayFromPage(
 	}, nil
 }
 
-// fetchReplayMessageIDs returns one keyset page of message ids published since
-// the given timestamp, ordered by id and strictly after afterID. The time
-// predicate is always on the message table's created_at — the authoritative
-// publish time — for both channels and topics (R-03).
-func (pq *Queue) fetchReplayMessageIDs(
+// fetchReplayCandidateIDs returns one keyset page of replay-candidate ids
+// published since the given timestamp, ordered by id and strictly after
+// afterID. The time predicate is always on the message table's created_at —
+// the authoritative publish time — for both channels and topics (R-03).
+//
+// The id paged on is the unit applyReplayFrom reinstates: the message id for
+// channels, the subscription-row id for topics. Paging topics on subscription
+// ids (rather than message ids) keeps one row of work per fetched id, so
+// opts.Limit caps the replay exactly instead of overshooting by a factor of
+// the subscriber count.
+func (pq *Queue) fetchReplayCandidateIDs(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
@@ -399,16 +412,20 @@ func (pq *Queue) fetchReplayMessageIDs(
 			LIMIT $2
 		`, pq.msgTable(tableName), MessageStatusPending, MessageStatusProcessing)
 	} else {
-		// Topics keep no status on the message table; page over every message
-		// published since the cutoff and let applyReplayFrom filter the
-		// subscription rows.
+		// Topics keep status on the per-subscriber subscription rows. Page over
+		// the subscription rows themselves (joined to the message for the
+		// publish-time cutoff) so each fetched id is exactly one row of work.
 		query = fmt.Sprintf(`
-			SELECT id FROM %s
-			WHERE created_at >= $1
-			  AND ($3::uuid IS NULL OR id > $3)
-			ORDER BY id
+			SELECT s.id
+			FROM %s s
+			JOIN %s m ON s.message_id = m.id
+			WHERE m.created_at >= $1
+			  AND s.status != '%s' AND s.status != '%s'
+			  AND ($3::uuid IS NULL OR s.id > $3)
+			ORDER BY s.id
 			LIMIT $2
-		`, pq.msgTable(tableName))
+		`, pq.subTable(tableName), pq.msgTable(tableName),
+			MessageStatusPending, MessageStatusProcessing)
 	}
 
 	rows, err := tx.QueryContext(ctx, query, since, pageLimit, after)
@@ -432,9 +449,10 @@ func (pq *Queue) fetchReplayMessageIDs(
 	return ids, nil
 }
 
-// applyReplayFrom reinstates the given message ids to pending and returns the
-// number of rows actually changed. For channels the message rows are reset;
-// for topics the per-subscriber subscription rows are reset (R-03).
+// applyReplayFrom reinstates the given candidate ids to pending and returns the
+// number of rows actually changed. For channels the ids are message ids and
+// the message rows are reset; for topics the ids are subscription-row ids and
+// those subscription rows are reset (R-03).
 func (pq *Queue) applyReplayFrom(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -462,7 +480,7 @@ func (pq *Queue) applyReplayFrom(
 			    visibility_timeout = NULL,
 			    acked_at = NULL,
 			    error_message = NULL
-			WHERE message_id = ANY($1::uuid[])
+			WHERE id = ANY($1::uuid[])
 			  AND status != '%s' AND status != '%s'
 		`, pq.subTable(tableName), MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 	}

@@ -12,7 +12,7 @@ import (
 // IMPORTANT: when adding a new entry to the migrations slice below, bump this
 // constant to match that entry's version number. An init() check enforces that
 // SchemaVersion equals the last migration's version.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // migrationAdvisoryLockKey is a fixed PostgreSQL advisory-lock key (the ASCII
 // bytes of "pgqueue") used to serialize schema migrations across processes.
@@ -33,13 +33,23 @@ CREATE TABLE IF NOT EXISTS pgqueue_schema_version (
 
 // migration is a single, ordered, forward-only schema change.
 //
-// apply receives the transaction in which the migration runs. Because it has a
-// full *sql.Tx, a migration is not limited to the static global tables: it can
-// also patch the dynamically-named per-queue tables (pgqueue_msg_*, pgqueue_dlq_*,
-// pgqueue_sub_*) by discovering them from pgqueue_metadata at apply time. Newly
-// created queues already get the current table shape from createChannelTables /
-// createPubSubTables, so a future migration only needs to patch pre-existing
-// tables.
+// apply receives the transaction in which the migration runs.
+//
+// IMPORTANT — per-queue tables are NOT covered by baseSchemaSQL. baseSchemaSQL
+// (and therefore the v1 migration) creates only the four global tables. The
+// per-queue tables (pgqueue_msg_*, pgqueue_dlq_*, pgqueue_sub_*) are created
+// on demand by createChannelTables / createPubSubTables, which always emit the
+// current column shape. Consequently, any migration that adds or alters a
+// column on a per-queue table MUST patch the already-existing per-queue tables
+// itself — newly created queues are fine, but pre-existing ones are not
+// touched by anything else. Because apply has a full *sql.Tx it can do this by
+// discovering the live tables from pgqueue_metadata, e.g.:
+//
+//	rows, _ := tx.QueryContext(ctx, `SELECT queue_type, table_name FROM pgqueue_metadata`)
+//	// ... for each row, ALTER TABLE pgqueue_msg_<table_name> ADD COLUMN ...
+//
+// Forgetting this step is the most likely way to ship a migration that works
+// on fresh databases but breaks every upgraded one.
 type migration struct {
 	version int
 	name    string
@@ -66,6 +76,71 @@ var migrations = []migration{
 			return nil
 		},
 	},
+	{
+		version: 2, //nolint:mnd // schema migration version number
+		name:    "index dlq original_message_id",
+		apply:   migrateIndexDLQOriginalMessageID,
+	},
+}
+
+// migrateIndexDLQOriginalMessageID is the v2 migration. It backfills the index
+// on pgqueue_dlq_*.original_message_id for every queue that already exists:
+// createDLQTable emits this index for new queues, but pre-existing per-queue
+// tables are not touched by anything else (see the migration doc comment), so
+// the migration discovers the live tables from pgqueue_metadata and patches
+// each one. CREATE INDEX IF NOT EXISTS keeps it idempotent and harmless for
+// tables created by a newer createDLQTable.
+func migrateIndexDLQOriginalMessageID(ctx context.Context, tx *sql.Tx) error {
+	// Drain the table-name list fully (and close its cursor) before issuing any
+	// DDL: another statement cannot run on the same transaction while a result
+	// set is still open.
+	tableNames, err := listQueueTableNames(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	for _, tableName := range tableNames {
+		// table_name is the sanitized per-queue identifier ([a-z0-9_]+, <= 28
+		// chars) written by sanitizeTableName, so interpolating it is safe.
+		stmt := fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_dlq_%s_orig_msg `+
+				`ON pgqueue_dlq_%s(original_message_id)`,
+			tableName, tableName,
+		)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf(
+				"failed to index DLQ for queue table %q: %w", tableName, err,
+			)
+		}
+	}
+
+	return nil
+}
+
+// listQueueTableNames reads every per-queue table_name recorded in
+// pgqueue_metadata. A migration that must patch the dynamic per-queue tables
+// uses it to discover the live set; the result set is closed before the caller
+// runs any further statement on the transaction.
+func listQueueTableNames(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT table_name FROM pgqueue_metadata`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list queue tables: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var tableNames []string
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return nil, fmt.Errorf("failed to scan queue table name: %w", err)
+		}
+		tableNames = append(tableNames, tableName)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate queue tables: %w", err)
+	}
+
+	return tableNames, nil
 }
 
 // init enforces that the migrations slice stays contiguous and ascending and

@@ -186,33 +186,64 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 func (gc *GarbageCollector) run(ctx context.Context) {
 	defer gc.wg.Done()
 
+	// Derive a context that is also cancelled when Stop closes stopChan, and
+	// run Collect under it. Without this, Stop (and Queue.Close, which joins
+	// the GC) would block until an in-progress Collect over a large backlog
+	// finished on its own — Collect's queue workers watch only their context.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go gc.cancelOnStop(runCtx, cancel)
+
 	ticker := time.NewTicker(gc.config.Interval)
 	defer ticker.Stop()
 
 	// Run an initial pass immediately so cleanup and timed-out-message recovery
 	// do not wait a full interval after Start.
-	select {
-	case <-ctx.Done():
+	if gc.stopRequested(runCtx) {
 		return
-	case <-gc.stopChan:
-		return
-	default:
-		if err := gc.Collect(ctx); err != nil {
-			gc.pq.logError("garbage collection error", "error", err)
-		}
 	}
+	gc.collectOnce(runCtx)
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return
 		case <-gc.stopChan:
 			return
 		case <-ticker.C:
-			if err := gc.Collect(ctx); err != nil {
-				gc.pq.logError("garbage collection error", "error", err)
-			}
+			gc.collectOnce(runCtx)
 		}
+	}
+}
+
+// cancelOnStop cancels the GC's run context when Stop closes stopChan, so an
+// in-progress Collect winds down promptly. It exits when the run context is
+// done (run returning cancels it via defer).
+func (gc *GarbageCollector) cancelOnStop(runCtx context.Context, cancel context.CancelFunc) {
+	select {
+	case <-gc.stopChan:
+		cancel()
+	case <-runCtx.Done():
+	}
+}
+
+// stopRequested reports whether the GC has been asked to wind down, either via
+// Stop (stopChan) or context cancellation.
+func (gc *GarbageCollector) stopRequested(runCtx context.Context) bool {
+	select {
+	case <-runCtx.Done():
+		return true
+	case <-gc.stopChan:
+		return true
+	default:
+		return false
+	}
+}
+
+// collectOnce runs a single Collect pass, logging any error.
+func (gc *GarbageCollector) collectOnce(ctx context.Context) {
+	if err := gc.Collect(ctx); err != nil {
+		gc.pq.logError("garbage collection error", "error", err)
 	}
 }
 
@@ -274,6 +305,12 @@ func (gc *GarbageCollector) collectQueue(
 		}
 		if err := gc.reclaimOrphanTopicMessages(ctx, queue.TableName); err != nil {
 			return fmt.Errorf("failed to reclaim orphan topic messages: %w", err)
+		}
+		// Promote timed-out-and-exhausted subscriptions to the DLQ before
+		// resetTimedOutEntries runs, so a still-exhausted subscription is
+		// dead-lettered rather than reset back to pending.
+		if err := gc.promoteExhaustedTopicSubscriptions(ctx, queue); err != nil {
+			return fmt.Errorf("failed to promote exhausted subscriptions: %w", err)
 		}
 	}
 
@@ -401,6 +438,136 @@ func scanExhaustedChannelMessages(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating exhausted messages: %w", err)
+	}
+	return batch, nil
+}
+
+// promoteExhaustedTopicSubscriptionsPageSize bounds the subscription rows
+// promoted to the DLQ per transaction, keeping the GC pass's footprint bounded
+// on a pathological backlog.
+const promoteExhaustedTopicSubscriptionsPageSize = 100
+
+// promoteExhaustedTopicSubscriptions moves pub/sub subscription rows that have
+// timed out in 'processing' state and exhausted their retries to the
+// dead-letter queue. The consume path (reclaimTopicAttempt) already does this
+// for any subscriber actively consuming; this GC pass is the backstop for a
+// subscriber that has gone idle, so its exhausted rows are dead-lettered
+// rather than reset to 'pending' indefinitely by resetTimedOutSubscriptions.
+//
+// retry_count >= effective max is exactly the condition under which a further
+// reclaim would breach the retryCount+1 > maxRetries guard — the same test
+// reclaimTopicAttempt applies. Work is done in bounded pages — moveSubToDLQ
+// deletes each promoted row, so a fresh SELECT never re-sees it.
+func (gc *GarbageCollector) promoteExhaustedTopicSubscriptions(
+	ctx context.Context,
+	queue QueueMetadata,
+) error {
+	maxRetries := gc.pq.resolveMaxRetries(&queue)
+	tableName := queue.TableName
+	selectQuery := fmt.Sprintf(`
+		SELECT s.message_id, s.subscriber_id, s.retry_count, m.payload, m.metadata
+		FROM %s s
+		JOIN %s m ON s.message_id = m.id
+		WHERE s.status = '%s'
+		  AND s.visibility_timeout IS NOT NULL
+		  AND s.visibility_timeout < NOW()
+		  AND s.retry_count >= $1
+		ORDER BY s.id
+		LIMIT %d
+		FOR UPDATE OF s SKIP LOCKED
+	`, gc.pq.subTable(tableName), gc.pq.msgTable(tableName),
+		MessageStatusProcessing, promoteExhaustedTopicSubscriptionsPageSize)
+
+	for {
+		promoted, err := gc.promoteExhaustedTopicPage(ctx, tableName, selectQuery, maxRetries)
+		if err != nil {
+			return err
+		}
+		if promoted < promoteExhaustedTopicSubscriptionsPageSize {
+			return nil // backlog exhausted
+		}
+	}
+}
+
+// exhaustedTopicSubscription is one timed-out, retry-exhausted subscription row
+// awaiting promotion to the dead-letter queue.
+type exhaustedTopicSubscription struct {
+	messageID    uuid.UUID
+	subscriberID string
+	retryCount   int
+	payload      []byte
+	metadataJSON sql.NullString
+}
+
+// promoteExhaustedTopicPage promotes one page of exhausted subscriptions to the
+// DLQ in a single transaction and returns how many it moved.
+func (gc *GarbageCollector) promoteExhaustedTopicPage(
+	ctx context.Context,
+	tableName, selectQuery string,
+	maxRetries int,
+) (int, error) {
+	tx, err := gc.pq.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	batch, err := scanExhaustedTopicSubscriptions(ctx, tx, selectQuery, maxRetries)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, e := range batch {
+		// moveSubToDLQ counts the timeout reclaim itself (state.retryCount+1),
+		// so the raw stored retry_count is passed — the same contract
+		// reclaimTopicAttempt relies on.
+		if err := gc.pq.moveSubToDLQ(
+			ctx, tx, tableName, e.messageID, e.subscriberID, errReasonVisibilityTimeout,
+			&subState{retryCount: e.retryCount, payload: e.payload, metadataJSON: e.metadataJSON},
+		); err != nil {
+			return 0, fmt.Errorf("failed to move exhausted subscription to DLQ: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit exhausted-subscription promotion: %w", err)
+	}
+
+	if len(batch) > 0 {
+		gc.pq.logInfo("promoted exhausted subscriptions to DLQ",
+			"count", len(batch), "table", tableName)
+	}
+	return len(batch), nil
+}
+
+// scanExhaustedTopicSubscriptions reads (and FOR UPDATE locks) one page of
+// exhausted subscriptions. The rows are fully drained and closed before the
+// caller runs any further statement on the transaction.
+func scanExhaustedTopicSubscriptions(
+	ctx context.Context,
+	tx *sql.Tx,
+	selectQuery string,
+	maxRetries int,
+) ([]exhaustedTopicSubscription, error) {
+	rows, err := tx.QueryContext(ctx, selectQuery, maxRetries)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query exhausted subscriptions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var batch []exhaustedTopicSubscription
+	for rows.Next() {
+		var e exhaustedTopicSubscription
+		if err := rows.Scan(
+			&e.messageID, &e.subscriberID, &e.retryCount,
+			&e.payload, &e.metadataJSON,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan exhausted subscription: %w", err)
+		}
+		batch = append(batch, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating exhausted subscriptions: %w", err)
 	}
 	return batch, nil
 }
@@ -543,11 +710,19 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 	return nil
 }
 
-// purgeOldPendingMessages deletes messages that have been pending longer than maxAge.
-// For pub/sub, a message is deleted if ANY subscriber still has it pending past the cutoff.
-// WARNING: For pub/sub, deleting the message row cascades to ALL subscription records,
-// including those already acked by other subscribers. This differs from
-// purgeCompletedMessages which requires ALL subscribers to have acked.
+// purgeOldPendingMessages drops deliveries that have been pending longer than
+// maxAge.
+//
+// For channels the unit is the message, so the message row itself is deleted.
+//
+// For pub/sub the unit is the per-subscriber delivery: only the stale *pending
+// subscription rows* are deleted, never the shared message row. A subscriber
+// too slow to process a message within maxAge gives up on that one message;
+// other subscribers — whether already acked, still processing, or simply less
+// far behind — are untouched. The message row is left for reclaimOrphanTopicMessages
+// (once every subscription is gone) or purgeCompletedMessages (once the rest are
+// acked) to remove, so no DLQ guard is needed here: a subscription moved to the
+// DLQ no longer has a row in the subscription table.
 func (gc *GarbageCollector) purgeOldPendingMessages(
 	ctx context.Context,
 	tableName string,
@@ -556,20 +731,16 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 ) error {
 	var query string
 	if queueType == QueueTypePubSub {
-		// Keep messages still referenced by a DLQ row so the DLQ entry stays
-		// replayable (FR-027) — see purgeCompletedMessages.
+		// Delete only the stale pending subscription rows, joined to the message
+		// for its publish-time cutoff. The message row and every other
+		// subscriber's rows are deliberately left in place.
 		query = fmt.Sprintf(`
-			DELETE FROM %s m
-			WHERE m.created_at < NOW() - make_interval(secs => $1)
-			AND EXISTS (
-				SELECT 1 FROM %s s
-				WHERE s.message_id = m.id AND s.status = '%s'
-			)
-			AND NOT EXISTS (
-				SELECT 1 FROM %s d WHERE d.original_message_id = m.id
-			)
-		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusPending,
-			gc.pq.dlqTable(tableName))
+			DELETE FROM %s s
+			USING %s m
+			WHERE s.message_id = m.id
+			AND s.status = '%s'
+			AND m.created_at < NOW() - make_interval(secs => $1)
+		`, gc.pq.subTable(tableName), gc.pq.msgTable(tableName), MessageStatusPending)
 	} else {
 		query = fmt.Sprintf(`
 			DELETE FROM %s

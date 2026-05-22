@@ -42,6 +42,9 @@ func (pq *Queue) PublishWithID(
 	payload []byte,
 	metadata map[string]any,
 ) (uuid.UUID, error) {
+	if err := pq.checkClosed(); err != nil {
+		return uuid.UUID{}, err
+	}
 	if payload == nil {
 		return uuid.UUID{}, ErrNilPayload
 	}
@@ -378,9 +381,19 @@ func (pq *Queue) PublishChannelBatch(
 	if err := pq.checkClosed(); err != nil {
 		return nil, err
 	}
-	// Delegate to the existing batch implementation which resolves queue type
-	// from metadata.
-	return pq.PublishBatch(ctx, name, msgs)
+	if len(msgs) == 0 {
+		return []uuid.UUID{}, nil
+	}
+	if err := validateBatchSize(len(msgs)); err != nil {
+		return nil, err
+	}
+	// Resolve metadata with the channel type explicitly so a name that also
+	// exists as a topic cannot misroute this publish to the topic.
+	queueMeta, err := pq.getChannelMetadata(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return pq.publishBatchResolved(ctx, queueMeta, msgs)
 }
 
 // PublishTopicBatch publishes multiple messages to a pub/sub topic in a single
@@ -393,7 +406,19 @@ func (pq *Queue) PublishTopicBatch(
 	if err := pq.checkClosed(); err != nil {
 		return nil, err
 	}
-	return pq.PublishBatch(ctx, name, msgs)
+	if len(msgs) == 0 {
+		return []uuid.UUID{}, nil
+	}
+	if err := validateBatchSize(len(msgs)); err != nil {
+		return nil, err
+	}
+	// Resolve metadata with the topic type explicitly so a name that also
+	// exists as a channel cannot misroute this publish to the channel.
+	queueMeta, err := pq.getTopicMetadata(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return pq.publishBatchResolved(ctx, queueMeta, msgs)
 }
 
 // publishToChannel publishes a message to a point-to-point channel.

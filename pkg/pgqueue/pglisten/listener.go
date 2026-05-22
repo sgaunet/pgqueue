@@ -104,9 +104,15 @@ type Listener struct {
 	channels  map[string]bool // every channel to (re-)LISTEN on
 	pending   []string        // LISTEN requests not yet issued
 	closed    bool
-	interrupt chan struct{} // wakes the run loop to drain pending requests
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// waitMu guards the cancellation state of the in-progress
+	// WaitForNotification. requestInterrupt invokes waitCancel directly to
+	// break the wait, replacing a per-notification canceller goroutine.
+	waitMu           sync.Mutex
+	waitCancel       context.CancelFunc // cancels the active wait, if any
+	interruptPending bool               // a LISTEN/Close arrived with no active wait
 }
 
 // compile-time check: *Listener satisfies the pgqueue.Listener hook interface.
@@ -126,7 +132,6 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 		notifs:          make(chan string, notifyBuffer),
 		conn:            conn,
 		channels:        make(map[string]bool),
-		interrupt:       make(chan struct{}, 1),
 		done:            make(chan struct{}),
 		reconnectPolicy: ReconnectPolicy{}.normalized(),
 	}
@@ -154,12 +159,24 @@ func (l *Listener) Listen(_ context.Context, channel string) error {
 	}
 	l.mu.Unlock()
 
-	// Nudge the run loop so it drains the pending request promptly.
-	select {
-	case l.interrupt <- struct{}{}:
-	default:
-	}
+	// Break the in-progress wait so the run loop drains the request promptly.
+	l.requestInterrupt()
 	return nil
+}
+
+// requestInterrupt breaks the in-progress WaitForNotification, if any, so the
+// run loop re-checks its state and drains pending work. When no wait is in
+// progress the request is remembered (interruptPending) so the next
+// receiveOne honors it instead of blocking — this preserves the buffered
+// "pending nudge" semantics the previous channel-based design relied on. It is
+// invoked both when a LISTEN is registered and when the Listener is closed.
+func (l *Listener) requestInterrupt() {
+	l.waitMu.Lock()
+	l.interruptPending = true
+	if l.waitCancel != nil {
+		l.waitCancel()
+	}
+	l.waitMu.Unlock()
 }
 
 // Notifications returns the stream of notification channel names. It is closed
@@ -176,6 +193,9 @@ func (l *Listener) Close() error {
 		l.closed = true
 		l.mu.Unlock()
 		close(l.done)
+		// Break any in-progress WaitForNotification so the run loop observes
+		// the closed state at once instead of blocking until the next NOTIFY.
+		l.requestInterrupt()
 	})
 	return nil
 }
@@ -206,29 +226,37 @@ func (l *Listener) run() {
 
 // receiveOne waits for a single notification and forwards it. It returns false
 // only when the listener is shutting down. A connection error triggers a
-// reconnect; an interrupt (new LISTEN request) just returns true to loop.
+// reconnect; an interrupt (a new LISTEN request, or Close) just returns true so
+// the run loop re-checks its state.
+//
+// The in-progress wait is cancelled by requestInterrupt invoking the stored
+// waitCancel directly — no per-notification canceller goroutine.
 func (l *Listener) receiveOne() bool {
+	l.waitMu.Lock()
+	if l.interruptPending {
+		// A LISTEN request (or Close) arrived with no wait to cancel; consume
+		// the flag and let the run loop drain it without blocking on a wait.
+		l.interruptPending = false
+		l.waitMu.Unlock()
+		return true
+	}
 	waitCtx, cancel := context.WithCancel(context.Background())
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-l.done:
-		case <-l.interrupt:
-		case <-stop:
-		}
-		cancel()
-	}()
+	l.waitCancel = cancel
+	l.waitMu.Unlock()
 
 	n, err := l.currentConn().WaitForNotification(waitCtx)
-	close(stop)
+
+	l.waitMu.Lock()
+	l.waitCancel = nil
+	l.waitMu.Unlock()
 	cancel()
 
 	if l.isDone() {
 		return false
 	}
 	if err != nil {
-		// Distinguish an interrupt (expected: a new LISTEN arrived) from a
-		// genuine connection failure.
+		// A cancelled wait context means an interrupt (expected: a new LISTEN
+		// arrived); any other error is a genuine connection failure.
 		if waitCtx.Err() != nil {
 			return true
 		}
@@ -273,7 +301,9 @@ func (l *Listener) reconnect() bool {
 		if l.isDone() {
 			return false
 		}
-		conn, err := pgx.Connect(context.Background(), l.connString)
+		connectCtx, cancelConnect := l.connectContext()
+		conn, err := pgx.Connect(connectCtx, l.connString)
+		cancelConnect()
 		if err != nil {
 			delay := l.reconnectBackoff(attempt)
 			l.logWarn("pglisten: reconnect attempt failed; retrying",
@@ -352,4 +382,22 @@ func (l *Listener) isDone() bool {
 	default:
 		return false
 	}
+}
+
+// connectContext returns a context cancelled when the Listener is closed, so a
+// pgx.Connect blocked on an unreachable host during reconnect is interrupted
+// by Close instead of leaking the run goroutine until the OS-level timeout.
+// The caller must invoke the returned cancel to release the watcher goroutine;
+// it must be called per attempt (not deferred) so watchers do not accumulate
+// across the reconnect loop.
+func (l *Listener) connectContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-l.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }

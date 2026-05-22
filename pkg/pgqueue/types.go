@@ -171,6 +171,11 @@ type ReplayLog struct {
 }
 
 // QueueStats holds statistics about a queue.
+//
+// PendingCount is a raw status breakdown: it counts every row in the pending
+// state, including any whose TTL has elapsed and which are therefore no longer
+// consumable. For the consumable depth (TTL-expired rows excluded) use
+// GetQueueDepth instead.
 type QueueStats struct {
 	QueueName         string
 	PendingCount      int64
@@ -194,13 +199,19 @@ type DLQMessage struct {
 
 // RetentionPolicy defines how messages should be garbage collected.
 //
-// WARNING for pub/sub topics: MaxPendingAge deletes the parent message row, which
-// cascades to ALL subscription records for that message — including those already
-// acked by other subscribers. Use with caution on pub/sub topics where subscribers
-// process at different speeds.
+// All three fields default to 0, meaning "keep forever". With a zero policy the
+// queue tables grow without bound: completed channel messages, acked pub/sub
+// subscription rows, and DLQ entries are never reclaimed. Set positive
+// durations to enable automatic cleanup.
+//
+// For pub/sub topics, MaxPendingAge applies per subscriber: it drops only the
+// stale pending subscription rows of a subscriber too slow to process a
+// message within the age limit. The shared message row and every other
+// subscriber's rows are left intact, so a slow subscriber can no longer cause
+// message loss for its peers.
 type RetentionPolicy struct {
 	CompletedMessageTTL time.Duration // How long to keep completed messages (0 = forever)
-	MaxPendingAge       time.Duration // Maximum age for pending messages (0 = no limit; see WARNING above for pub/sub)
+	MaxPendingAge       time.Duration // Maximum age for pending messages/deliveries (0 = no limit)
 	DLQRetention        time.Duration // How long to keep DLQ messages (0 = forever)
 }
 

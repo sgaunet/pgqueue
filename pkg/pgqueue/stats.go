@@ -58,7 +58,10 @@ func (pq *Queue) GetStats(
 	return stats, nil
 }
 
-// GetQueueDepth returns the number of pending messages in a queue.
+// GetQueueDepth returns the number of pending messages currently consumable
+// from a queue. Messages whose TTL has elapsed are excluded, matching what the
+// consume queries actually deliver, so the depth is not inflated by expired
+// rows that no consumer can ever receive.
 func (pq *Queue) GetQueueDepth(
 	ctx context.Context,
 	queueName string,
@@ -79,29 +82,45 @@ func (pq *Queue) GetQueueDepth(
 	}
 
 	tableName := metadata.TableName
-	var count int64
+	ttl := pq.getQueueTTL(metadata.Config)
+	query, args := queueDepthQuery(pq, tableName, queueType, ttl)
 
-	if queueType == QueueTypeChannel {
-		//nolint:gosec // G201: table name validated by queueNameRegex
-		query := fmt.Sprintf(
-			"SELECT COUNT(*) FROM %s WHERE status = '%s'",
-			pq.msgTable(tableName), MessageStatusPending,
-		)
-		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
-			return 0, fmt.Errorf("failed to get queue depth: %w", err)
-		}
-	} else {
-		//nolint:gosec // G201: table name validated by queueNameRegex
-		query := fmt.Sprintf(
-			"SELECT COUNT(*) FROM %s WHERE status = '%s'",
-			pq.subTable(tableName), MessageStatusPending,
-		)
-		if err := pq.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
-			return 0, fmt.Errorf("failed to get queue depth: %w", err)
-		}
+	var count int64
+	if err := pq.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to get queue depth: %w", err)
 	}
 
 	return count, nil
+}
+
+// queueDepthQuery builds the consumable-depth COUNT for a queue. When a TTL is
+// configured the count excludes messages past their TTL — for channels via the
+// message table's created_at, for topics via the joined message row — so it
+// agrees with what the consume queries deliver.
+func queueDepthQuery(pq *Queue, tableName string, queueType QueueType, ttl time.Duration) (string, []any) {
+	if queueType == QueueTypeChannel {
+		base := fmt.Sprintf(
+			"SELECT COUNT(*) FROM %s WHERE status = '%s'",
+			pq.msgTable(tableName), MessageStatusPending,
+		)
+		if ttl > 0 {
+			return base + " AND created_at > NOW() - make_interval(secs => $1)",
+				[]any{ttl.Seconds()}
+		}
+		return base, nil
+	}
+
+	if ttl > 0 {
+		return fmt.Sprintf(
+			`SELECT COUNT(*) FROM %s s JOIN %s m ON s.message_id = m.id
+			 WHERE s.status = '%s' AND m.created_at > NOW() - make_interval(secs => $1)`,
+			pq.subTable(tableName), pq.msgTable(tableName), MessageStatusPending,
+		), []any{ttl.Seconds()}
+	}
+	return fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s WHERE status = '%s'",
+		pq.subTable(tableName), MessageStatusPending,
+	), nil
 }
 
 // GetSubscriberLag returns lag statistics for a specific subscriber on a topic.

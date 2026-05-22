@@ -148,6 +148,23 @@ func (n *notifier) wakeChan(ctx context.Context, notifyChannel string) <-chan st
 	return w.wait()
 }
 
+// forget drops the waker and LISTEN bookkeeping for a notify channel whose
+// queue has been deleted, so the wakers map does not grow without bound as
+// queues are created and destroyed over a long-lived process.
+//
+// The underlying Listener keeps its own LISTEN registration for the channel —
+// the Listener interface has no Unlisten — but that residue is a single small
+// string per queue ever consumed and is out of scope here. A consumer still
+// blocked on the just-deleted queue stops receiving NOTIFY wakeups; that is
+// acceptable, since deleting a queue with a live consumer is a caller error
+// and the safety-net poll surfaces the dropped table on its next tick.
+func (n *notifier) forget(notifyChannel string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.wakers, notifyChannel)
+	delete(n.listening, notifyChannel)
+}
+
 // pump fans the Listener's notification stream out to the per-channel wakers.
 func (n *notifier) pump() {
 	for channel := range n.listener.Notifications() {

@@ -123,6 +123,13 @@ func WithBackoffPolicy(p BackoffPolicy) Option {
 // WithSafetyNetPoll sets the polling interval used as a fallback when
 // LISTEN/NOTIFY notifications are missed (FR-016). Zero disables the safety-net
 // poll.
+//
+// Disabling the poll is only safe when no Listener is registered for push
+// delivery, or when latency on a missed notification is acceptable. A Listener
+// can miss notifications — for example NOTIFYs that fire while it is
+// reconnecting after a dropped connection are lost — and the safety-net poll is
+// what recovers delivery in that window. With both a Listener registered and
+// the poll disabled, a consumer can stall until the next publish wakes it.
 func WithSafetyNetPoll(d time.Duration) Option {
 	return func(c *queueConfig) {
 		c.safetyNetPoll = d

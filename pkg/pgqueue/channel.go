@@ -19,6 +19,14 @@ const (
 	maxErrorMessageLength = 1024
 )
 
+// maxConsumeReclaimDefers bounds how many timed-out messages a single consume
+// call will skip (defer under a backoff policy, or promote to the DLQ) before
+// it gives up and returns empty. Without this cap a large crash-loop backlog
+// would make one consume call walk — and row-lock — the entire backlog inside
+// a single transaction. The caller's poll/notify loop retries promptly, and
+// the garbage collector recovers timed-out messages in bulk regardless.
+const maxConsumeReclaimDefers = 64
+
 func validateVisibilityTimeout(d time.Duration) error {
 	if d < minVisibilityTimeout || d > maxVisibilityTimeout {
 		return ErrInvalidVisibilityTimeout
@@ -34,6 +42,9 @@ func (pq *Queue) ConsumeFromChannel(
 	channelName string,
 	visibilityTimeout time.Duration,
 ) (*Message, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
 	if err := validateVisibilityTimeout(visibilityTimeout); err != nil {
 		return nil, err
 	}
@@ -265,15 +276,15 @@ func (pq *Queue) fetchPendingChannelMessage(
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
 ) (*Message, *time.Time, error) {
-	query, args := channelConsumeQuery(
-		pq.msgTable(tableName), ttl, pq.config.DefaultMaxRetries,
-	)
+	query, args := channelConsumeQuery(pq.msgTable(tableName), ttl)
 
-	// Loop so that a timed-out message whose redelivery is deferred by the
-	// backoff policy (R-05) is skipped and the next eligible message is
-	// considered, rather than this consume call returning empty. Exhausted
-	// timed-out messages are excluded by the query itself (R-12) — the
-	// garbage collector promotes them to the DLQ.
+	// Loop so that a timed-out message that is skipped — its redelivery
+	// deferred by the backoff policy (R-05), or it has exhausted its retries
+	// and is promoted to the DLQ inline — does not make this consume call
+	// return empty: the next eligible message is considered instead. The skip
+	// count is capped (maxConsumeReclaimDefers) so one call cannot walk an
+	// unbounded backlog.
+	defers := 0
 	for {
 		var row channelCandidate
 		err := tx.QueryRowContext(ctx, query, args...).Scan(
@@ -293,6 +304,12 @@ func (pq *Queue) fetchPendingChannelMessage(
 			return nil, nil, err
 		}
 		if deferred {
+			defers++
+			if defers >= maxConsumeReclaimDefers {
+				// Backlog too deep to drain in one call; return empty and let
+				// the caller's poll/notify loop pick up where this left off.
+				return nil, nil, nil
+			}
 			continue
 		}
 
@@ -308,15 +325,16 @@ func (pq *Queue) fetchPendingChannelMessage(
 // crashed or never acked). Reclaiming timed-out messages here means redelivery
 // does not depend on the GarbageCollector running.
 //
-// A timed-out 'processing' message that has already exhausted its retries is
-// deliberately excluded (retry_count < effective max): promoting it to the DLQ
-// is the garbage collector's job, not the consume path's (R-12). defaultMaxRetries
-// is the fallback limit for rows whose max_retries column is NULL (DLQ replays).
-func channelConsumeQuery(msgTable string, ttl time.Duration, defaultMaxRetries int) (string, []any) {
-	args := []any{defaultMaxRetries}
+// A timed-out 'processing' message that has exhausted its retries is also
+// selected: reclaimChannelAttempt promotes it to the DLQ inline and the scan
+// skips to the next candidate. This keeps an exhausted-by-timeout message from
+// being stranded when no GarbageCollector is running, matching how the pub/sub
+// consume path handles exhausted subscriptions (reclaimTopicAttempt).
+func channelConsumeQuery(msgTable string, ttl time.Duration) (string, []any) {
+	args := []any{}
 	ttlClause := ""
 	if ttl > 0 {
-		ttlClause = "AND created_at > NOW() - make_interval(secs => $2)"
+		ttlClause = "AND created_at > NOW() - make_interval(secs => $1)"
 		args = append(args, ttl.Seconds())
 	}
 
@@ -328,8 +346,7 @@ func channelConsumeQuery(msgTable string, ttl time.Duration, defaultMaxRetries i
 		       metadata, processed_at, error_message
 		FROM %s
 		WHERE ((status = '%s' AND available_at <= NOW())
-		       OR (status = '%s' AND visibility_timeout < NOW()
-		           AND retry_count < COALESCE(max_retries, $1)))
+		       OR (status = '%s' AND visibility_timeout < NOW()))
 		  %s
 		ORDER BY id
 		LIMIT 1
@@ -341,13 +358,16 @@ func channelConsumeQuery(msgTable string, ttl time.Duration, defaultMaxRetries i
 
 // reclaimChannelAttempt accounts for a redelivery when a candidate was picked
 // up in 'processing' state — a visibility timeout where the previous consumer
-// never acked. The consume query already excludes exhausted timed-out messages
-// (R-12), so a reclaim here is never the final attempt.
+// never acked.
 //
-// It returns the retry count to claim with. When a backoff policy is configured
-// (R-05) the timed-out message is instead returned to 'pending' with its
-// redelivery deferred by the backoff delay; deferred is then true and the
-// caller skips this message.
+// It returns the retry count to claim with. The second return value reports
+// that the candidate was consumed by this function rather than handed back to
+// be delivered — the caller skips it and moves to the next message. That
+// happens in two cases: a message that has now exhausted its retries is
+// promoted to the DLQ inline (so it is not stranded when no GarbageCollector
+// runs), and, when a backoff policy is configured (R-05), a non-exhausted
+// timed-out message is returned to 'pending' with its redelivery deferred by
+// the backoff delay.
 func (pq *Queue) reclaimChannelAttempt(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -360,6 +380,20 @@ func (pq *Queue) reclaimChannelAttempt(
 
 	// A timeout reclaim counts as one redelivery attempt.
 	retryCount := row.retryCount + 1
+
+	// Exhausted by visibility timeout: dead-letter it inline and skip, exactly
+	// as the pub/sub consume path does for exhausted subscriptions
+	// (reclaimTopicAttempt). The GarbageCollector's promoteExhaustedChannelMessages
+	// stays as a backstop for rows no consumer reaches.
+	if retryCount > channelMaxRetries(pq.config.DefaultMaxRetries, row.maxRetries) {
+		if err := pq.moveToDLQ(
+			ctx, tx, tableName, row.id, errReasonVisibilityTimeout,
+			row.payload, retryCount, row.metadataJSON,
+		); err != nil {
+			return 0, false, err
+		}
+		return 0, true, nil
+	}
 
 	if pq.cfg.backoffConfigured {
 		// Return the message to pending with available_at pushed out by the
@@ -451,9 +485,11 @@ func (pq *Queue) claimChannelMessage(
 		Metadata:   pq.parseMetadataJSON(row.metadataJSON),
 	}
 
-	if row.maxRetries.Valid {
-		msg.MaxRetries = int(row.maxRetries.Int32)
-	}
+	// Report the effective retry limit, not the raw column: a NULL max_retries
+	// (a DLQ-replayed row) falls back to the configured default — the same
+	// resolution channelMaxRetries applies — so a consumer reading
+	// msg.MaxRetries never sees a misleading 0 meaning "unknown".
+	msg.MaxRetries = channelMaxRetries(pq.config.DefaultMaxRetries, row.maxRetries)
 	if row.processedAt.Valid {
 		msg.ProcessedAt = &row.processedAt.Time
 	}
@@ -566,10 +602,10 @@ func (pq *Queue) retryMessage(
 	delay time.Duration,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
-	// claim_id is cleared so a stale receipt held by the previous consumer
-	// resolves to ErrClaimExpired rather than ErrMessageAlreadyAcked.
-	// available_at is pushed out by the backoff delay so the message is not
-	// redelivered until the delay has elapsed (FR-023).
+	// claim_id is cleared so the previous consumer's claim no longer matches:
+	// a stale receipt for this message now resolves to ErrClaimExpired (see
+	// classifyClaimMiss). available_at is pushed out by the backoff delay so
+	// the message is not redelivered until the delay has elapsed (FR-023).
 	updateQuery := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',

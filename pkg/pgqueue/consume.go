@@ -21,6 +21,13 @@ import (
 // this; the poll is the safety net.
 const defaultPollInterval = 1 * time.Second
 
+// ackGracePeriod bounds the auto-ack/nack issued after a handler returns. The
+// ack runs on a context detached from cancellation so a handler that finished
+// just as shutdown began still records its result; the timeout keeps a hung
+// database from making that detached ack — and therefore Queue.Close, which
+// joins the handler loops — block forever.
+const ackGracePeriod = 30 * time.Second
+
 // Transient-error retry bounds for the consume loops (FR-026): a transient
 // database failure is retried with a short escalating backoff up to
 // maxConsumeTransientRetries consecutive times before it is treated as fatal.
@@ -138,6 +145,17 @@ func (pq *Queue) Ack(ctx context.Context, r Receipt) error {
 	if err := pq.checkClosed(); err != nil {
 		return err
 	}
+	return pq.ackReceipt(ctx, r)
+}
+
+// ackReceipt performs the acknowledgement without the closed-state gate that
+// the public Ack applies. Queue.Close marks the Queue closed *before* it joins
+// the handler-based consume loops, so the auto-ack dispatchToHandler issues for
+// a handler that finished just as shutdown began must bypass checkClosed —
+// otherwise every in-flight message at shutdown would fail to ack and be
+// needlessly redelivered after its visibility timeout. Direct callers still go
+// through Ack and keep the closed gate.
+func (pq *Queue) ackReceipt(ctx context.Context, r Receipt) error {
 	ctx, span := pq.startSpan(ctx, "pgqueue.ack",
 		StringAttr("queue", r.QueueName),
 		StringAttr("message_id", r.MessageID.String()))
@@ -173,6 +191,18 @@ func (pq *Queue) Nack(
 	if err := pq.checkClosed(); err != nil {
 		return err
 	}
+	return pq.nackReceipt(ctx, r, reason, opts...)
+}
+
+// nackReceipt performs the negative acknowledgement without the closed-state
+// gate that the public Nack applies — see ackReceipt for why the handler-loop
+// auto-nack must bypass it.
+func (pq *Queue) nackReceipt(
+	ctx context.Context,
+	r Receipt,
+	reason string,
+	opts ...NackOption,
+) error {
 	ctx, span := pq.startSpan(ctx, "pgqueue.nack",
 		StringAttr("queue", r.QueueName),
 		StringAttr("message_id", r.MessageID.String()))
@@ -233,12 +263,13 @@ func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) error {
 
 // NackBatch negatively acknowledges multiple messages using their Receipts.
 // Messages that have exhausted retries are moved to the DLQ; others are
-// retried. reason is recorded as the failure reason.
+// retried. reason is recorded as the failure reason. A WithRetryDelay option
+// overrides the computed backoff delay for every message in the batch.
 func (pq *Queue) NackBatch(
 	ctx context.Context,
 	rs []Receipt,
 	reason string,
-	_ ...NackOption, // reserved: backoff override is wired in Phase 8 (US6)
+	opts ...NackOption,
 ) error {
 	if err := pq.checkClosed(); err != nil {
 		return err
@@ -260,9 +291,9 @@ func (pq *Queue) NackBatch(
 		var err error
 		switch k.qt {
 		case QueueTypeChannel:
-			err = pq.NackChannelBatch(ctx, k.queueName, receipts, reason)
+			err = pq.NackChannelBatch(ctx, k.queueName, receipts, reason, opts...)
 		case QueueTypePubSub:
-			err = pq.NackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason)
+			err = pq.NackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason, opts...)
 		default:
 			continue
 		}
@@ -282,18 +313,27 @@ func isStopSignal(ctx context.Context, err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-// waitForWork blocks until there may be a message to consume: a LISTEN/NOTIFY
-// wake-up if push delivery is available, the safety-net poll interval d, or ctx
+// armWake returns the push-delivery wake channel for notifyChannel, or nil when
+// push delivery is unavailable. It is deliberately called *before* each receive
+// attempt (see fetchNext): arming the waker across the receive closes the
+// lost-wakeup window where a NOTIFY firing between an empty receive() and the
+// subsequent wait would otherwise be missed and cost a full poll interval.
+func (pq *Queue) armWake(ctx context.Context, notifyChannel string) <-chan struct{} {
+	if pq.notifier == nil || notifyChannel == "" {
+		return nil
+	}
+	return pq.notifier.wakeChan(ctx, notifyChannel)
+}
+
+// waitForWork blocks until there may be a message to consume: the pre-armed
+// LISTEN/NOTIFY wake channel closing, the safety-net poll interval d, or ctx
 // cancellation. It reports false only when ctx ended, signalling the caller to
 // stop. A spurious wake just triggers one extra fetch attempt, which is cheap.
-func (pq *Queue) waitForWork(ctx context.Context, d time.Duration, notifyChannel string) bool {
+// A nil wake channel blocks forever, so that case only fires under push
+// delivery.
+func (pq *Queue) waitForWork(ctx context.Context, d time.Duration, wake <-chan struct{}) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-
-	var wake <-chan struct{}
-	if pq.notifier != nil && notifyChannel != "" {
-		wake = pq.notifier.wakeChan(ctx, notifyChannel)
-	}
 
 	select {
 	case <-ctx.Done():
@@ -301,8 +341,6 @@ func (pq *Queue) waitForWork(ctx context.Context, d time.Duration, notifyChannel
 	case <-timer.C:
 		return true
 	case <-wake:
-		// A nil wake channel blocks forever, so this case only fires when push
-		// delivery is active.
 		return true
 	}
 }
@@ -398,6 +436,10 @@ func (pq *Queue) fetchNext(
 		if ctx.Err() != nil {
 			return fetchOutcome{}
 		}
+		// Arm the push-delivery waker before receiving so a NOTIFY that fires
+		// while receive() runs closes this generation's wake channel rather
+		// than being lost in the gap before the wait (see armWake).
+		wake := pq.armWake(ctx, notifyChannel)
 		msg, err := receive(ctx)
 		switch {
 		case err == nil:
@@ -405,7 +447,7 @@ func (pq *Queue) fetchNext(
 			return fetchOutcome{msg: msg}
 		case isEmptySignal(err):
 			*transientFails = 0
-			if !pq.waitForWork(ctx, poll, notifyChannel) {
+			if !pq.waitForWork(ctx, poll, wake) {
 				return fetchOutcome{}
 			}
 		case isStopSignal(ctx, err):
@@ -433,7 +475,8 @@ func (pq *Queue) retryTransient(
 	if *fails > maxConsumeTransientRetries {
 		return fetchOutcome{err: err}, false
 	}
-	if !pq.waitForWork(ctx, transientBackoff(*fails), "") {
+	// A transient-error backoff is a plain timed wait — no push-delivery waker.
+	if !pq.waitForWork(ctx, transientBackoff(*fails), nil) {
 		return fetchOutcome{}, false
 	}
 	return fetchOutcome{}, true
@@ -615,9 +658,18 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	pq.recordConsume(receipt.QueueName, time.Since(start))
 	endSpan(span, herr)
 
-	ackCtx := context.WithoutCancel(ctx)
+	// Detach from cancellation so a handler that finished as shutdown began
+	// still records its result, but cap the wait: an uncancellable, unbounded
+	// ack against a hung database would block this worker — and Queue.Close,
+	// which joins it — forever. ackReceipt/nackReceipt are used in place of the
+	// public Ack/Nack so the auto-ack is not rejected by the closed-state gate:
+	// Close marks the Queue closed before joining these loops, and a handler
+	// finishing in that window must still record its result rather than leave
+	// the message to time out and redeliver.
+	ackCtx, ackCancel := context.WithTimeout(context.WithoutCancel(ctx), ackGracePeriod)
+	defer ackCancel()
 	if herr != nil {
-		if err := pq.Nack(ackCtx, receipt, herr.Error()); err != nil && !errors.Is(err, ErrClaimExpired) {
+		if err := pq.nackReceipt(ackCtx, receipt, herr.Error()); err != nil && !errors.Is(err, ErrClaimExpired) {
 			pq.logError("failed to nack message after handler error",
 				"queue", receipt.QueueName,
 				"message_id", msg.ID.String(),
@@ -628,7 +680,7 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	// A failed ack is logged but not fatal: the message simply redelivers, which
 	// at-least-once tolerates. ErrClaimExpired is the expected outcome when the
 	// handler outran the visibility timeout, so it is not logged as an error.
-	if err := pq.Ack(ackCtx, receipt); err != nil && !errors.Is(err, ErrClaimExpired) {
+	if err := pq.ackReceipt(ackCtx, receipt); err != nil && !errors.Is(err, ErrClaimExpired) {
 		pq.logError("failed to ack message after successful handler",
 			"queue", receipt.QueueName,
 			"message_id", msg.ID.String(),

@@ -7,9 +7,21 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+// resolveNackRetryDelay collapses a slice of NackOption down to the single
+// retry-delay override they may carry (WithRetryDelay); zero means "use the
+// configured backoff policy".
+func resolveNackRetryDelay(opts []NackOption) time.Duration {
+	o := nackOpts{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o.retryDelay
+}
 
 // SQL parameter counts per row for multi-row INSERT statements.
 const (
@@ -33,6 +45,9 @@ func (pq *Queue) PublishBatch(
 	queueName string,
 	messages []PublishMessage,
 ) ([]uuid.UUID, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
 	if len(messages) == 0 {
 		return []uuid.UUID{}, nil
 	}
@@ -45,7 +60,20 @@ func (pq *Queue) PublishBatch(
 		return nil, err
 	}
 
-	// Validate all payloads upfront before any DB work
+	return pq.publishBatchResolved(ctx, queueMeta, messages)
+}
+
+// publishBatchResolved publishes a batch once the queue metadata has been
+// resolved. It validates every payload, generates message IDs, and dispatches
+// to the channel or pub/sub batch insert based on queueMeta.QueueType. The
+// caller is responsible for the closed-state, empty-slice, and batch-size
+// checks before calling this.
+func (pq *Queue) publishBatchResolved(
+	ctx context.Context,
+	queueMeta *QueueMetadata,
+	messages []PublishMessage,
+) ([]uuid.UUID, error) {
+	// Validate all payloads upfront before any DB work.
 	for i := range messages {
 		if messages[i].Payload == nil {
 			return nil, ErrNilPayload
@@ -60,8 +88,7 @@ func (pq *Queue) PublishBatch(
 		return nil, err
 	}
 
-	queueType := queueMeta.QueueType
-	if queueType == QueueTypePubSub {
+	if queueMeta.QueueType == QueueTypePubSub {
 		return ids, pq.publishBatchToPubSub(
 			ctx, queueMeta.QueueName, queueMeta.TableName,
 			ids, messages, metadataJSONs,
@@ -192,13 +219,16 @@ func (pq *Queue) AckTopicBatch(
 // NackChannelBatch negatively acknowledges multiple messages from a channel.
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
+// A WithRetryDelay option overrides the computed backoff delay for the batch.
 func (pq *Queue) NackChannelBatch(
 	ctx context.Context,
 	channelName string,
 	receipts []Receipt,
 	errorMsg string,
+	opts ...NackOption,
 ) error {
 	errorMsg = truncateErrorMsg(errorMsg)
+	retryDelay := resolveNackRetryDelay(opts)
 
 	if len(receipts) == 0 {
 		return nil
@@ -233,7 +263,7 @@ func (pq *Queue) NackChannelBatch(
 		return ErrMessageNotFound
 	}
 
-	if err := pq.processNackBatch(ctx, tx, queueMeta.TableName, states, errorMsg); err != nil {
+	if err := pq.processNackBatch(ctx, tx, queueMeta.TableName, states, errorMsg, retryDelay); err != nil {
 		return err
 	}
 
@@ -247,14 +277,17 @@ func (pq *Queue) NackChannelBatch(
 // NackTopicBatch negatively acknowledges multiple messages for a subscriber from a topic.
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
+// A WithRetryDelay option overrides the computed backoff delay for the batch.
 func (pq *Queue) NackTopicBatch(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
 	receipts []Receipt,
 	errorMsg string,
+	opts ...NackOption,
 ) error {
 	errorMsg = truncateErrorMsg(errorMsg)
+	retryDelay := resolveNackRetryDelay(opts)
 
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return err
@@ -290,7 +323,7 @@ func (pq *Queue) NackTopicBatch(
 	maxRetry := pq.resolveMaxRetries(queueMeta)
 
 	if err := pq.processNackTopicBatch(
-		ctx, tx, queueMeta.TableName, subscriberID, states, maxRetry, errorMsg,
+		ctx, tx, queueMeta.TableName, subscriberID, states, maxRetry, errorMsg, retryDelay,
 	); err != nil {
 		return err
 	}
@@ -319,13 +352,34 @@ func (pq *Queue) getTopicMetadata(
 	return queueMeta, nil
 }
 
-// processNackBatch partitions messages into retry vs DLQ and processes each group.
+// getChannelMetadata retrieves channel metadata, translating not-found to a
+// name-prefixed ErrQueueNotFound.
+func (pq *Queue) getChannelMetadata(
+	ctx context.Context,
+	channelName string,
+) (*QueueMetadata, error) {
+	queueMeta, err := pq.getQueueMetadata(
+		ctx, string(QueueTypeChannel), channelName,
+	)
+	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return nil, fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+		}
+		return nil, fmt.Errorf("failed to get channel metadata: %w", err)
+	}
+	return queueMeta, nil
+}
+
+// processNackBatch partitions messages into retry vs DLQ and processes each
+// group. retryDelay, when positive, overrides the computed backoff delay for
+// every retried message (WithRetryDelay); zero uses the queue's BackoffPolicy.
 func (pq *Queue) processNackBatch(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 	states []batchMessageState,
 	errorMsg string,
+	retryDelay time.Duration,
 ) error {
 	var retryIDs []uuid.UUID
 	var retryDelays []float64
@@ -346,10 +400,10 @@ func (pq *Queue) processNackBatch(
 			})
 		} else {
 			// Each retried message carries its own backoff delay so a batch
-			// nack honors the queue's BackoffPolicy exactly as a single Nack
-			// does (FR-023).
+			// nack honors the queue's BackoffPolicy — or the WithRetryDelay
+			// override — exactly as a single Nack does (FR-023).
 			retryIDs = append(retryIDs, s.id)
-			retryDelays = append(retryDelays, pq.computeRetryDelay(s.retryCount+1, 0).Seconds())
+			retryDelays = append(retryDelays, pq.computeRetryDelay(s.retryCount+1, retryDelay).Seconds())
 		}
 	}
 
@@ -816,7 +870,9 @@ func (pq *Queue) fetchBatchSubStates(
 	return states, nil
 }
 
-// processNackTopicBatch partitions subscriptions into retry vs DLQ and processes each group.
+// processNackTopicBatch partitions subscriptions into retry vs DLQ and
+// processes each group. retryDelay, when positive, overrides the computed
+// backoff delay for every retried subscription (WithRetryDelay).
 func (pq *Queue) processNackTopicBatch(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -824,6 +880,7 @@ func (pq *Queue) processNackTopicBatch(
 	states []batchSubState,
 	maxRetry int,
 	errorMsg string,
+	retryDelay time.Duration,
 ) error {
 	var retryIDs []uuid.UUID
 	var retryDelays []float64
@@ -839,9 +896,10 @@ func (pq *Queue) processNackTopicBatch(
 			})
 		} else {
 			// Per-subscription backoff delay so a batch nack honors the
-			// BackoffPolicy exactly as a single Nack does (FR-023).
+			// BackoffPolicy — or the WithRetryDelay override — exactly as a
+			// single Nack does (FR-023).
 			retryIDs = append(retryIDs, s.messageID)
-			retryDelays = append(retryDelays, pq.computeRetryDelay(s.retryCount+1, 0).Seconds())
+			retryDelays = append(retryDelays, pq.computeRetryDelay(s.retryCount+1, retryDelay).Seconds())
 		}
 	}
 

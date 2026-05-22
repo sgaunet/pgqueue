@@ -786,3 +786,62 @@ func TestNackTopicBatchAppliesBackoff(t *testing.T) {
 		t.Fatalf("message not redelivered after backoff: %v", err)
 	}
 }
+
+// TestPublishBatchTypedMethodsRejectWrongType verifies that PublishChannelBatch
+// and PublishTopicBatch resolve the queue with their own type: invoking the
+// channel batch on a name that exists only as a topic (and vice versa) returns
+// a not-found error instead of silently publishing to the wrong-typed queue.
+func TestPublishBatchTypedMethodsRejectWrongType(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const topicOnly = "batch-topic-only"
+	if err := pq.CreateTopic(ctx, topicOnly); err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicOnly, "sub1"); err != nil {
+		t.Fatalf("failed to subscribe: %v", err)
+	}
+
+	const channelOnly = "batch-channel-only"
+	if err := pq.CreateChannel(ctx, channelOnly); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	msgs := []pgqueue.PublishMessage{{Payload: []byte("p1")}}
+
+	// PublishChannelBatch on a topic-only name must not silently publish to the
+	// topic; it must fail to find a channel of that name.
+	if _, err := pq.PublishChannelBatch(ctx, topicOnly, msgs); !errors.Is(err, pgqueue.ErrQueueNotFound) {
+		t.Errorf("PublishChannelBatch on a topic name: got err %v, want ErrQueueNotFound", err)
+	}
+	topicStats, err := pq.GetStats(ctx, topicOnly, pgqueue.QueueTypePubSub)
+	if err != nil {
+		t.Fatalf("topic GetStats failed: %v", err)
+	}
+	if topicStats.PendingCount != 0 {
+		t.Errorf("PublishChannelBatch leaked into the topic: %d pending", topicStats.PendingCount)
+	}
+
+	// Symmetrically, PublishTopicBatch on a channel-only name must fail.
+	if _, err := pq.PublishTopicBatch(ctx, channelOnly, msgs); !errors.Is(err, pgqueue.ErrTopicNotFound) {
+		t.Errorf("PublishTopicBatch on a channel name: got err %v, want ErrTopicNotFound", err)
+	}
+	chanStats, err := pq.GetStats(ctx, channelOnly, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("channel GetStats failed: %v", err)
+	}
+	if chanStats.PendingCount != 0 {
+		t.Errorf("PublishTopicBatch leaked into the channel: %d pending", chanStats.PendingCount)
+	}
+
+	// The typed methods still work for their own type.
+	if _, err := pq.PublishChannelBatch(ctx, channelOnly, msgs); err != nil {
+		t.Errorf("PublishChannelBatch on a channel: unexpected error %v", err)
+	}
+	if _, err := pq.PublishTopicBatch(ctx, topicOnly, msgs); err != nil {
+		t.Errorf("PublishTopicBatch on a topic: unexpected error %v", err)
+	}
+}

@@ -69,6 +69,19 @@ func (pq *Queue) Unsubscribe(
 	return nil
 }
 
+// consumeTopicPreflight runs the cheap pre-flight checks shared by topic
+// consumption: the Queue must be open, and the visibility timeout and
+// subscriber ID must be valid.
+func (pq *Queue) consumeTopicPreflight(subscriberID string, visibilityTimeout time.Duration) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
+	if err := validateVisibilityTimeout(visibilityTimeout); err != nil {
+		return err
+	}
+	return validateSubscriberID(subscriberID)
+}
+
 // ConsumeFromTopic retrieves the next available message for a subscriber from a topic.
 // Returns nil message if no messages available.
 func (pq *Queue) ConsumeFromTopic(
@@ -76,11 +89,7 @@ func (pq *Queue) ConsumeFromTopic(
 	topicName, subscriberID string,
 	visibilityTimeout time.Duration,
 ) (*Message, error) {
-	if err := validateVisibilityTimeout(visibilityTimeout); err != nil {
-		return nil, err
-	}
-
-	if err := validateSubscriberID(subscriberID); err != nil {
+	if err := pq.consumeTopicPreflight(subscriberID, visibilityTimeout); err != nil {
 		return nil, err
 	}
 
@@ -378,9 +387,10 @@ func (pq *Queue) retrySubscription(
 	delay time.Duration,
 ) error {
 	//nolint:gosec // G201: table name validated by queueNameRegex
-	// claim_id is cleared so a stale receipt held by the previous consumer
-	// resolves to ErrClaimExpired rather than ErrMessageAlreadyAcked.
-	// available_at is pushed out by the backoff delay (FR-023).
+	// claim_id is cleared so the previous consumer's claim no longer matches:
+	// a stale receipt for this subscription now resolves to ErrClaimExpired
+	// (see classifyClaimMiss). available_at is pushed out by the backoff delay
+	// (FR-023).
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -425,6 +435,9 @@ func (pq *Queue) fetchPendingTopicMessage(
 
 	// Loop so an exhausted timed-out subscription is moved to the DLQ and
 	// skipped rather than redelivered forever — see fetchPendingChannelMessage.
+	// The skip count is capped (maxConsumeReclaimDefers) so one call cannot
+	// walk — and row-lock — an unbounded backlog in a single transaction.
+	skips := 0
 	for {
 		var row topicCandidate
 		err := tx.QueryRowContext(ctx, query, args...).Scan(
@@ -445,6 +458,12 @@ func (pq *Queue) fetchPendingTopicMessage(
 			return nil, nil, err
 		}
 		if dlqd {
+			skips++
+			if skips >= maxConsumeReclaimDefers {
+				// Backlog too deep to drain in one call; return empty and let
+				// the caller's poll/notify loop pick up where this left off.
+				return nil, nil, nil
+			}
 			continue
 		}
 
