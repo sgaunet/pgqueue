@@ -467,6 +467,7 @@ func (pq *Queue) applyReplayFrom(
 			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
+			    claim_id = NULL,
 			    processed_at = NULL,
 			    error_message = NULL
 			WHERE id = ANY($1::text::uuid[])
@@ -478,6 +479,7 @@ func (pq *Queue) applyReplayFrom(
 			SET status = '%s',
 			    retry_count = 0,
 			    visibility_timeout = NULL,
+			    claim_id = NULL,
 			    acked_at = NULL,
 			    error_message = NULL
 			WHERE id = ANY($1::text::uuid[])
@@ -540,6 +542,7 @@ func (pq *Queue) executeReplayMessage(
 		SET status = '%s',
 		    retry_count = 0,
 		    visibility_timeout = NULL,
+		    claim_id = NULL,
 		    processed_at = NULL,
 		    error_message = NULL
 		WHERE id = $1 AND status != '%s'
