@@ -75,9 +75,13 @@ func newTopic() *topic {
 
 // WithMaxRetries sets the retry limit before a message is moved to the DLQ.
 // The default is 3, matching the core library.
+//
+// An explicit zero is honored: WithMaxRetries(0) dead-letters a message on its
+// first failed delivery, mirroring the core library's WithDefaultMaxRetries(0).
+// A negative value is meaningless and is ignored.
 func WithMaxRetries(n int) Option {
 	return func(q *Queue) {
-		if n > 0 {
+		if n >= 0 {
 			q.maxRetries = n
 		}
 	}

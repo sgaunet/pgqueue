@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -625,14 +626,34 @@ func (pq *Queue) retryMessage(
 	return nil
 }
 
-// truncateErrorMsg caps an error message at maxErrorMessageLength bytes. It
-// truncates on a UTF-8 rune boundary: slicing a multi-byte string at an
-// arbitrary byte offset can split a rune and produce invalid UTF-8, which
-// PostgreSQL rejects on a TEXT column. Any trailing partial sequence is dropped.
+// truncateErrorMsg sanitizes a nack error message for storage in the
+// error_message TEXT column. It guarantees the result is BOTH valid UTF-8 and
+// at most maxErrorMessageLength bytes, for any input — a handler's error
+// message is arbitrary bytes and may embed non-UTF-8 sequences, which
+// PostgreSQL rejects on a TEXT column.
+//
+// Invalid byte sequences anywhere in the message are replaced with the Unicode
+// replacement character. A single stray byte must not discard the surrounding
+// diagnostic text: an earlier revision trimmed bytes from the end until the
+// whole string was valid, which threw away every byte after the first invalid
+// one — collapsing a long message to (in the worst case) the empty string.
+//
+// The sanitized message is then truncated on a UTF-8 rune boundary so the byte
+// cap never splits a multi-byte rune.
 func truncateErrorMsg(msg string) string {
+	if utf8.ValidString(msg) && len(msg) <= maxErrorMessageLength {
+		return msg
+	}
+	// Replace invalid byte sequences in place so valid content on either side
+	// of a stray byte is preserved rather than discarded.
+	if !utf8.ValidString(msg) {
+		msg = strings.ToValidUTF8(msg, "�")
+	}
 	if len(msg) <= maxErrorMessageLength {
 		return msg
 	}
+	// msg is now valid UTF-8, so the only thing that can make a byte-capped
+	// prefix invalid is a split trailing rune — at most utf8.UTFMax-1 bytes.
 	truncated := msg[:maxErrorMessageLength]
 	for len(truncated) > 0 && !utf8.ValidString(truncated) {
 		truncated = truncated[:len(truncated)-1]

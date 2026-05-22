@@ -224,6 +224,32 @@ func (pq *Queue) nackReceipt(
 	return err
 }
 
+// receiptGroupKey identifies the set of receipts that target the same queue
+// (and, for topics, the same subscriber), so AckBatch/NackBatch can issue one
+// batch call per group.
+type receiptGroupKey struct {
+	qt           QueueType
+	queueName    string
+	subscriberID string
+}
+
+// groupReceiptsByQueue partitions receipts by their queue binding. It returns
+// ErrReceiptMissingQueueType if any receipt carries no valid QueueType, so a
+// malformed receipt fails fast — and consistently with the single-message
+// Ack/Nack — rather than being silently dropped (which would leave its message
+// un-acked, to be needlessly redelivered after the visibility timeout).
+func groupReceiptsByQueue(rs []Receipt) (map[receiptGroupKey][]Receipt, error) {
+	groups := make(map[receiptGroupKey][]Receipt)
+	for _, r := range rs {
+		if r.QueueType != QueueTypeChannel && r.QueueType != QueueTypePubSub {
+			return nil, ErrReceiptMissingQueueType
+		}
+		k := receiptGroupKey{qt: r.QueueType, queueName: r.QueueName, subscriberID: r.SubscriberID}
+		groups[k] = append(groups[k], r)
+	}
+	return groups, nil
+}
+
 // AckBatch acknowledges multiple messages using their Receipts. Receipts are
 // grouped by queue and acknowledged in a single batch operation per queue.
 // Each Receipt must carry the queue binding set by ReceiveChannel/ReceiveTopic.
@@ -234,15 +260,9 @@ func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) error {
 	if len(rs) == 0 {
 		return nil
 	}
-	type groupKey struct {
-		qt           QueueType
-		queueName    string
-		subscriberID string
-	}
-	groups := make(map[groupKey][]Receipt)
-	for _, r := range rs {
-		k := groupKey{qt: r.QueueType, queueName: r.QueueName, subscriberID: r.SubscriberID}
-		groups[k] = append(groups[k], r)
+	groups, err := groupReceiptsByQueue(rs)
+	if err != nil {
+		return err
 	}
 	for k, receipts := range groups {
 		var err error
@@ -277,15 +297,9 @@ func (pq *Queue) NackBatch(
 	if len(rs) == 0 {
 		return nil
 	}
-	type groupKey struct {
-		qt           QueueType
-		queueName    string
-		subscriberID string
-	}
-	groups := make(map[groupKey][]Receipt)
-	for _, r := range rs {
-		k := groupKey{qt: r.QueueType, queueName: r.QueueName, subscriberID: r.SubscriberID}
-		groups[k] = append(groups[k], r)
+	groups, err := groupReceiptsByQueue(rs)
+	if err != nil {
+		return err
 	}
 	for k, receipts := range groups {
 		var err error
