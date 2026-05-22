@@ -17,7 +17,21 @@ const (
 	defaultGCMaxWorkers    = 10
 	maxGCMaxWorkers        = 100                    // upper bound to cap goroutine/connection fan-out
 	gcSlowCollectThreshold = 100 * time.Millisecond // L5: named constant for slow GC logging
+
+	defaultCompletedMessageTTL = 24 * time.Hour      // retain completed messages for a day
+	defaultDLQRetention        = 30 * 24 * time.Hour // retain DLQ entries for a month
 )
+
+// defaultRetentionPolicy is substituted for an all-zero DefaultPolicy by
+// NewGarbageCollector, so a GarbageCollector created without a policy still
+// bounds table growth (issue #47). MaxPendingAge is deliberately left unbounded:
+// pending messages are live, unprocessed data, and purging them by default
+// would silently lose messages whenever a consumer is down.
+var defaultRetentionPolicy = RetentionPolicy{
+	CompletedMessageTTL: defaultCompletedMessageTTL,
+	MaxPendingAge:       0,
+	DLQRetention:        defaultDLQRetention,
+}
 
 // GarbageCollector handles automatic cleanup of old messages.
 type GarbageCollector struct {
@@ -32,6 +46,12 @@ type GarbageCollector struct {
 
 // NewGarbageCollector creates a new garbage collector instance.
 //
+// An all-zero config.DefaultPolicy is replaced with default retention
+// (CompletedMessageTTL 24h, DLQRetention 30d; MaxPendingAge stays unbounded) so
+// the GC bounds table growth out of the box. A DefaultPolicy with any field
+// set, and every Policies entry, is used verbatim; set fields to KeepForever to
+// run a GC that retains everything.
+//
 // The GC back-registers on the Queue so Queue.Close stops it automatically. A
 // GC created after the Queue is already closed is inert: it is not registered
 // and Start is a no-op.
@@ -42,6 +62,13 @@ func NewGarbageCollector(
 	// Set defaults
 	if config.Interval == 0 {
 		config.Interval = defaultGCInterval
+	}
+	// An all-zero DefaultPolicy is treated as unconfigured and replaced with
+	// default retention so the GC bounds table growth out of the box (issue
+	// #47). A policy that sets even one field — including a KeepForever field —
+	// is honored verbatim.
+	if config.DefaultPolicy == (RetentionPolicy{}) {
+		config.DefaultPolicy = defaultRetentionPolicy
 	}
 	if config.Policies == nil {
 		config.Policies = make(map[string]RetentionPolicy)

@@ -140,30 +140,30 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	}
 }
 
-func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
+func TestGarbageCollectorKeepForeverPreservesMessages(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Create a test channel
-	err := pq.CreateChannel(ctx, "gc-zero-ttl-test", pgqueue.WithQueueMaxRetries(3))
+	err := pq.CreateChannel(ctx, "gc-keep-forever-test", pgqueue.WithQueueMaxRetries(3))
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
 	// Publish and acknowledge a message
-	_, err = pq.Publish(ctx, "gc-zero-ttl-test", []byte("test message"))
+	_, err = pq.Publish(ctx, "gc-keep-forever-test", []byte("test message"))
 	if err != nil {
 		t.Fatalf("failed to publish message: %v", err)
 	}
 
-	msg, err := pq.ConsumeFromChannel(ctx, "gc-zero-ttl-test", 30*time.Second)
+	msg, err := pq.ConsumeFromChannel(ctx, "gc-keep-forever-test", 30*time.Second)
 	if err != nil {
 		t.Fatalf("failed to consume message: %v", err)
 	}
 
-	if err := pq.AckChannel(ctx, "gc-zero-ttl-test", msg.Receipt()); err != nil {
+	if err := pq.AckChannel(ctx, "gc-keep-forever-test", msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack message: %v", err)
 	}
 
@@ -171,7 +171,7 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify message is completed
-	stats, err := pq.GetStats(ctx, "gc-zero-ttl-test", pgqueue.QueueTypeChannel)
+	stats, err := pq.GetStats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -179,10 +179,12 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 		t.Errorf("expected 1 completed message, got %d", stats.CompletedCount)
 	}
 
-	// Run garbage collector with TTL=0 (never expire)
+	// Run garbage collector with an explicit KeepForever policy. A bare
+	// RetentionPolicy{} would be treated as unconfigured and replaced with
+	// default retention, so KeepForever is how a GC opts out of all cleanup.
 	gcConfig := pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
-			CompletedMessageTTL: 0, // Never expire
+			CompletedMessageTTL: pgqueue.KeepForever,
 		},
 	}
 	gc := pgqueue.NewGarbageCollector(pq, gcConfig)
@@ -196,13 +198,57 @@ func TestGarbageCollectorZeroTTLPreservesMessages(t *testing.T) {
 	}
 
 	// Verify completed message is still present
-	stats, err = pq.GetStats(ctx, "gc-zero-ttl-test", pgqueue.QueueTypeChannel)
+	stats, err = pq.GetStats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
 
 	if stats.CompletedCount != 1 {
-		t.Errorf("expected 1 completed message to be preserved with TTL=0, got %d", stats.CompletedCount)
+		t.Errorf("expected 1 completed message to be preserved with KeepForever, got %d", stats.CompletedCount)
+	}
+}
+
+// TestGarbageCollectorDefaultPolicyPurgesCompleted is the regression test for
+// issue #47: a GarbageCollector created with an empty config must still reclaim
+// completed messages, rather than letting the table grow without bound.
+func TestGarbageCollectorDefaultPolicyPurgesCompleted(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if err := pq.CreateChannel(ctx, "gc-default-policy"); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+	if _, err := pq.Publish(ctx, "gc-default-policy", []byte("done")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+	msg, err := pq.ConsumeFromChannel(ctx, "gc-default-policy", 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to consume: %v", err)
+	}
+	if err := pq.AckChannel(ctx, "gc-default-policy", msg.Receipt()); err != nil {
+		t.Fatalf("failed to ack: %v", err)
+	}
+
+	// Backdate processed_at past the 24h default CompletedMessageTTL.
+	if _, err := db.ExecContext(ctx,
+		"UPDATE pgqueue_msg_gc_default_policy SET processed_at = NOW() - INTERVAL '25 hours'"); err != nil {
+		t.Fatalf("failed to backdate completed message: %v", err)
+	}
+
+	// An empty config: NewGarbageCollector substitutes the default policy.
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("garbage collection failed: %v", err)
+	}
+
+	stats, err := pq.GetStats(ctx, "gc-default-policy", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats: %v", err)
+	}
+	if stats.CompletedCount != 0 {
+		t.Errorf("expected completed message purged by default policy, got %d", stats.CompletedCount)
 	}
 }
 

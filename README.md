@@ -161,10 +161,14 @@ gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
 gc.Start(ctx) // runs in the background until ctx is cancelled or q.Close()
 ```
 
-> **`RetentionPolicy` zero value means "keep forever".** Each field defaults to
-> `0`, which *disables* that cleanup — so a `GarbageCollector` with an empty
-> policy reclaims nothing and the tables grow without bound. Set positive
-> durations to enable purging.
+> **Retention defaults.** `NewGarbageCollector` substitutes default retention
+> (`CompletedMessageTTL` 24h, `DLQRetention` 30d) when `DefaultPolicy` is left
+> empty, so a `GarbageCollector` created without a policy still bounds table
+> growth. `MaxPendingAge` stays unbounded by default — pending messages are
+> live, unprocessed data. A `DefaultPolicy` that sets even one field, and every
+> per-queue `Policies` entry, is used as-is (there, a `0` field disables that
+> cleanup). To run a `GarbageCollector` that keeps everything forever, set the
+> fields explicitly to `pgqueue.KeepForever`.
 
 `q.Close()` stops every `GarbageCollector` created for the queue (it
 back-registers on construction), so you do not have to track them for shutdown.

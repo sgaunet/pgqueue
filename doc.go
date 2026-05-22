@@ -36,9 +36,11 @@ WithQueueMaxMessageSize.
 Storage retention is opt-in. Message redelivery on a crashed consumer and DLQ
 promotion of retry-exhausted messages happen without any extra setup, but old
 rows (completed messages, DLQ entries, acked subscriptions) are only reclaimed
-by a GarbageCollector: construct one with NewGarbageCollector, give it a
-RetentionPolicy with positive durations (the zero value keeps rows forever),
-and call Start. See NewGarbageCollector and RetentionPolicy.
+by a GarbageCollector: construct one with NewGarbageCollector and call Start.
+NewGarbageCollector substitutes default retention when given an empty
+DefaultPolicy, so the GC bounds table growth out of the box; pass an explicit
+RetentionPolicy to tune it, or KeepForever fields to retain rows indefinitely.
+See NewGarbageCollector and RetentionPolicy.
 
 For complete examples, see the examples/ directory.
 */

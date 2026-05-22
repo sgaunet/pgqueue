@@ -197,12 +197,24 @@ type DLQMessage struct {
 	Metadata          map[string]any
 }
 
+// KeepForever is a RetentionPolicy field value that disables cleanup for that
+// field — the rows it governs are never purged. It exists so a completely
+// empty GarbageCollectorConfig.DefaultPolicy can be distinguished from one that
+// deliberately wants infinite retention: NewGarbageCollector replaces an
+// all-zero DefaultPolicy with default retention, but leaves any policy that
+// sets at least one field (including a KeepForever field) untouched.
+const KeepForever time.Duration = -1
+
 // RetentionPolicy defines how messages should be garbage collected.
 //
-// All three fields default to 0, meaning "keep forever". With a zero policy the
-// queue tables grow without bound: completed channel messages, acked pub/sub
-// subscription rows, and DLQ entries are never reclaimed. Set positive
-// durations to enable automatic cleanup.
+// A field set to 0 or KeepForever disables cleanup for the rows it governs (a
+// positive duration enables it). The one exception is an all-zero policy used
+// as GarbageCollectorConfig.DefaultPolicy: NewGarbageCollector treats that as
+// "unconfigured" and substitutes default retention, so a GarbageCollector
+// created without a policy still bounds table growth. Per-queue Policies
+// entries and any DefaultPolicy with at least one field set are used verbatim.
+// To run a GarbageCollector that keeps everything forever, set the fields
+// explicitly to KeepForever.
 //
 // For pub/sub topics, MaxPendingAge applies per subscriber: it drops only the
 // stale pending subscription rows of a subscriber too slow to process a
@@ -210,9 +222,9 @@ type DLQMessage struct {
 // subscriber's rows are left intact, so a slow subscriber can no longer cause
 // message loss for its peers.
 type RetentionPolicy struct {
-	CompletedMessageTTL time.Duration // How long to keep completed messages (0 = forever)
-	MaxPendingAge       time.Duration // Maximum age for pending messages/deliveries (0 = no limit)
-	DLQRetention        time.Duration // How long to keep DLQ messages (0 = forever)
+	CompletedMessageTTL time.Duration // How long to keep completed messages (0 or KeepForever = forever)
+	MaxPendingAge       time.Duration // Maximum age for pending messages/deliveries (0 or KeepForever = no limit)
+	DLQRetention        time.Duration // How long to keep DLQ messages (0 or KeepForever = forever)
 }
 
 // GarbageCollectorConfig holds configuration for the garbage collector.
