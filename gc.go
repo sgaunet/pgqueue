@@ -181,7 +181,13 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			wg.Wait()
-			return fmt.Errorf("garbage collection cancelled: %w", ctx.Err())
+			// Preserve errors from workers that already ran so they are
+			// not silently lost on cancellation.
+			mu.Lock()
+			cancelErrs := append(errs, //nolint:gocritic // intentional copy
+				fmt.Errorf("garbage collection cancelled: %w", ctx.Err()))
+			mu.Unlock()
+			return errors.Join(cancelErrs...)
 		case sem <- struct{}{}:
 			wg.Add(1)
 			go func(q QueueMetadata) {
