@@ -469,7 +469,7 @@ func (pq *Queue) applyReplayFrom(
 			    visibility_timeout = NULL,
 			    processed_at = NULL,
 			    error_message = NULL
-			WHERE id = ANY($1::uuid[])
+			WHERE id = ANY($1::text::uuid[])
 			  AND status != '%s' AND status != '%s'
 		`, pq.msgTable(tableName), MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 	} else {
@@ -480,12 +480,12 @@ func (pq *Queue) applyReplayFrom(
 			    visibility_timeout = NULL,
 			    acked_at = NULL,
 			    error_message = NULL
-			WHERE id = ANY($1::uuid[])
+			WHERE id = ANY($1::text::uuid[])
 			  AND status != '%s' AND status != '%s'
 		`, pq.subTable(tableName), MessageStatusPending, MessageStatusPending, MessageStatusProcessing)
 	}
 
-	result, err := tx.ExecContext(ctx, query, uuidSliceToStringSlice(ids))
+	result, err := tx.ExecContext(ctx, query, uuidArrayLiteral(ids))
 	if err != nil {
 		return 0, fmt.Errorf("failed to replay messages: %w", err)
 	}
@@ -841,9 +841,9 @@ func (pq *Queue) reinsertDLQChannel(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM %s WHERE id = ANY($1::uuid[])`, pq.dlqTable(tableName),
+		`DELETE FROM %s WHERE id = ANY($1::text::uuid[])`, pq.dlqTable(tableName),
 	)
-	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
+	if _, err := tx.ExecContext(ctx, deleteQuery, uuidArrayLiteral(dlqIDs)); err != nil {
 		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
 	}
 
@@ -875,7 +875,7 @@ func (pq *Queue) insertDLQChannelMessages(
 		fmt.Fprintf(&sb, "($%d, $%d, NOW(), '%s', 0, $%d)",
 			base+1, base+2, MessageStatusPending, base+3, //nolint:mnd // SQL placeholder arithmetic
 		)
-		args = append(args, msg.originalMessageID, msg.payload, msg.metadata)
+		args = append(args, msg.originalMessageID, msg.payload, jsonbParam(msg.metadata))
 	}
 	sb.WriteString(" ON CONFLICT (id) DO NOTHING RETURNING id")
 
@@ -948,9 +948,9 @@ func (pq *Queue) reinsertDLQPubSub(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM %s WHERE id = ANY($1::uuid[])`, pq.dlqTable(tableName),
+		`DELETE FROM %s WHERE id = ANY($1::text::uuid[])`, pq.dlqTable(tableName),
 	)
-	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(replayedIDs)); err != nil {
+	if _, err := tx.ExecContext(ctx, deleteQuery, uuidArrayLiteral(replayedIDs)); err != nil {
 		return 0, fmt.Errorf("failed to delete from DLQ: %w", err)
 	}
 
@@ -976,9 +976,9 @@ func (pq *Queue) filterExistingMessages(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(
-		`SELECT id FROM %s WHERE id = ANY($1::uuid[])`, pq.msgTable(tableName),
+		`SELECT id FROM %s WHERE id = ANY($1::text::uuid[])`, pq.msgTable(tableName),
 	)
-	rows, err := tx.QueryContext(ctx, query, uuidSliceToStringSlice(ids))
+	rows, err := tx.QueryContext(ctx, query, uuidArrayLiteral(ids))
 	if err != nil {
 		return nil, fmt.Errorf("failed to check existing messages: %w", err)
 	}

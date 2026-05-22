@@ -214,7 +214,7 @@ func (pq *Queue) publishToPubSub(
 		ON CONFLICT (id) DO NOTHING
 	`, pq.msgTable(tableName))
 
-	result, err := tx.ExecContext(ctx, insertMsg, messageID, payload, metadata)
+	result, err := tx.ExecContext(ctx, insertMsg, messageID, payload, jsonbParam(metadata))
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)
 	}
@@ -445,7 +445,7 @@ func (pq *Queue) publishToChannel(
 	`, pq.msgTable(tableName), MessageStatusPending)
 
 	result, err := tx.ExecContext(
-		ctx, insertMsg, messageID, payload, metadata, maxRetries,
+		ctx, insertMsg, messageID, payload, jsonbParam(metadata), maxRetries,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)

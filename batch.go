@@ -37,9 +37,6 @@ const (
 //
 // The operation is atomic (all-or-nothing): if any message has a duplicate ID,
 // the entire batch is rolled back and ErrDuplicateMessageID is returned.
-//
-// Note: batch ack/nack operations require the pgx driver (jackc/pgx); lib/pq is not
-// supported for operations that use ANY($1::uuid[]) array parameters.
 func (pq *Queue) PublishBatch(
 	ctx context.Context,
 	queueName string,
@@ -134,13 +131,13 @@ func (pq *Queue) AckChannelBatch(
 	query := fmt.Sprintf(`
 		UPDATE %s AS m
 		SET status = '%s', processed_at = NOW()
-		FROM unnest($1::uuid[], $2::uuid[]) AS u(id, claim_id)
+		FROM unnest($1::text::uuid[], $2::text::uuid[]) AS u(id, claim_id)
 		WHERE m.id = u.id
 		  AND m.claim_id = u.claim_id
 		  AND m.status = '%s'
 	`, pq.msgTable(queueMeta.TableName), MessageStatusCompleted, MessageStatusProcessing)
 
-	ids, claims := receiptsToIDClaimSlices(receipts)
+	ids, claims := receiptsToIDClaimLiterals(receipts)
 	result, err := pq.db.ExecContext(ctx, query, ids, claims)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge messages: %w", err)
@@ -192,14 +189,14 @@ func (pq *Queue) AckTopicBatch(
 	query := fmt.Sprintf(`
 		UPDATE %s AS s
 		SET status = '%s', acked_at = NOW()
-		FROM unnest($1::uuid[], $2::uuid[]) AS u(message_id, claim_id)
+		FROM unnest($1::text::uuid[], $2::text::uuid[]) AS u(message_id, claim_id)
 		WHERE s.message_id = u.message_id
 		  AND s.claim_id = u.claim_id
 		  AND s.subscriber_id = $3
 		  AND s.status = '%s'
 	`, pq.subTable(queueMeta.TableName), MessageStatusAcked, MessageStatusProcessing)
 
-	ids, claims := receiptsToIDClaimSlices(receipts)
+	ids, claims := receiptsToIDClaimLiterals(receipts)
 	result, err := pq.db.ExecContext(ctx, query, ids, claims, subscriberID)
 	if err != nil {
 		return fmt.Errorf("failed to acknowledge messages: %w", err)
@@ -490,7 +487,7 @@ func (pq *Queue) publishBatchToChannel(
 		fmt.Fprintf(&sb, "($%d, $%d, '%s', $%d, $%d)",
 			base+1, base+2, MessageStatusPending, base+3, base+4, //nolint:mnd // SQL placeholder arithmetic
 		)
-		args = append(args, ids[i], messages[i].Payload, metadataJSONs[i], maxRetries)
+		args = append(args, ids[i], messages[i].Payload, jsonbParam(metadataJSONs[i]), maxRetries)
 	}
 	sb.WriteString(" ON CONFLICT (id) DO NOTHING")
 
@@ -583,7 +580,7 @@ func (pq *Queue) insertBatchPubSubMessages(
 		fmt.Fprintf(&sb, "($%d, $%d, $%d)",
 			base+1, base+2, base+3, //nolint:mnd // SQL placeholder arithmetic
 		)
-		args = append(args, ids[i], messages[i].Payload, metadataJSONs[i])
+		args = append(args, ids[i], messages[i].Payload, jsonbParam(metadataJSONs[i]))
 	}
 	sb.WriteString(" ON CONFLICT (id) DO NOTHING")
 
@@ -701,13 +698,13 @@ func (pq *Queue) fetchBatchMessageStates(
 	query := fmt.Sprintf(`
 		SELECT m.id, m.retry_count, m.max_retries, m.payload, m.metadata
 		FROM %s AS m
-		JOIN unnest($1::uuid[], $2::uuid[]) AS u(id, claim_id)
+		JOIN unnest($1::text::uuid[], $2::text::uuid[]) AS u(id, claim_id)
 		  ON m.id = u.id AND m.claim_id = u.claim_id
 		WHERE m.status = '%s'
 		FOR UPDATE OF m
 	`, pq.msgTable(tableName), MessageStatusProcessing)
 
-	ids, claims := receiptsToIDClaimSlices(receipts)
+	ids, claims := receiptsToIDClaimLiterals(receipts)
 	rows, err := tx.QueryContext(ctx, query, ids, claims)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages: %w", err)
@@ -755,12 +752,12 @@ func (pq *Queue) batchRetryMessages(
 		    visibility_timeout = NULL,
 		    available_at = NOW() + make_interval(secs => u.delay),
 		    error_message = $3
-		FROM unnest($1::uuid[], $2::float8[]) AS u(id, delay)
+		FROM unnest($1::text::uuid[], $2::text::float8[]) AS u(id, delay)
 		WHERE m.id = u.id
 	`, pq.msgTable(tableName), MessageStatusPending)
 
 	_, err := tx.ExecContext(
-		ctx, query, uuidSliceToStringSlice(messageIDs), delaySeconds, errorMsg,
+		ctx, query, uuidArrayLiteral(messageIDs), float64ArrayLiteral(delaySeconds), errorMsg,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update messages: %w", err)
@@ -807,10 +804,10 @@ func (pq *Queue) batchMoveToDLQ(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	delQuery := fmt.Sprintf(
-		`DELETE FROM %s WHERE id = ANY($1::uuid[])`,
+		`DELETE FROM %s WHERE id = ANY($1::text::uuid[])`,
 		pq.msgTable(tableName),
 	)
-	if _, err := tx.ExecContext(ctx, delQuery, uuidSliceToStringSlice(dlqIDs)); err != nil {
+	if _, err := tx.ExecContext(ctx, delQuery, uuidArrayLiteral(dlqIDs)); err != nil {
 		return fmt.Errorf("failed to delete messages: %w", err)
 	}
 
@@ -838,14 +835,14 @@ func (pq *Queue) fetchBatchSubStates(
 		SELECT s.message_id, s.retry_count, m.payload, m.metadata
 		FROM %s s
 		JOIN %s m ON s.message_id = m.id
-		JOIN unnest($1::uuid[], $2::uuid[]) AS u(message_id, claim_id)
+		JOIN unnest($1::text::uuid[], $2::text::uuid[]) AS u(message_id, claim_id)
 		  ON s.message_id = u.message_id AND s.claim_id = u.claim_id
 		WHERE s.subscriber_id = $3
 		  AND s.status = '%s'
 		FOR UPDATE OF s
 	`, pq.subTable(tableName), pq.msgTable(tableName), MessageStatusProcessing)
 
-	ids, claims := receiptsToIDClaimSlices(receipts)
+	ids, claims := receiptsToIDClaimLiterals(receipts)
 	rows, err := tx.QueryContext(ctx, query, ids, claims, subscriberID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query subscriptions: %w", err)
@@ -944,13 +941,13 @@ func (pq *Queue) batchRetrySubscriptions(
 		    visibility_timeout = NULL,
 		    available_at = NOW() + make_interval(secs => u.delay),
 		    error_message = $4
-		FROM unnest($1::uuid[], $2::float8[]) AS u(message_id, delay)
+		FROM unnest($1::text::uuid[], $2::text::float8[]) AS u(message_id, delay)
 		WHERE s.message_id = u.message_id
 		  AND s.subscriber_id = $3
 	`, pq.subTable(tableName), MessageStatusPending)
 
 	_, err := tx.ExecContext(
-		ctx, query, uuidSliceToStringSlice(messageIDs), delaySeconds, subscriberID, errorMsg,
+		ctx, query, uuidArrayLiteral(messageIDs), float64ArrayLiteral(delaySeconds), subscriberID, errorMsg,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update subscriptions: %w", err)
@@ -1000,36 +997,12 @@ func (pq *Queue) batchMoveSubToDLQ(
 
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	deleteQuery := fmt.Sprintf(
-		`DELETE FROM %s WHERE message_id = ANY($1::uuid[]) AND subscriber_id = $2`,
+		`DELETE FROM %s WHERE message_id = ANY($1::text::uuid[]) AND subscriber_id = $2`,
 		pq.subTable(tableName),
 	)
-	if _, err := tx.ExecContext(ctx, deleteQuery, uuidSliceToStringSlice(dlqIDs), subscriberID); err != nil {
+	if _, err := tx.ExecContext(ctx, deleteQuery, uuidArrayLiteral(dlqIDs), subscriberID); err != nil {
 		return fmt.Errorf("failed to delete subscriptions: %w", err)
 	}
 
 	return nil
-}
-
-// uuidSliceToStringSlice converts UUIDs to a string slice for SQL array parameters.
-// This works with the pgx driver. If using lib/pq, use pq.Array() wrapper instead.
-func uuidSliceToStringSlice(ids []uuid.UUID) []string {
-	result := make([]string, len(ids))
-	for i, id := range ids {
-		result[i] = id.String()
-	}
-	return result
-}
-
-// receiptsToIDClaimSlices splits receipts into index-aligned message-ID and
-// claim-ID string slices, for use as the two PostgreSQL uuid[] parameters of an
-// unnest(...) join (pgx driver).
-func receiptsToIDClaimSlices(receipts []Receipt) ([]string, []string) {
-	ids := make([]string, len(receipts))
-	claims := make([]string, len(receipts))
-	for i, r := range receipts {
-		ids[i] = r.MessageID.String()
-		claims[i] = r.ClaimID.String()
-	}
-
-	return ids, claims
 }
