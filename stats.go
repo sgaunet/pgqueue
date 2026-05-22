@@ -445,11 +445,10 @@ func (pq *Queue) GetUnhealthySubscribers(
 		return nil, fmt.Errorf("failed to iterate topics: %w", err)
 	}
 
-	cutoff := time.Now().Add(-threshold)
 	var unhealthy []SubscriberHealth
 
 	for _, topic := range topics {
-		subs, err := pq.findUnhealthyForTopic(ctx, topic.queueName, topic.tableName, cutoff)
+		subs, err := pq.findUnhealthyForTopic(ctx, topic.queueName, topic.tableName, threshold)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check topic %s: %w", topic.queueName, err)
 		}
@@ -462,11 +461,11 @@ func (pq *Queue) GetUnhealthySubscribers(
 func (pq *Queue) findUnhealthyForTopic(
 	ctx context.Context,
 	topicName, tableName string,
-	cutoff time.Time,
+	threshold time.Duration,
 ) ([]SubscriberHealth, error) {
 	query := buildUnhealthySubscribersQuery(pq.subTable(tableName))
 
-	rows, err := pq.db.QueryContext(ctx, query, cutoff)
+	rows, err := pq.db.QueryContext(ctx, query, threshold.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("failed to query unhealthy subscribers: %w", err)
 	}
@@ -538,7 +537,8 @@ func buildUnhealthySubscribersQuery(subTable string) string {
 				AND visibility_timeout IS NOT NULL
 				AND visibility_timeout < NOW()
 			) > 0
-			OR MIN(created_at) FILTER (WHERE status = '%s') < $1
+			OR MIN(created_at) FILTER (WHERE status = '%s')
+				< NOW() - make_interval(secs => $1)
 	`, MessageStatusPending, MessageStatusProcessing, MessageStatusPending, subTable,
 		MessageStatusProcessing, MessageStatusPending)
 }
