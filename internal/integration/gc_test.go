@@ -1186,3 +1186,256 @@ func TestGarbageCollectorInertAfterClose(t *testing.T) {
 		t.Fatal("GC Stop hung: Start spawned a loop on a closed Queue")
 	}
 }
+
+// TestGarbageCollectorPaginatesRetentionPurges is the regression test for
+// issue #50: the four GC retention purges (purgeCompletedMessages,
+// purgeOldPendingMessages, purgeDLQMessages, reclaimOrphanTopicMessages) must
+// drain a backlog larger than one page rather than stopping after one
+// unbounded DELETE.
+//
+// Each sub-test seeds 1100 rows — strictly more than retentionPurgePageSize
+// (1000) — so a single-page implementation would leave a remainder. Rows are
+// seeded directly via SQL because the GC behaviour under test is pure DELETE:
+// going through the public publish/consume/ack API for 1100 messages × 6
+// sub-tests would add several seconds without exercising anything new.
+func TestGarbageCollectorPaginatesRetentionPurges(t *testing.T) {
+	const seedCount = 1100
+
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	t.Run("completed/channel", func(t *testing.T) {
+		const name = "gc-page-completed-ch"
+		if err := pq.CreateChannel(ctx, name); err != nil {
+			t.Fatalf("create channel: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+			INSERT INTO pgqueue_msg_gc_page_completed_ch (id, payload, status, processed_at)
+			SELECT uuidv7(), 'p'::bytea, 'completed', NOW() - INTERVAL '25 hours'
+			FROM generate_series(1, %d)
+		`, seedCount)); err != nil {
+			t.Fatalf("seed completed channel rows: %v", err)
+		}
+
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+			DefaultPolicy: pgqueue.RetentionPolicy{CompletedMessageTTL: time.Hour},
+		})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+
+		var remaining int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pgqueue_msg_gc_page_completed_ch").Scan(&remaining); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if remaining != 0 {
+			t.Errorf("expected all %d completed rows purged across pages, got %d remaining",
+				seedCount, remaining)
+		}
+	})
+
+	t.Run("completed/pubsub", func(t *testing.T) {
+		const name = "gc-page-completed-ps"
+		if err := pq.CreateTopic(ctx, name); err != nil {
+			t.Fatalf("create topic: %v", err)
+		}
+		// Seed messages and matching acked subscriptions. The purge predicate
+		// requires (no sub != acked) AND (no DLQ ref), so every sub row must be
+		// 'acked' for the message to be eligible.
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+			INSERT INTO pgqueue_msg_gc_page_completed_ps (id, payload, created_at)
+			SELECT uuidv7(), 'p'::bytea, NOW() - INTERVAL '25 hours'
+			FROM generate_series(1, %d)
+		`, seedCount)); err != nil {
+			t.Fatalf("seed pubsub messages: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO pgqueue_sub_gc_page_completed_ps (message_id, subscriber_id, status)
+			SELECT id, 'sub-1', 'acked' FROM pgqueue_msg_gc_page_completed_ps
+		`); err != nil {
+			t.Fatalf("seed pubsub subscriptions: %v", err)
+		}
+
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+			DefaultPolicy: pgqueue.RetentionPolicy{CompletedMessageTTL: time.Hour},
+		})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+
+		var remaining int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pgqueue_msg_gc_page_completed_ps").Scan(&remaining); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if remaining != 0 {
+			t.Errorf("expected all %d pubsub messages purged across pages, got %d remaining",
+				seedCount, remaining)
+		}
+	})
+
+	t.Run("pending/channel", func(t *testing.T) {
+		const name = "gc-page-pending-ch"
+		if err := pq.CreateChannel(ctx, name); err != nil {
+			t.Fatalf("create channel: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+			INSERT INTO pgqueue_msg_gc_page_pending_ch (id, payload, created_at)
+			SELECT uuidv7(), 'p'::bytea, NOW() - INTERVAL '2 hours'
+			FROM generate_series(1, %d)
+		`, seedCount)); err != nil {
+			t.Fatalf("seed pending channel rows: %v", err)
+		}
+
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+			DefaultPolicy: pgqueue.RetentionPolicy{MaxPendingAge: time.Hour},
+		})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+
+		var remaining int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pgqueue_msg_gc_page_pending_ch").Scan(&remaining); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if remaining != 0 {
+			t.Errorf("expected all %d pending channel rows purged across pages, got %d remaining",
+				seedCount, remaining)
+		}
+	})
+
+	t.Run("pending/pubsub", func(t *testing.T) {
+		const name = "gc-page-pending-ps"
+		if err := pq.CreateTopic(ctx, name); err != nil {
+			t.Fatalf("create topic: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+			INSERT INTO pgqueue_msg_gc_page_pending_ps (id, payload, created_at)
+			SELECT uuidv7(), 'p'::bytea, NOW() - INTERVAL '2 hours'
+			FROM generate_series(1, %d)
+		`, seedCount)); err != nil {
+			t.Fatalf("seed pubsub messages: %v", err)
+		}
+		// Two subscribers per message: sub-1 stale-pending (target of the
+		// purge), sub-2 already acked. The acked sub row keeps the message off
+		// the orphan-reclaim list within the same Collect() pass, so we can
+		// distinctly assert that the *pending* purge only touches its own
+		// rows — what the public doc on purgeOldPendingMessages promises.
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO pgqueue_sub_gc_page_pending_ps (message_id, subscriber_id, status)
+			SELECT id, 'sub-1', 'pending' FROM pgqueue_msg_gc_page_pending_ps
+		`); err != nil {
+			t.Fatalf("seed pending subs: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO pgqueue_sub_gc_page_pending_ps (message_id, subscriber_id, status)
+			SELECT id, 'sub-2', 'acked' FROM pgqueue_msg_gc_page_pending_ps
+		`); err != nil {
+			t.Fatalf("seed acked subs: %v", err)
+		}
+
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+			DefaultPolicy: pgqueue.RetentionPolicy{MaxPendingAge: time.Hour},
+		})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+
+		var pendingSubs, ackedSubs, msgRemaining int
+		if err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pgqueue_sub_gc_page_pending_ps WHERE status = 'pending'`,
+		).Scan(&pendingSubs); err != nil {
+			t.Fatalf("count pending subs: %v", err)
+		}
+		if err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pgqueue_sub_gc_page_pending_ps WHERE status = 'acked'`,
+		).Scan(&ackedSubs); err != nil {
+			t.Fatalf("count acked subs: %v", err)
+		}
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pgqueue_msg_gc_page_pending_ps").Scan(&msgRemaining); err != nil {
+			t.Fatalf("count messages: %v", err)
+		}
+		if pendingSubs != 0 {
+			t.Errorf("expected all %d pending pubsub subs purged across pages, got %d remaining",
+				seedCount, pendingSubs)
+		}
+		if ackedSubs != seedCount {
+			t.Errorf("expected %d acked subs untouched by pending purge, got %d",
+				seedCount, ackedSubs)
+		}
+		if msgRemaining != seedCount {
+			t.Errorf("expected message rows preserved by pending purge, got %d (want %d)",
+				msgRemaining, seedCount)
+		}
+	})
+
+	t.Run("dlq", func(t *testing.T) {
+		const name = "gc-page-dlq"
+		if err := pq.CreateChannel(ctx, name); err != nil {
+			t.Fatalf("create channel: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+			INSERT INTO pgqueue_dlq_gc_page_dlq
+				(original_message_id, payload, failure_reason, retry_count, moved_at)
+			SELECT uuidv7(), 'p'::bytea, 'test', 0, NOW() - INTERVAL '2 hours'
+			FROM generate_series(1, %d)
+		`, seedCount)); err != nil {
+			t.Fatalf("seed DLQ rows: %v", err)
+		}
+
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+			DefaultPolicy: pgqueue.RetentionPolicy{DLQRetention: time.Hour},
+		})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+
+		var remaining int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pgqueue_dlq_gc_page_dlq").Scan(&remaining); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if remaining != 0 {
+			t.Errorf("expected all %d DLQ rows purged across pages, got %d remaining",
+				seedCount, remaining)
+		}
+	})
+
+	t.Run("orphan", func(t *testing.T) {
+		const name = "gc-page-orphan"
+		if err := pq.CreateTopic(ctx, name); err != nil {
+			t.Fatalf("create topic: %v", err)
+		}
+		// No subscribers → no sub rows → every inserted message is an orphan.
+		// created_at is left fresh so purgeCompletedMessages (24h default TTL)
+		// does not also delete them; reclaimOrphanTopicMessages alone should
+		// drain the backlog.
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+			INSERT INTO pgqueue_msg_gc_page_orphan (id, payload)
+			SELECT uuidv7(), 'p'::bytea
+			FROM generate_series(1, %d)
+		`, seedCount)); err != nil {
+			t.Fatalf("seed orphan messages: %v", err)
+		}
+
+		// Default policy is fine: orphan reclaim runs regardless of policy.
+		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+		if err := gc.Collect(ctx); err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+
+		var remaining int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pgqueue_msg_gc_page_orphan").Scan(&remaining); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if remaining != 0 {
+			t.Errorf("expected all %d orphan messages reclaimed across pages, got %d remaining",
+				seedCount, remaining)
+		}
+	})
+}

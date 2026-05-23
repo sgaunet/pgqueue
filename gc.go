@@ -605,6 +605,48 @@ func scanExhaustedTopicSubscriptions(
 	return batch, nil
 }
 
+// retentionPurgePageSize bounds each retention DELETE to a small lock window
+// and WAL footprint (issue #50). The first GC pass after a retention policy is
+// finally enabled on a long-running queue with millions of expired rows would
+// otherwise issue one giant unbounded DELETE — long row-lock window, large WAL
+// spike, replication lag, risk of statement timeout. Paginating bounds those
+// costs per statement.
+//
+// Sized larger than promoteExhausted*PageSize because each page here is a
+// single DELETE statement (no per-row processing like the promote pages, which
+// also insert into the DLQ); the larger batch amortises round-trip overhead on
+// huge backlogs while still keeping each statement's lock window and WAL spike
+// bounded.
+const retentionPurgePageSize = 1000
+
+// runPagedPurge executes a paginated DELETE in a loop, breaking when a page
+// returns fewer than retentionPurgePageSize rows. The caller passes a
+// fully-formed query that uses LIMIT retentionPurgePageSize and FOR UPDATE …
+// SKIP LOCKED in its inner SELECT. PostgreSQL releases the subquery's row
+// locks at statement commit, so no surrounding transaction is required.
+// Returns the total rows deleted across all pages.
+func (gc *GarbageCollector) runPagedPurge(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (int64, error) {
+	var total int64
+	for {
+		result, err := gc.pq.db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return total, err //nolint:wrapcheck // caller wraps with operation context
+		}
+		n, _ := result.RowsAffected()
+		total += n
+		if n < int64(retentionPurgePageSize) {
+			return total, nil // backlog exhausted
+		}
+		if err := ctx.Err(); err != nil {
+			return total, fmt.Errorf("retention purge cancelled: %w", err)
+		}
+	}
+}
+
 // reclaimOrphanTopicMessages deletes pub/sub messages that can never be
 // delivered: a message published to a topic that had zero subscribers at
 // publish time gets no subscription rows (subscription rows are created
@@ -613,23 +655,40 @@ func scanExhaustedTopicSubscriptions(
 // Messages whose subscriptions were all moved to the DLQ are NOT orphans — the
 // DLQ entry still references the message for a possible replay — so the delete
 // also excludes any message referenced by a DLQ row (FR-027).
+//
+// Work is paginated (issue #50): each iteration deletes at most
+// retentionPurgePageSize rows by id, using FOR UPDATE OF m SKIP LOCKED in the
+// subquery so concurrent workers never block each other. PostgreSQL holds the
+// subquery's row locks only for the duration of the surrounding DELETE
+// statement, so no explicit transaction is required around each page.
 func (gc *GarbageCollector) reclaimOrphanTopicMessages(
 	ctx context.Context,
 	tableName string,
 ) error {
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		DELETE FROM %s m
-		WHERE NOT EXISTS (
-			SELECT 1 FROM %s s WHERE s.message_id = m.id
+		DELETE FROM %s
+		WHERE id IN (
+			SELECT m.id FROM %s m
+			WHERE NOT EXISTS (
+				SELECT 1 FROM %s s WHERE s.message_id = m.id
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM %s d WHERE d.original_message_id = m.id
+			)
+			ORDER BY m.id
+			LIMIT %d
+			FOR UPDATE OF m SKIP LOCKED
 		)
-		AND NOT EXISTS (
-			SELECT 1 FROM %s d WHERE d.original_message_id = m.id
-		)
-	`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), gc.pq.dlqTable(tableName))
+	`, gc.pq.msgTable(tableName), gc.pq.msgTable(tableName),
+		gc.pq.subTable(tableName), gc.pq.dlqTable(tableName),
+		retentionPurgePageSize)
 
-	if _, err := gc.pq.db.ExecContext(ctx, query); err != nil {
+	total, err := gc.runPagedPurge(ctx, query)
+	if err != nil {
 		return fmt.Errorf("failed to delete orphan topic messages: %w", err)
+	}
+	if total > 0 {
+		gc.pq.logInfo("reclaimed orphan topic messages", "count", total, "table", tableName)
 	}
 	return nil
 }
@@ -697,6 +756,11 @@ func (gc *GarbageCollector) getPolicy(queueName string) RetentionPolicy {
 	return gc.config.DefaultPolicy
 }
 
+// purgeCompletedMessages deletes messages older than ttl whose work is finished.
+//
+// Work is paginated (issue #50): each iteration deletes at most
+// retentionPurgePageSize rows by id, using FOR UPDATE SKIP LOCKED in the
+// subquery so concurrent GC workers never block each other.
 func (gc *GarbageCollector) purgeCompletedMessages(
 	ctx context.Context,
 	tableName string,
@@ -711,35 +775,46 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 		// only non-acked subscriber was dead-lettered would be purged here,
 		// silently orphaning its DLQ entry.
 		query = fmt.Sprintf(`
-			DELETE FROM %s m
-			WHERE m.created_at < NOW() - make_interval(secs => $1)
-			AND NOT EXISTS (
-				SELECT 1 FROM %s s
-				WHERE s.message_id = m.id AND s.status != '%s'
+			DELETE FROM %s
+			WHERE id IN (
+				SELECT m.id FROM %s m
+				WHERE m.created_at < NOW() - make_interval(secs => $1)
+				AND NOT EXISTS (
+					SELECT 1 FROM %s s
+					WHERE s.message_id = m.id AND s.status != '%s'
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM %s d WHERE d.original_message_id = m.id
+				)
+				ORDER BY m.id
+				LIMIT %d
+				FOR UPDATE OF m SKIP LOCKED
 			)
-			AND NOT EXISTS (
-				SELECT 1 FROM %s d WHERE d.original_message_id = m.id
-			)
-		`, gc.pq.msgTable(tableName), gc.pq.subTable(tableName), MessageStatusAcked,
-			gc.pq.dlqTable(tableName))
+		`, gc.pq.msgTable(tableName), gc.pq.msgTable(tableName),
+			gc.pq.subTable(tableName), MessageStatusAcked,
+			gc.pq.dlqTable(tableName), retentionPurgePageSize)
 	} else {
 		query = fmt.Sprintf(`
 			DELETE FROM %s
-			WHERE status = '%s'
-			AND processed_at < NOW() - make_interval(secs => $1)
-		`, gc.pq.msgTable(tableName), MessageStatusCompleted)
+			WHERE id IN (
+				SELECT id FROM %s
+				WHERE status = '%s'
+				AND processed_at < NOW() - make_interval(secs => $1)
+				ORDER BY id
+				LIMIT %d
+				FOR UPDATE SKIP LOCKED
+			)
+		`, gc.pq.msgTable(tableName), gc.pq.msgTable(tableName),
+			MessageStatusCompleted, retentionPurgePageSize)
 	}
 
-	result, err := gc.pq.db.ExecContext(ctx, query, ttl.Seconds())
+	total, err := gc.runPagedPurge(ctx, query, ttl.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to purge completed messages: %w", err)
 	}
-
-	rows, _ := result.RowsAffected()
-	if rows > 0 {
-		gc.pq.logInfo("purged completed messages", "count", rows, "table", tableName)
+	if total > 0 {
+		gc.pq.logInfo("purged completed messages", "count", total, "table", tableName)
 	}
-
 	return nil
 }
 
@@ -756,6 +831,11 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 // (once every subscription is gone) or purgeCompletedMessages (once the rest are
 // acked) to remove, so no DLQ guard is needed here: a subscription moved to the
 // DLQ no longer has a row in the subscription table.
+// Work is paginated (issue #50): each iteration deletes at most
+// retentionPurgePageSize rows by id, using FOR UPDATE [OF s] SKIP LOCKED in the
+// subquery so concurrent workers never block each other. The pub/sub branch
+// paginates on the subscription-row id, the channel branch on the message-row
+// id.
 func (gc *GarbageCollector) purgeOldPendingMessages(
 	ctx context.Context,
 	tableName string,
@@ -768,55 +848,73 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 		// for its publish-time cutoff. The message row and every other
 		// subscriber's rows are deliberately left in place.
 		query = fmt.Sprintf(`
-			DELETE FROM %s s
-			USING %s m
-			WHERE s.message_id = m.id
-			AND s.status = '%s'
-			AND m.created_at < NOW() - make_interval(secs => $1)
-		`, gc.pq.subTable(tableName), gc.pq.msgTable(tableName), MessageStatusPending)
+			DELETE FROM %s
+			WHERE id IN (
+				SELECT s.id FROM %s s
+				JOIN %s m ON s.message_id = m.id
+				WHERE s.status = '%s'
+				AND m.created_at < NOW() - make_interval(secs => $1)
+				ORDER BY s.id
+				LIMIT %d
+				FOR UPDATE OF s SKIP LOCKED
+			)
+		`, gc.pq.subTable(tableName), gc.pq.subTable(tableName),
+			gc.pq.msgTable(tableName), MessageStatusPending,
+			retentionPurgePageSize)
 	} else {
 		query = fmt.Sprintf(`
 			DELETE FROM %s
-			WHERE status = '%s'
-			AND created_at < NOW() - make_interval(secs => $1)
-		`, gc.pq.msgTable(tableName), MessageStatusPending)
+			WHERE id IN (
+				SELECT id FROM %s
+				WHERE status = '%s'
+				AND created_at < NOW() - make_interval(secs => $1)
+				ORDER BY id
+				LIMIT %d
+				FOR UPDATE SKIP LOCKED
+			)
+		`, gc.pq.msgTable(tableName), gc.pq.msgTable(tableName),
+			MessageStatusPending, retentionPurgePageSize)
 	}
 
-	result, err := gc.pq.db.ExecContext(ctx, query, maxAge.Seconds())
+	total, err := gc.runPagedPurge(ctx, query, maxAge.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to purge old pending messages: %w", err)
 	}
-
-	rows, _ := result.RowsAffected()
-	if rows > 0 {
-		gc.pq.logInfo("purged old pending messages", "count", rows, "table", tableName)
+	if total > 0 {
+		gc.pq.logInfo("purged old pending messages", "count", total, "table", tableName)
 	}
-
 	return nil
 }
 
 // purgeDLQMessages deletes DLQ messages older than retention period.
+//
+// Work is paginated (issue #50): each iteration deletes at most
+// retentionPurgePageSize rows by id, using FOR UPDATE SKIP LOCKED in the
+// subquery so concurrent workers never block each other.
 func (gc *GarbageCollector) purgeDLQMessages(
 	ctx context.Context,
 	tableName string,
 	retention time.Duration,
 ) error {
-	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		DELETE FROM %s
-		WHERE moved_at < NOW() - make_interval(secs => $1)
-	`, gc.pq.dlqTable(tableName))
+		WHERE id IN (
+			SELECT id FROM %s
+			WHERE moved_at < NOW() - make_interval(secs => $1)
+			ORDER BY id
+			LIMIT %d
+			FOR UPDATE SKIP LOCKED
+		)
+	`, gc.pq.dlqTable(tableName), gc.pq.dlqTable(tableName),
+		retentionPurgePageSize)
 
-	result, err := gc.pq.db.ExecContext(ctx, query, retention.Seconds())
+	total, err := gc.runPagedPurge(ctx, query, retention.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to purge DLQ messages: %w", err)
 	}
-
-	rows, _ := result.RowsAffected()
-	if rows > 0 {
-		gc.pq.logInfo("purged DLQ messages", "count", rows, "table", tableName)
+	if total > 0 {
+		gc.pq.logInfo("purged DLQ messages", "count", total, "table", tableName)
 	}
-
 	return nil
 }
 
