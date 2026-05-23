@@ -139,6 +139,7 @@ type Listener struct {
 	conn      *pgx.Conn
 	channels  map[string]bool // every channel to (re-)LISTEN on
 	pending   []string        // LISTEN requests not yet issued
+	unpending []string        // UNLISTEN requests not yet issued (#52)
 	closed    bool
 	done      chan struct{}
 	closeOnce sync.Once
@@ -151,8 +152,13 @@ type Listener struct {
 	interruptPending bool               // a LISTEN/Close arrived with no active wait
 }
 
-// compile-time check: *Listener satisfies the pgqueue.Listener hook interface.
-var _ pgqueue.Listener = (*Listener)(nil)
+// compile-time check: *Listener satisfies the pgqueue.Listener hook interface,
+// and also the optional Unlistener capability so queue deletions release the
+// LISTEN registration on the backend session (#52).
+var (
+	_ pgqueue.Listener   = (*Listener)(nil)
+	_ pgqueue.Unlistener = (*Listener)(nil)
+)
 
 // New opens a dedicated connection for LISTEN/NOTIFY and starts the receive
 // loop. connString is a standard PostgreSQL connection string (the same form
@@ -197,6 +203,30 @@ func (l *Listener) Listen(_ context.Context, channel string) error {
 	l.mu.Unlock()
 
 	// Break the in-progress wait so the run loop drains the request promptly.
+	l.requestInterrupt()
+	return nil
+}
+
+// Unlisten removes a channel from the LISTEN set so subsequent reconnects do
+// not re-issue it, and asynchronously UNLISTENs it on the active connection
+// to release the server-side registration. It is the inverse of Listen and is
+// idempotent: unknown channels are a no-op. Called from pgqueue's queue-delete
+// path so a process that churns queues does not leak LISTENs (#52).
+func (l *Listener) Unlisten(_ context.Context, channel string) error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return errListenerClosed
+	}
+	if !l.channels[channel] {
+		l.mu.Unlock()
+		return nil
+	}
+	delete(l.channels, channel)
+	l.unpending = append(l.unpending, channel)
+	l.mu.Unlock()
+
+	// Break the in-progress wait so the run loop drains the UNLISTEN promptly.
 	l.requestInterrupt()
 	return nil
 }
@@ -339,21 +369,34 @@ func (l *Listener) keepaliveProbe() bool {
 	return true
 }
 
-// drainPending issues every queued LISTEN statement.
+// drainPending issues every queued LISTEN and UNLISTEN statement.
 func (l *Listener) drainPending() error {
 	l.mu.Lock()
 	pending := l.pending
 	l.pending = nil
+	unpending := l.unpending
+	l.unpending = nil
 	conn := l.conn
 	l.mu.Unlock()
 
-	for _, ch := range pending {
+	for i, ch := range pending {
 		// LISTEN takes no parameters; the channel name is a validated pgqueue
 		// identifier, quoted so it is matched verbatim against pg_notify.
 		if _, err := conn.Exec(context.Background(), `LISTEN "`+ch+`"`); err != nil {
-			// Re-queue the unissued channels so a reconnect retries them.
-			l.requeue(pending)
+			// Re-queue the unissued channels so a reconnect retries them. The
+			// already-issued ones are skipped; reconnect rebuilds them from
+			// the channels map anyway.
+			l.requeue(pending[i:])
 			return fmt.Errorf("pglisten: LISTEN %q: %w", ch, err)
+		}
+	}
+	for _, ch := range unpending {
+		// UNLISTEN is best-effort: a failure here just means a stale
+		// server-side registration. The channel is already gone from the
+		// channels map, so reconnect will not re-LISTEN it; and the next
+		// reconnect brings a fresh session with no residue regardless.
+		if _, err := conn.Exec(context.Background(), `UNLISTEN "`+ch+`"`); err != nil {
+			l.logWarn("pglisten: UNLISTEN failed", "channel", ch, "error", err)
 		}
 	}
 	return nil
@@ -386,8 +429,11 @@ func (l *Listener) reconnect() bool {
 		}
 		l.mu.Lock()
 		l.conn = conn
-		// Re-LISTEN every channel ever requested.
+		// Re-LISTEN every channel still in the active set; any queued
+		// UNLISTENs are dropped because the fresh session has no
+		// LISTENs to unwind (#52).
 		l.pending = l.pending[:0]
+		l.unpending = nil
 		for ch := range l.channels {
 			l.pending = append(l.pending, ch)
 		}

@@ -839,8 +839,9 @@ func (pq *Queue) deleteQueue(
 
 	// Drop the push-delivery waker for the deleted queue so the notifier's
 	// waker map does not accumulate entries for queues that no longer exist.
+	// forget also best-effort UNLISTENs on the underlying Listener (#52).
 	if pq.notifier != nil {
-		pq.notifier.forget(notifyChannelName(metadata.TableName))
+		pq.notifier.forget(ctx, notifyChannelName(metadata.TableName))
 	}
 
 	return nil

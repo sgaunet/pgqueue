@@ -57,6 +57,16 @@ type Listener interface {
 	Close() error
 }
 
+// Unlistener is an optional capability that a Listener may implement. When a
+// queue is deleted the notifier calls Unlisten so the implementation can drop
+// its per-channel bookkeeping and issue UNLISTEN on the server, keeping a
+// process that churns queues from accumulating residue (#52). Implementations
+// that omit it are unaffected — the leak is bounded by channels-ever-consumed
+// and the safety-net poll still covers correctness.
+type Unlistener interface {
+	Unlisten(ctx context.Context, channel string) error
+}
+
 // waker is a one-to-many wake-up primitive: any number of consume loops select
 // on wait(); signal() releases all of them and arms a fresh generation.
 type waker struct {
@@ -150,19 +160,29 @@ func (n *notifier) wakeChan(ctx context.Context, notifyChannel string) <-chan st
 
 // forget drops the waker and LISTEN bookkeeping for a notify channel whose
 // queue has been deleted, so the wakers map does not grow without bound as
-// queues are created and destroyed over a long-lived process.
-//
-// The underlying Listener keeps its own LISTEN registration for the channel —
-// the Listener interface has no Unlisten — but that residue is a single small
-// string per queue ever consumed and is out of scope here. A consumer still
-// blocked on the just-deleted queue stops receiving NOTIFY wakeups; that is
-// acceptable, since deleting a queue with a live consumer is a caller error
-// and the safety-net poll surfaces the dropped table on its next tick.
-func (n *notifier) forget(notifyChannel string) {
+// queues are created and destroyed over a long-lived process. When the
+// underlying Listener implements Unlistener, forget also asks it to release
+// its own registration so the pgqueue.Listener implementation does not
+// accumulate residue either (#52). The Unlisten call is best-effort: an
+// error is silenced and the local bookkeeping is dropped regardless, since
+// the safety-net poll covers any wakeup we miss. A consumer still blocked on
+// the just-deleted queue stops receiving NOTIFY wakeups; that is acceptable,
+// since deleting a queue with a live consumer is a caller error and the
+// safety-net poll surfaces the dropped table on its next tick.
+func (n *notifier) forget(ctx context.Context, notifyChannel string) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	delete(n.wakers, notifyChannel)
 	delete(n.listening, notifyChannel)
+	closed := n.closed
+	listener := n.listener
+	n.mu.Unlock()
+
+	if closed {
+		return
+	}
+	if u, ok := listener.(Unlistener); ok {
+		_ = u.Unlisten(ctx, notifyChannel)
+	}
 }
 
 // pump fans the Listener's notification stream out to the per-channel wakers.

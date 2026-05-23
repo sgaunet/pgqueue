@@ -2,6 +2,7 @@ package pglisten
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -120,6 +121,85 @@ func TestKeepaliveProbeLogsAtWarnOnFailure(t *testing.T) {
 	}
 	if !strings.Contains(out, "keepalive probe failed") {
 		t.Errorf("keepalive probe log missing expected message: %q", out)
+	}
+}
+
+// newListenerForUnlistenTest builds a Listener wired enough for the Unlisten
+// state-machine tests: a non-nil channels map, a done channel so requestInterrupt
+// is safe, and pre-populated entries.
+func newListenerForUnlistenTest(channels ...string) *Listener {
+	l := &Listener{
+		channels: make(map[string]bool, len(channels)),
+		done:     make(chan struct{}),
+	}
+	for _, ch := range channels {
+		l.channels[ch] = true
+	}
+	return l
+}
+
+// TestUnlistenRemovesChannelFromReconnectSet verifies that Unlisten removes the
+// channel from the LISTEN set (so reconnect does not re-issue it) and queues an
+// UNLISTEN for the run loop to drain (#52).
+func TestUnlistenRemovesChannelFromReconnectSet(t *testing.T) {
+	l := newListenerForUnlistenTest("a", "b")
+
+	if err := l.Unlisten(context.Background(), "a"); err != nil {
+		t.Fatalf("Unlisten(a) returned error: %v", err)
+	}
+
+	l.mu.Lock()
+	_, stillListed := l.channels["a"]
+	bStillListed := l.channels["b"]
+	unpending := append([]string(nil), l.unpending...)
+	l.mu.Unlock()
+
+	if stillListed {
+		t.Error(`channels["a"] still present after Unlisten`)
+	}
+	if !bStillListed {
+		t.Error(`channels["b"] dropped by Unlisten("a")`)
+	}
+	if len(unpending) != 1 || unpending[0] != "a" {
+		t.Errorf("unpending = %v, want [a]", unpending)
+	}
+}
+
+// TestUnlistenIsIdempotent verifies Unlisten on a channel that was never
+// registered (or already unlistened) is a no-op and returns nil (#52).
+func TestUnlistenIsIdempotent(t *testing.T) {
+	l := newListenerForUnlistenTest("a")
+
+	// First call removes "a"; second is a no-op.
+	if err := l.Unlisten(context.Background(), "a"); err != nil {
+		t.Fatalf("Unlisten(a) first call: %v", err)
+	}
+	if err := l.Unlisten(context.Background(), "a"); err != nil {
+		t.Fatalf("Unlisten(a) second call: %v", err)
+	}
+	// Unknown channel — also a no-op.
+	if err := l.Unlisten(context.Background(), "never"); err != nil {
+		t.Fatalf("Unlisten(never) returned error: %v", err)
+	}
+
+	l.mu.Lock()
+	unpendingLen := len(l.unpending)
+	l.mu.Unlock()
+	if unpendingLen != 1 {
+		t.Errorf("unpending length = %d, want 1 (only the first Unlisten queues work)", unpendingLen)
+	}
+}
+
+// TestUnlistenAfterCloseReturnsErrListenerClosed mirrors Listen's closed-state
+// behavior so callers see a consistent shutdown signal (#52).
+func TestUnlistenAfterCloseReturnsErrListenerClosed(t *testing.T) {
+	l := newListenerForUnlistenTest("a")
+	l.mu.Lock()
+	l.closed = true
+	l.mu.Unlock()
+
+	if err := l.Unlisten(context.Background(), "a"); !errors.Is(err, errListenerClosed) {
+		t.Errorf("Unlisten after close: got %v, want errListenerClosed", err)
 	}
 }
 

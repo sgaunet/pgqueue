@@ -342,3 +342,75 @@ func TestWakeChanConcurrent(t *testing.T) {
 		t.Errorf("second Close() should be a no-op, got: %v", err)
 	}
 }
+
+// TestPglistenUnlistenReleasesBackendRegistration is the #52 regression guard:
+// pglisten.Listener.Unlisten must release the backend session's LISTEN, not
+// just drop local bookkeeping. We verify by NOTIFYing from a separate session
+// before and after the Unlisten — pre-Unlisten the listener receives it,
+// post-Unlisten it does not (the backend session no longer subscribes).
+//
+// The test talks to *pglisten.Listener directly (no pgqueue.Queue, no
+// notifier) so listener.Notifications() is not raced by the notifier pump.
+// The pgqueue-side wiring (DeleteChannel -> notifier.forget -> Unlistener)
+// is covered structurally by the compile-time Unlistener interface and the
+// targeted unit tests in pglisten/listener_test.go.
+func TestPglistenUnlistenReleasesBackendRegistration(t *testing.T) {
+	db, connStr, cleanup := setupNotifyTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	listener, err := pglisten.New(ctx, connStr)
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	const ch = "unlisten_direct"
+	if err := listener.Listen(ctx, ch); err != nil {
+		t.Fatalf("Listen(%q): %v", ch, err)
+	}
+	// Let the run loop drain the LISTEN onto the backend session.
+	time.Sleep(200 * time.Millisecond)
+
+	// Pre-Unlisten: a NOTIFY from the main connection reaches the listener.
+	if _, err := db.ExecContext(ctx, `SELECT pg_notify($1, '')`, ch); err != nil {
+		t.Fatalf("pg_notify (pre-Unlisten): %v", err)
+	}
+	select {
+	case got := <-listener.Notifications():
+		if got != ch {
+			t.Fatalf("pre-Unlisten notification on wrong channel: got %q, want %q", got, ch)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-Unlisten: listener never received NOTIFY; LISTEN was not issued")
+	}
+
+	// Issue Unlisten and let the UNLISTEN drain on the run loop.
+	if err := listener.Unlisten(ctx, ch); err != nil {
+		t.Fatalf("Unlisten(%q): %v", ch, err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	// Drain any stray in-flight notifications scheduled before UNLISTEN.
+	drainDeadline := time.After(200 * time.Millisecond)
+drain:
+	for {
+		select {
+		case <-listener.Notifications():
+		case <-drainDeadline:
+			break drain
+		}
+	}
+
+	// Post-Unlisten: a NOTIFY must NOT reach the listener — the backend
+	// session has released its registration (#52).
+	if _, err := db.ExecContext(ctx, `SELECT pg_notify($1, '')`, ch); err != nil {
+		t.Fatalf("pg_notify (post-Unlisten): %v", err)
+	}
+	select {
+	case got := <-listener.Notifications():
+		t.Fatalf("post-Unlisten: unexpected NOTIFY received on %q; UNLISTEN did not take effect", got)
+	case <-time.After(1 * time.Second):
+		// Expected: no notification — the LISTEN was actually released.
+	}
+}
