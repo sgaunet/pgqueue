@@ -120,6 +120,79 @@ func TestNotifyIdleConsumerWakesUnderOneSecond(t *testing.T) {
 	}
 }
 
+// TestNotifyKeepalivePreservesPushDelivery is the regression guard for #49:
+// a short keepalive interval forces the listener to probe the connection with
+// Ping mid-wait. This test proves the keepalive does not corrupt the
+// connection, eat a notification, or delay push delivery on a live link.
+//
+// A deterministic "silent TCP death" test would require socket-layer fault
+// injection (toxiproxy, iptables DROP, SIGSTOP on Postgres) and is out of
+// scope here.
+func TestNotifyKeepalivePreservesPushDelivery(t *testing.T) {
+	db, connStr, cleanup := setupNotifyTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("failed to initialize schema: %v", err)
+	}
+
+	// 500ms keepalive => roughly 4 Ping ticks during the 2s idle window
+	// below. If any Ping corrupts the connection or swallows the
+	// notification, the delivery assertion fails.
+	listener, err := pglisten.New(ctx, connStr,
+		pglisten.WithKeepaliveInterval(500*time.Millisecond))
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithListener(listener),
+		// 60s safety-net poll: sub-second delivery can only come from NOTIFY.
+		pgqueue.WithSafetyNetPoll(60*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("failed to init pgqueue: %v", err)
+	}
+	defer func() { _ = pq.Close() }()
+
+	const channelName = "notify-keepalive"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	received := make(chan time.Time, 1)
+	consumeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		_ = pq.ConsumeChannel(consumeCtx, channelName,
+			func(_ context.Context, _ *pgqueue.Message) error {
+				received <- time.Now()
+				return nil
+			})
+	}()
+
+	// Let the consumer attach and let several keepalive ticks fire while
+	// the connection is idle.
+	time.Sleep(2 * time.Second)
+
+	publishedAt := time.Now()
+	if _, err := pq.PublishChannel(ctx, channelName, []byte("wake up")); err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	select {
+	case at := <-received:
+		latency := at.Sub(publishedAt)
+		if latency > 1*time.Second {
+			t.Fatalf("delivery latency %v exceeds 1s; keepalive may have broken push delivery", latency)
+		}
+		t.Logf("push delivery latency under keepalive: %v", latency)
+	case <-time.After(5 * time.Second):
+		t.Fatal("message was not delivered within 5s")
+	}
+}
+
 // TestNotifySafetyNetPollDeliversMissedMessage verifies that a message whose
 // NOTIFY was never observed by the listener (it was published before the
 // listener subscribed) is still delivered by the bounded safety-net poll.

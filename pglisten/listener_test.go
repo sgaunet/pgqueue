@@ -2,6 +2,7 @@ package pglisten
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -69,6 +70,56 @@ func TestReconnectPolicyNormalized(t *testing.T) {
 	// A multiplier below 1 is invalid and must fall back to the default.
 	if got := (ReconnectPolicy{Multiplier: 0.5}).normalized(); got.Multiplier < 1 {
 		t.Errorf("Multiplier %v not corrected to >= 1", got.Multiplier)
+	}
+}
+
+// TestKeepaliveIntervalNormalized confirms a zero or negative interval is
+// replaced by the default; a positive value is preserved verbatim (#49).
+func TestKeepaliveIntervalNormalized(t *testing.T) {
+	if got := normalizeKeepaliveInterval(0); got != defaultKeepaliveInterval {
+		t.Errorf("zero: got %v, want default %v", got, defaultKeepaliveInterval)
+	}
+	if got := normalizeKeepaliveInterval(-5 * time.Second); got != defaultKeepaliveInterval {
+		t.Errorf("negative: got %v, want default %v", got, defaultKeepaliveInterval)
+	}
+	if got := normalizeKeepaliveInterval(2 * time.Second); got != 2*time.Second {
+		t.Errorf("custom: got %v, want %v", got, 2*time.Second)
+	}
+}
+
+// TestWithKeepaliveIntervalOption checks the option wires through to the
+// Listener field and normalizes a zero value to the default (#49).
+func TestWithKeepaliveIntervalOption(t *testing.T) {
+	l := &Listener{}
+	WithKeepaliveInterval(2 * time.Second)(l)
+	if l.keepaliveInterval != 2*time.Second {
+		t.Errorf("keepaliveInterval = %v, want %v", l.keepaliveInterval, 2*time.Second)
+	}
+	l2 := &Listener{}
+	WithKeepaliveInterval(0)(l2)
+	if l2.keepaliveInterval != defaultKeepaliveInterval {
+		t.Errorf("zero via option: got %v, want default %v", l2.keepaliveInterval, defaultKeepaliveInterval)
+	}
+}
+
+// TestKeepaliveProbeLogsAtWarnOnFailure asserts the keepalive-probe failure
+// log goes out at WARN level via the shared logWarn helper (#49). We cannot
+// drive a real Ping failure here without a DB; this mirrors the shape check
+// done in TestReconnectLogsAtWarn.
+func TestKeepaliveProbeLogsAtWarnOnFailure(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	l := &Listener{logger: logger}
+
+	l.logWarn("pglisten: keepalive probe failed; reconnecting",
+		"interval", 30*time.Second, "error", errors.New("boom"))
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("keepalive probe log not at WARN level: %q", out)
+	}
+	if !strings.Contains(out, "keepalive probe failed") {
+		t.Errorf("keepalive probe log missing expected message: %q", out)
 	}
 }
 

@@ -35,6 +35,17 @@ const (
 	maxReconnectBackoffSteps = 32
 )
 
+// Default keepalive/liveness-probe parameters for the LISTEN connection (#49).
+// keepaliveInterval bounds how long WaitForNotification may block so a
+// silently-dead TCP connection (NAT idle drop, firewall close with no RST,
+// hung backend) is detected within the interval instead of the OS-level
+// ~2h TCP timeout. pingTimeout caps the probe itself so it cannot inherit
+// the very hang it is meant to detect.
+const (
+	defaultKeepaliveInterval = 30 * time.Second
+	defaultPingTimeout       = 5 * time.Second
+)
+
 // notifyBuffer sizes the buffered notifications channel. A slow consumer cannot
 // stall the receive loop until this many notifications are outstanding.
 const notifyBuffer = 64
@@ -50,6 +61,16 @@ type ReconnectPolicy struct {
 	MaxDelay time.Duration
 	// Multiplier grows the window each attempt; clamped to >= 1 (default 2).
 	Multiplier float64
+}
+
+// normalizeKeepaliveInterval applies the default to a zero or negative
+// interval. There is no escape hatch to disable the keepalive: disabling
+// reintroduces the silent-TCP-death bug this guards against (#49).
+func normalizeKeepaliveInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultKeepaliveInterval
+	}
+	return d
 }
 
 // normalized returns a copy of p with any zero or invalid field replaced by
@@ -85,6 +106,20 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(l *Listener) { l.logger = logger }
 }
 
+// WithKeepaliveInterval bounds how long the Listener blocks on
+// WaitForNotification before probing the underlying connection with Ping.
+// Detects a silently-dead TCP connection (NAT or firewall idle drop, a
+// half-open socket with no RST, a hung PG backend) within the chosen
+// interval instead of waiting on the OS-level ~2h TCP timeout. A failed
+// probe triggers the normal reconnect flow.
+//
+// Zero or negative values fall back to the 30s default. The keepalive
+// cannot be disabled — disabling reintroduces the bug it guards against.
+// See https://github.com/sgaunet/pgqueue/issues/49.
+func WithKeepaliveInterval(d time.Duration) Option {
+	return func(l *Listener) { l.keepaliveInterval = normalizeKeepaliveInterval(d) }
+}
+
 // errListenerClosed is returned by Listen after the Listener has been closed.
 var errListenerClosed = errors.New("pglisten: listener is closed")
 
@@ -96,8 +131,9 @@ type Listener struct {
 	connString string
 	notifs     chan string
 
-	reconnectPolicy ReconnectPolicy
-	logger          *slog.Logger
+	reconnectPolicy   ReconnectPolicy
+	logger            *slog.Logger
+	keepaliveInterval time.Duration
 
 	mu        sync.Mutex
 	conn      *pgx.Conn
@@ -128,12 +164,13 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 		return nil, fmt.Errorf("pglisten: connect: %w", err)
 	}
 	l := &Listener{
-		connString:      connString,
-		notifs:          make(chan string, notifyBuffer),
-		conn:            conn,
-		channels:        make(map[string]bool),
-		done:            make(chan struct{}),
-		reconnectPolicy: ReconnectPolicy{}.normalized(),
+		connString:        connString,
+		notifs:            make(chan string, notifyBuffer),
+		conn:              conn,
+		channels:          make(map[string]bool),
+		done:              make(chan struct{}),
+		reconnectPolicy:   ReconnectPolicy{}.normalized(),
+		keepaliveInterval: defaultKeepaliveInterval,
 	}
 	for _, o := range opts {
 		o(l)
@@ -229,8 +266,10 @@ func (l *Listener) run() {
 // reconnect; an interrupt (a new LISTEN request, or Close) just returns true so
 // the run loop re-checks its state.
 //
-// The in-progress wait is cancelled by requestInterrupt invoking the stored
-// waitCancel directly — no per-notification canceller goroutine.
+// The wait is bounded by the keepalive interval (#49): when the deadline
+// fires we probe the connection with Ping to distinguish "live but idle"
+// from "silently dead". The in-progress wait is also cancelled directly by
+// requestInterrupt invoking the stored waitCancel.
 func (l *Listener) receiveOne() bool {
 	l.waitMu.Lock()
 	if l.interruptPending {
@@ -240,7 +279,8 @@ func (l *Listener) receiveOne() bool {
 		l.waitMu.Unlock()
 		return true
 	}
-	waitCtx, cancel := context.WithCancel(context.Background())
+	interval := normalizeKeepaliveInterval(l.keepaliveInterval)
+	waitCtx, cancel := context.WithTimeout(context.Background(), interval)
 	l.waitCancel = cancel
 	l.waitMu.Unlock()
 
@@ -248,6 +288,7 @@ func (l *Listener) receiveOne() bool {
 
 	l.waitMu.Lock()
 	l.waitCancel = nil
+	interrupted := l.interruptPending
 	l.waitMu.Unlock()
 	cancel()
 
@@ -255,18 +296,45 @@ func (l *Listener) receiveOne() bool {
 		return false
 	}
 	if err != nil {
-		// A cancelled wait context means an interrupt (expected: a new LISTEN
-		// arrived); any other error is a genuine connection failure.
-		if waitCtx.Err() != nil {
+		// Three branches keyed on the wait-context error:
+		//   - Canceled         => requestInterrupt() fired (LISTEN/Close).
+		//   - DeadlineExceeded => keepalive tick — probe the connection.
+		//   - nil              => genuine connection error — reconnect.
+		// The `interrupted` snapshot covers the benign race where the
+		// deadline and requestInterrupt fire in the same instant: if an
+		// interrupt is pending we honor it instead of running a Ping the
+		// next receiveOne would just retry anyway.
+		switch {
+		case interrupted, errors.Is(waitCtx.Err(), context.Canceled):
 			return true
+		case errors.Is(waitCtx.Err(), context.DeadlineExceeded):
+			return l.keepaliveProbe()
+		default:
+			return l.reconnect()
 		}
-		return l.reconnect()
 	}
 
 	select {
 	case l.notifs <- n.Channel:
 	case <-l.done:
 		return false
+	}
+	return true
+}
+
+// keepaliveProbe runs a short-bounded Ping on the listener's connection to
+// distinguish "live but idle" from "silently dead". Safe to call here
+// because the run goroutine has sole ownership of the connection and
+// WaitForNotification has already returned; pgx leaves the connection
+// usable for subsequent calls after a deadline-cancelled wait.
+func (l *Listener) keepaliveProbe() bool {
+	pingCtx, cancel := context.WithTimeout(context.Background(), defaultPingTimeout)
+	defer cancel()
+	if err := l.currentConn().Ping(pingCtx); err != nil {
+		l.logWarn("pglisten: keepalive probe failed; reconnecting",
+			"interval", normalizeKeepaliveInterval(l.keepaliveInterval),
+			"error", err)
+		return l.reconnect()
 	}
 	return true
 }
