@@ -3,8 +3,15 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
+
+// errMalformedMigrations is the sentinel wrapped by every validateMigrations
+// failure. It is never surfaced to callers — init panics on it — but having a
+// static error keeps the wrapped-error linters satisfied and lets tests assert
+// the failure with errors.Is.
+var errMalformedMigrations = errors.New("malformed migrations slice")
 
 // SchemaVersion is the latest schema version this build of pgqueue knows how to
 // produce. InitSchema migrates a database up to this version automatically.
@@ -33,7 +40,26 @@ CREATE TABLE IF NOT EXISTS pgqueue_schema_version (
 
 // migration is a single, ordered, forward-only schema change.
 //
-// apply receives the transaction in which the migration runs.
+// A migration has two optional phases; at least one must be set:
+//
+//   - applyNonTx runs first, on the dedicated migration *sql.Conn, OUTSIDE any
+//     transaction. It exists for statements PostgreSQL forbids inside a
+//     transaction block — chiefly CREATE INDEX CONCURRENTLY, which lets an
+//     upgrade build an index without locking a large per-queue table against
+//     writes. It is the right home for any DDL whose plain (transactional) form
+//     would cause a publish outage on a populated database.
+//   - apply runs second, inside the transaction that also records the version
+//     row, so the apply work and the pgqueue_schema_version insert commit
+//     atomically.
+//
+// CRASH SAFETY — applyNonTx runs before the version row is committed, so a
+// crash between the two re-runs applyNonTx on the next InitSchema. applyNonTx
+// therefore MUST be idempotent and cannot be rolled back; keep every statement
+// individually safe to repeat. Use CREATE INDEX CONCURRENTLY IF NOT EXISTS.
+// Footgun: an interrupted CREATE INDEX CONCURRENTLY leaves an *invalid* index
+// that IF NOT EXISTS then silently skips forever — a robust concurrent
+// migration drops an invalid leftover first (e.g. DROP INDEX CONCURRENTLY IF
+// EXISTS, or detect invalidity via pg_index.indisvalid) before recreating it.
 //
 // IMPORTANT — per-queue tables are NOT covered by baseSchemaSQL. baseSchemaSQL
 // (and therefore the v1 migration) creates only the four global tables. The
@@ -42,18 +68,25 @@ CREATE TABLE IF NOT EXISTS pgqueue_schema_version (
 // current column shape. Consequently, any migration that adds or alters a
 // column on a per-queue table MUST patch the already-existing per-queue tables
 // itself — newly created queues are fine, but pre-existing ones are not
-// touched by anything else. Because apply has a full *sql.Tx it can do this by
-// discovering the live tables from pgqueue_metadata, e.g.:
+// touched by anything else. Both phases can discover the live tables from
+// pgqueue_metadata via listQueueTableNames, e.g.:
 //
-//	rows, _ := tx.QueryContext(ctx, `SELECT queue_type, table_name FROM pgqueue_metadata`)
-//	// ... for each row, ALTER TABLE pgqueue_msg_<table_name> ADD COLUMN ...
+//	for _, t := range tableNames {
+//		// apply:      ALTER TABLE pgqueue_msg_<t> ADD COLUMN ...
+//		// applyNonTx: CREATE INDEX CONCURRENTLY IF NOT EXISTS ... ON pgqueue_msg_<t> ...
+//	}
 //
 // Forgetting this step is the most likely way to ship a migration that works
 // on fresh databases but breaks every upgraded one.
 type migration struct {
 	version int
 	name    string
-	apply   func(ctx context.Context, tx *sql.Tx) error
+	// apply runs inside the version-recording transaction. Optional.
+	apply func(ctx context.Context, tx *sql.Tx) error
+	// applyNonTx runs on the migration connection outside any transaction,
+	// before apply. Optional. See the type comment for its crash-safety
+	// contract — it must be idempotent.
+	applyNonTx func(ctx context.Context, conn *sql.Conn) error
 }
 
 // migrations is the ordered, append-only list of schema migrations. Each run of
@@ -143,23 +176,40 @@ func listQueueTableNames(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	return tableNames, nil
 }
 
-// init enforces that the migrations slice stays contiguous and ascending and
-// that SchemaVersion matches the last migration. A gap or a stale SchemaVersion
-// would silently skip migrations, so this fails fast at process startup.
+// init fails fast at process startup if the migrations slice is malformed.
 func init() {
-	for i := range migrations {
-		if want := i + 1; migrations[i].version != want {
-			panic(fmt.Sprintf(
-				"pgqueue: migrations must be contiguous and ascending; "+
+	if err := validateMigrations(migrations); err != nil {
+		panic("pgqueue: " + err.Error())
+	}
+}
+
+// validateMigrations enforces the structural invariants of the migrations
+// slice: versions must be contiguous and ascending from 1, the last version
+// must equal SchemaVersion, and every migration must define at least one of
+// apply / applyNonTx. A gap or a stale SchemaVersion would silently skip
+// migrations, and a migration with neither phase would record a version
+// without doing any work.
+func validateMigrations(ms []migration) error {
+	for i := range ms {
+		if want := i + 1; ms[i].version != want {
+			return fmt.Errorf(
+				"%w: must be contiguous and ascending; "+
 					"index %d has version %d, want %d",
-				i, migrations[i].version, want))
+				errMalformedMigrations, i, ms[i].version, want)
+		}
+		if ms[i].apply == nil && ms[i].applyNonTx == nil {
+			return fmt.Errorf(
+				"%w: migration %d (%s) defines neither apply nor applyNonTx",
+				errMalformedMigrations, ms[i].version, ms[i].name)
 		}
 	}
-	if last := migrations[len(migrations)-1].version; last != SchemaVersion {
-		panic(fmt.Sprintf(
-			"pgqueue: SchemaVersion is %d but the last migration is %d",
-			SchemaVersion, last))
+	if last := ms[len(ms)-1].version; last != SchemaVersion {
+		return fmt.Errorf(
+			"%w: SchemaVersion is %d but the last migration is %d",
+			errMalformedMigrations, SchemaVersion, last)
 	}
+
+	return nil
 }
 
 // queryRower is satisfied by *sql.DB, *sql.Conn, and *sql.Tx, letting
@@ -272,18 +322,32 @@ func configureMigrationSchema(ctx context.Context, conn *sql.Conn, schema string
 	}, nil
 }
 
-// applyMigration runs a single migration and records its version atomically:
-// the apply function and the pgqueue_schema_version insert share one
-// transaction, so either both succeed or neither does.
+// applyMigration runs a single migration and records its version.
+//
+// The optional applyNonTx phase runs first, directly on the migration
+// connection outside any transaction (for statements PostgreSQL forbids inside
+// a transaction block, e.g. CREATE INDEX CONCURRENTLY). The optional apply
+// phase then runs inside the transaction that also inserts the
+// pgqueue_schema_version row, so apply and the version record commit
+// atomically. The advisory lock held by runMigrations spans this whole call,
+// so concurrent InitSchema callers never run applyNonTx simultaneously.
 func applyMigration(ctx context.Context, conn *sql.Conn, m migration) error {
+	if m.applyNonTx != nil {
+		if err := m.applyNonTx(ctx, conn); err != nil {
+			return err
+		}
+	}
+
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := m.apply(ctx, tx); err != nil {
-		return err
+	if m.apply != nil {
+		if err := m.apply(ctx, tx); err != nil {
+			return err
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx,
