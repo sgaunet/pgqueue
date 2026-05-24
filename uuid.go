@@ -56,15 +56,23 @@ var uuidV7State struct {
 // therefore "ORDER BY id" chronological ordering, is preserved throughout
 // (R-20).
 func NewUUIDv7() (uuid.UUID, error) {
-	//nolint:gosec // G115: UnixMilli is positive for any realistic wall clock.
-	nowMS := uint64(time.Now().UnixMilli())
-	return newUUIDv7At(nowMS)
+	return newUUIDv7At(nowMillisecond)
 }
 
-// newUUIDv7At builds a UUIDv7 stamped with the given Unix-millisecond
-// timestamp. NewUUIDv7 passes the wall clock; tests pass a synthetic clock to
-// exercise the clock-regression resync path.
-func newUUIDv7At(nowMS uint64) (uuid.UUID, error) {
+// nowMillisecond returns the current Unix timestamp in milliseconds. Extracted
+// so newUUIDv7At can be driven by a synthetic clock in tests.
+func nowMillisecond() uint64 {
+	//nolint:gosec // G115: UnixMilli is positive for any realistic wall clock.
+	return uint64(time.Now().UnixMilli())
+}
+
+// newUUIDv7At builds a UUIDv7 stamped from the given clock function. NewUUIDv7
+// passes the wall clock; tests pass a synthetic clock to exercise the
+// clock-regression resync and counter-overflow paths. The clock is called once
+// at entry and again when the per-millisecond counter overflows, so the
+// overflow branch can resync to real time instead of borrowing forward
+// unboundedly under sustained burst load (issue #58).
+func newUUIDv7At(nowFn func() uint64) (uuid.UUID, error) {
 	var u uuid.UUID
 
 	// Random fill for bytes 6-15; bytes 6-7 are overwritten with the counter
@@ -72,6 +80,8 @@ func newUUIDv7At(nowMS uint64) (uuid.UUID, error) {
 	if _, err := rand.Read(u[6:]); err != nil {
 		return uuid.UUID{}, fmt.Errorf("failed to generate random bytes: %w", err)
 	}
+
+	nowMS := nowFn()
 
 	uuidV7State.mu.Lock()
 	switch {
@@ -87,8 +97,15 @@ func newUUIDv7At(nowMS uint64) (uuid.UUID, error) {
 		// monotonic by reusing lastMS and incrementing the counter.
 		uuidV7State.counter++
 		if uuidV7State.counter > uuidV7CounterMask {
-			// Counter exhausted within a millisecond: borrow the next one.
-			uuidV7State.lastMS++
+			// Counter exhausted within a millisecond. Re-read the clock
+			// before borrowing: if real time has moved on, resync to it
+			// instead of drifting lastMS further into the future.
+			nowMS = nowFn()
+			if nowMS > uuidV7State.lastMS {
+				uuidV7State.lastMS = nowMS
+			} else {
+				uuidV7State.lastMS++
+			}
 			uuidV7State.counter = 0
 		}
 	}
