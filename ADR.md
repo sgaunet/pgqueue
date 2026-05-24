@@ -39,6 +39,8 @@ This document captures key architectural decisions made in `pgqueue` and the rat
 
 **Trade-offs**: More tables to manage, and dynamic DDL requires careful name validation (`queueNameRegex`). Queue names are sanitized via `sanitizeTableName()` to prevent SQL injection.
 
+**Scalability ceiling**: Each queue is 2-3 tables plus 6-7 indexes, so queue count multiplies the number of PostgreSQL relations in the database. Several admin operations also scale linearly with queue count: `GarbageCollector.Collect` iterates every queue, `ListChannels` / `ListTopics` walk the metadata table, and `GetUnhealthySubscribers` issues one query per topic (N+1). The design is comfortable for **tens to low hundreds of queues per database**. At the scale of thousands of queues, PostgreSQL catalog bloat, query-planning latency, and autovacuum overhead become the dominant cost. The table-per-queue design is therefore **not** appropriate for patterns that mint a queue per tenant or per user — for those workloads, multiplex tenants onto a fixed pool of queues (demultiplex via message metadata or payload), or shard tenants across separate databases. `WithMaxQueues(n)` lets you enforce a cap so the ceiling is reached deliberately, not by surprise.
+
 ---
 
 ## ADR-003: UUIDv7 as Primary Key

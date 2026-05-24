@@ -175,7 +175,7 @@ back-registers on construction), so you do not have to track them for shutdown.
 
 ## Architecture
 
-- **Table-per-queue**: Each channel/topic has dedicated tables for isolation and performance
+- **Table-per-queue**: Each channel/topic has dedicated tables for isolation and performance. This design targets **tens to low hundreds of queues per database**; it is not suited for per-tenant/per-user queues at multi-tenant scale. See [ADR-002](ADR.md#adr-002-table-per-queue-architecture) for the ceiling and the linear-scaling operations (`GarbageCollector.Collect`, `ListChannels`/`ListTopics`, `GetUnhealthySubscribers`).
 - **UUIDv7 for ordering**: Time-ordered identifiers ensure message ordering
 - **Direct SQL**: Parameterized queries via database/sql for type safety
 - **Self-migrating schema**: `InitSchema()` creates and version-migrates the schema in-process — no external migration tools required

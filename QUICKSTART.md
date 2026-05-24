@@ -308,7 +308,7 @@ Configuration is supplied through functional options, not config structs.
 | `WithMaxMessageSize(bytes)` | Max payload size (default 256 KiB) |
 | `WithDefaultMaxRetries(n)` | Delivery attempts before the DLQ (default 3; `0` = DLQ on first failure) |
 | `WithDefaultTTL(d)` | Default message TTL (`0` = never expire) |
-| `WithMaxQueues(n)` | Cap the total number of queues (`0` = unlimited) |
+| `WithMaxQueues(n)` | Cap the total number of queues (`0` = unlimited). The table-per-queue design targets tens to low hundreds of queues per database — see [ADR-002](ADR.md#adr-002-table-per-queue-architecture). |
 | `WithSchema(name)` | PostgreSQL schema for all pgqueue tables (default `public`) |
 | `WithBackoffPolicy(p)` | Retry backoff policy (decorrelated jitter) |
 | `WithListener(l)` | Enable `LISTEN/NOTIFY` push delivery |
