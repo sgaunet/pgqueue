@@ -41,8 +41,14 @@ func WithQueueTTL(d time.Duration) QueueOption {
 	}
 }
 
-// WithQueueMaxMessageSize overrides the default maximum message size for a
-// specific channel or topic.
+// WithQueueMaxMessageSize overrides the maximum payload size for a specific
+// channel or topic.
+//
+// Zero (the default) inherits the queue-wide cap configured via
+// WithMaxMessageSize. Any positive value up to MaxAllowedMessageSize
+// (PostgreSQL's bytea per-value limit) is honored verbatim. Negative values
+// and values above MaxAllowedMessageSize make CreateChannel/CreateTopic
+// return ErrInvalidConfig.
 func WithQueueMaxMessageSize(bytes int) QueueOption {
 	return func(o *queueCreateOpts) {
 		o.maxMessageSize = bytes

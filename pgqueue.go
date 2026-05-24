@@ -207,15 +207,31 @@ func onlySchemaOption(opts []Option) bool {
 // version pgqueue supports (uuidv7() is native from PostgreSQL 18 onward).
 const minPGVersionNum = 180000
 
-// validateConfig rejects a Config with a negative numeric field: a negative
-// MaxMessageSize would make every publish fail, and the others have no
-// meaningful negative interpretation.
+// validateConfig rejects a Config whose numeric fields are out of range: a
+// negative or oversized MaxMessageSize would make publishes fail (or exceed
+// PostgreSQL's bytea limit), and the others have no meaningful negative
+// interpretation.
 func validateConfig(cfg Config) error {
-	if cfg.MaxMessageSize < 0 || cfg.DefaultMaxRetries < 0 ||
-		cfg.DefaultTTL < 0 || cfg.MaxQueues < 0 {
+	if err := validateMaxMessageSize(cfg.MaxMessageSize); err != nil {
+		return err
+	}
+	if cfg.DefaultMaxRetries < 0 || cfg.DefaultTTL < 0 || cfg.MaxQueues < 0 {
 		return ErrInvalidConfig
 	}
 
+	return nil
+}
+
+// validateMaxMessageSize ensures a payload-size cap is non-negative and
+// within PostgreSQL's bytea per-value limit (MaxAllowedMessageSize). Zero is
+// allowed and means "use the package default" at the layer that consumes it.
+func validateMaxMessageSize(n int) error {
+	if n < 0 || n > MaxAllowedMessageSize {
+		return fmt.Errorf(
+			"max message size %d out of range [0, %d]: %w",
+			n, MaxAllowedMessageSize, ErrInvalidConfig,
+		)
+	}
 	return nil
 }
 
@@ -295,8 +311,10 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 	}
 
 	cfg := applyConfigOptions(opts)
-	if cfg.maxMessageSize < 0 || cfg.defaultMaxRetries < 0 ||
-		int64(cfg.defaultTTL) < 0 || cfg.maxQueues < 0 {
+	if err := validateMaxMessageSize(cfg.maxMessageSize); err != nil {
+		return nil, err
+	}
+	if cfg.defaultMaxRetries < 0 || int64(cfg.defaultTTL) < 0 || cfg.maxQueues < 0 {
 		return nil, ErrInvalidConfig
 	}
 	if err := validateSchemaName(cfg.schemaName); err != nil {
@@ -365,6 +383,9 @@ func (pq *Queue) CreateChannel(
 		return err
 	}
 	o := applyQueueOptions(opts)
+	if err := validateMaxMessageSize(o.maxMessageSize); err != nil {
+		return err
+	}
 	co := ChannelOptions{
 		MaxMessageSize: o.maxMessageSize,
 		TTL:            o.ttl,
@@ -386,6 +407,9 @@ func (pq *Queue) CreateTopic(
 		return err
 	}
 	o := applyQueueOptions(opts)
+	if err := validateMaxMessageSize(o.maxMessageSize); err != nil {
+		return err
+	}
 	to := TopicOptions{
 		MaxMessageSize: o.maxMessageSize,
 		TTL:            o.ttl,

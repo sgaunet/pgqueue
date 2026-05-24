@@ -8,6 +8,15 @@ import (
 // defaultMaxMessageSize is 256 KiB, per the spec (FR-032).
 const defaultMaxMessageSize = 256 * 1024
 
+// MaxAllowedMessageSize is the largest payload pgqueue will accept, in bytes.
+// It matches PostgreSQL's hard per-value limit for the bytea column used to
+// store payloads (1 GiB). WithMaxMessageSize and WithQueueMaxMessageSize
+// reject any value above this with ErrInvalidConfig.
+//
+// Payloads near this ceiling stress driver buffers, WAL, and replication —
+// pick the smallest size that fits your workload.
+const MaxAllowedMessageSize = 1 << 30
+
 // Option is a functional configuration option for New and InitSchema.
 type Option func(*queueConfig)
 
@@ -30,7 +39,14 @@ type queueConfig struct {
 }
 
 // WithMaxMessageSize sets the maximum allowed message payload size in bytes.
-// The default is 256 KiB.
+//
+// Zero (the default) selects the built-in default of 256 KiB. Any positive
+// value up to MaxAllowedMessageSize (PostgreSQL's bytea per-value limit) is
+// honored verbatim. Negative values and values above MaxAllowedMessageSize
+// make New return ErrInvalidConfig.
+//
+// To accept the largest payload PostgreSQL can store, use
+// WithMaxMessageSize(MaxAllowedMessageSize).
 func WithMaxMessageSize(bytes int) Option {
 	return func(c *queueConfig) {
 		c.maxMessageSize = bytes

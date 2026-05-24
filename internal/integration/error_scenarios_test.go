@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -195,6 +196,71 @@ func TestMessageSizeExceedsLimit(t *testing.T) {
 	_, err = pq.Publish(ctx, "size-test", largeMessage)
 	if err == nil {
 		t.Error("expected error when publishing message exceeding size limit, got nil")
+	}
+}
+
+// TestLargeMessageWithExplicitCap verifies that an explicitly raised
+// WithMaxMessageSize is honored end-to-end: a payload below the raised cap
+// publishes successfully while one above it is rejected with
+// ErrMessageSizeExceeded. Guards against any future regression that silently
+// downgrades a caller-supplied cap back to the 256 KiB default.
+func TestLargeMessageWithExplicitCap(t *testing.T) {
+	ctx := context.Background()
+	db, containerCleanup := setupTestContainer(t)
+	defer containerCleanup()
+
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("failed to initialize schema: %v", err)
+	}
+
+	const raisedCap = 2 << 20 // 2 MiB
+	pq, err := pgqueue.New(ctx, db, pgqueue.WithMaxMessageSize(raisedCap))
+	if err != nil {
+		t.Fatalf("New with raised cap: %v", err)
+	}
+	defer func() { _ = pq.Close() }()
+
+	if err := pq.CreateChannel(ctx, "large-msg"); err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+
+	oneMiB := bytes.Repeat([]byte{'A'}, 1<<20)
+	if _, err := pq.Publish(ctx, "large-msg", oneMiB); err != nil {
+		t.Errorf("publish 1 MiB under 2 MiB cap: unexpected err %v", err)
+	}
+
+	threeMiB := bytes.Repeat([]byte{'A'}, 3<<20)
+	_, err = pq.Publish(ctx, "large-msg", threeMiB)
+	if !errors.Is(err, pgqueue.ErrMessageSizeExceeded) {
+		t.Errorf("publish 3 MiB above 2 MiB cap: err = %v, want ErrMessageSizeExceeded", err)
+	}
+}
+
+// TestCreateChannelMaxMessageSizeOutOfRange verifies CreateChannel and
+// CreateTopic refuse to register a queue whose per-queue size cap exceeds
+// MaxAllowedMessageSize (PostgreSQL's bytea limit), failing fast at creation
+// rather than letting publishes fail later with an opaque driver error.
+func TestCreateChannelMaxMessageSizeOutOfRange(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	err := pq.CreateChannel(ctx, "too-big-channel",
+		pgqueue.WithQueueMaxMessageSize(pgqueue.MaxAllowedMessageSize+1))
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("CreateChannel above ceiling: err = %v, want ErrInvalidConfig", err)
+	}
+
+	err = pq.CreateTopic(ctx, "too-big-topic",
+		pgqueue.WithQueueMaxMessageSize(pgqueue.MaxAllowedMessageSize+1))
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("CreateTopic above ceiling: err = %v, want ErrInvalidConfig", err)
+	}
+
+	err = pq.CreateChannel(ctx, "negative-channel", pgqueue.WithQueueMaxMessageSize(-1))
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Errorf("CreateChannel negative cap: err = %v, want ErrInvalidConfig", err)
 	}
 }
 

@@ -2,6 +2,7 @@ package pgqueue
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -65,5 +66,73 @@ func TestOnlySchemaOption(t *testing.T) {
 	// Must return false, not panic, for a non-comparable listener value.
 	if onlySchemaOption([]Option{WithListener(uncomparableTestListener{})}) {
 		t.Error("WithListener: onlySchemaOption = true, want false")
+	}
+}
+
+// TestApplyConfigOptionsMaxMessageSize verifies the 0-coerces-to-default
+// behavior and that an explicit positive value (including MaxAllowedMessageSize)
+// is preserved verbatim, so a caller asking for a larger payload cap is not
+// silently downgraded to 256 KiB.
+func TestApplyConfigOptionsMaxMessageSize(t *testing.T) {
+	if got := applyConfigOptions(nil).maxMessageSize; got != defaultMaxMessageSize {
+		t.Errorf("no option: maxMessageSize = %d, want %d", got, defaultMaxMessageSize)
+	}
+
+	max := applyConfigOptions([]Option{WithMaxMessageSize(MaxAllowedMessageSize)}).maxMessageSize
+	if max != MaxAllowedMessageSize {
+		t.Errorf("WithMaxMessageSize(MaxAllowedMessageSize): maxMessageSize = %d, want %d",
+			max, MaxAllowedMessageSize)
+	}
+
+	custom := applyConfigOptions([]Option{WithMaxMessageSize(2 << 20)}).maxMessageSize
+	if custom != 2<<20 {
+		t.Errorf("WithMaxMessageSize(2 MiB): maxMessageSize = %d, want %d", custom, 2<<20)
+	}
+}
+
+// TestValidateMaxMessageSize covers the boundary behavior of the shared
+// guard used by New, validateConfig, and CreateChannel/CreateTopic: zero is
+// allowed (resolves to default downstream), MaxAllowedMessageSize is the
+// inclusive upper bound, and anything outside that range returns
+// ErrInvalidConfig.
+func TestValidateMaxMessageSize(t *testing.T) {
+	cases := []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{"zero", 0, false},
+		{"small positive", 1024, false},
+		{"at ceiling", MaxAllowedMessageSize, false},
+		{"above ceiling", MaxAllowedMessageSize + 1, true},
+		{"negative", -1, true},
+		{"large negative", -1 << 20, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMaxMessageSize(tc.size)
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Errorf("size=%d: err = %v, want ErrInvalidConfig", tc.size, err)
+				}
+			} else if err != nil {
+				t.Errorf("size=%d: unexpected err %v", tc.size, err)
+			}
+		})
+	}
+}
+
+// TestValidateConfigMaxMessageSize verifies the legacy Config struct enforces
+// the same ceiling as the functional-options path, so deprecated Init callers
+// see consistent rejection of out-of-range payload caps.
+func TestValidateConfigMaxMessageSize(t *testing.T) {
+	if err := validateConfig(Config{MaxMessageSize: MaxAllowedMessageSize}); err != nil {
+		t.Errorf("Config at ceiling: unexpected err %v", err)
+	}
+	if err := validateConfig(Config{MaxMessageSize: MaxAllowedMessageSize + 1}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("Config above ceiling: err = %v, want ErrInvalidConfig", err)
+	}
+	if err := validateConfig(Config{MaxMessageSize: -1}); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("Config negative: err = %v, want ErrInvalidConfig", err)
 	}
 }

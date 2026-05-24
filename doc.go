@@ -33,6 +33,10 @@ Per-queue creation options (TTL, max retries, message size) are functional
 options passed to CreateChannel/CreateTopic — WithQueueTTL, WithQueueMaxRetries,
 WithQueueMaxMessageSize.
 
+The default message-size cap is 256 KiB. To allow larger payloads, pass an
+explicit size to WithMaxMessageSize or WithQueueMaxMessageSize, up to
+MaxAllowedMessageSize (PostgreSQL's bytea per-value limit, 1 GiB).
+
 Storage retention is opt-in. Message redelivery on a crashed consumer and DLQ
 promotion of retry-exhausted messages happen without any extra setup, but old
 rows (completed messages, DLQ entries, acked subscriptions) are only reclaimed
