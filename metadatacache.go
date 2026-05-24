@@ -19,9 +19,11 @@ const metadataCacheTTL = 1 * time.Minute
 // state such as `paused` is always read fresh from the database to avoid stale
 // reads under concurrent pause/resume operations.
 //
-// An entry is invalidated (deleted) when the local process deletes the queue,
-// and otherwise expires after metadataCacheTTL so a cross-process deletion
-// cannot pin a stale mapping indefinitely.
+// An entry is invalidated (deleted) when the local process deletes the queue.
+// Otherwise expiration happens two ways, both bounded by metadataCacheTTL:
+// opportunistically on the next get of the same key, and via a periodic sweep
+// driven by the GarbageCollector ticker so an unread stale entry cannot pin
+// the mapping indefinitely after a cross-process deletion.
 type metadataCache struct {
 	mu    sync.Mutex
 	items map[string]*cachedQueueMeta // key: "<queue_type>/<queue_name>"
@@ -75,6 +77,19 @@ func (mc *metadataCache) invalidate(queueType, queueName string) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	delete(mc.items, mc.key(queueType, queueName))
+}
+
+// sweep removes entries whose TTL has elapsed. Safe to call concurrently with
+// get/set/invalidate; the mutex serialises all access.
+func (mc *metadataCache) sweep() {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	now := time.Now()
+	for key, item := range mc.items {
+		if now.Sub(item.storedAt) > metadataCacheTTL {
+			delete(mc.items, key)
+		}
+	}
 }
 
 func (mc *metadataCache) key(queueType, queueName string) string {

@@ -236,6 +236,7 @@ func (gc *GarbageCollector) run(ctx context.Context) {
 		return
 	}
 	gc.collectOnce(runCtx)
+	gc.sweepMetadataCache()
 
 	for {
 		select {
@@ -245,7 +246,17 @@ func (gc *GarbageCollector) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			gc.collectOnce(runCtx)
+			gc.sweepMetadataCache()
 		}
+	}
+}
+
+// sweepMetadataCache drops expired entries from the table-name cache. Piggybacks
+// on the GC ticker so a queue deleted by another process cannot pin a stale
+// mapping in this process indefinitely (issue #54).
+func (gc *GarbageCollector) sweepMetadataCache() {
+	if gc.pq.mdcache != nil {
+		gc.pq.mdcache.sweep()
 	}
 }
 
