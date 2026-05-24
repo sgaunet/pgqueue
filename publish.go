@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -100,44 +101,29 @@ func (pq *Queue) resolveQueueMetadata(
 	ctx context.Context,
 	queueName string,
 ) (*QueueMetadata, error) {
+	// The UNIQUE(table_name) constraint on pgqueue_metadata (see baseSchemaSQL)
+	// guarantees at most one row matches: a channel and a topic with the same
+	// queue_name would sanitize to the same physical table name and the second
+	// CreateChannel/CreateTopic would be rejected at creation time.
 	//nolint:gosec // G201: schema-qualified internal table name, not user input
 	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
 		FROM %s
 		WHERE queue_name = $1
 	`, pq.globalTable("pgqueue_metadata"))
-	rows, err := pq.db.QueryContext(ctx, query, queueName)
+	var meta QueueMetadata
+	err := pq.db.QueryRowContext(ctx, query, queueName).Scan(
+		&meta.ID, &meta.QueueType, &meta.QueueName,
+		&meta.TableName, &meta.Config, &meta.Paused,
+		&meta.CreatedAt, &meta.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%s: %w", queueName, ErrQueueNotFound)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query queue metadata: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var results []QueueMetadata
-	for rows.Next() {
-		var meta QueueMetadata
-		if err := rows.Scan(
-			&meta.ID, &meta.QueueType, &meta.QueueName,
-			&meta.TableName, &meta.Config, &meta.Paused,
-			&meta.CreatedAt, &meta.UpdatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan queue metadata: %w", err)
-		}
-		results = append(results, meta)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate queue metadata: %w", err)
-	}
-
-	switch len(results) {
-	case 0:
-		return nil, fmt.Errorf("%s: %w", queueName, ErrQueueNotFound)
-	case 1:
-		return &results[0], nil
-	default:
-		return nil, fmt.Errorf(
-			"%s: %w", queueName, ErrAmbiguousQueueName,
-		)
-	}
+	return &meta, nil
 }
 
 func (pq *Queue) validatePayloadSize(

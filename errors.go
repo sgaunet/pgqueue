@@ -70,9 +70,6 @@ var (
 	// that is currently being processed.
 	ErrMessageInProcessing = errors.New("message is currently being processed and cannot be replayed")
 
-	// ErrAmbiguousQueueName is returned when a queue name exists as both a channel and topic.
-	ErrAmbiguousQueueName = errors.New("ambiguous queue name: exists as both channel and topic")
-
 	// ErrReplayNotSupported is returned when ReplayMessage is called on a pub/sub queue.
 	// Pub/sub message tables do not track status; use ReplayFrom or ReplayDLQ instead.
 	ErrReplayNotSupported = errors.New("ReplayMessage is not supported for pub/sub queues; use ReplayFrom or ReplayDLQ")
