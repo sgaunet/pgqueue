@@ -647,7 +647,13 @@ func (gc *GarbageCollector) runPagedPurge(
 		if err != nil {
 			return total, err //nolint:wrapcheck // caller wraps with operation context
 		}
-		n, _ := result.RowsAffected()
+		n, err := rowsAffectedOrErr(result)
+		if err != nil {
+			// A discarded error here used to make n=0, which terminates the
+			// page loop on the first iteration and reports the purge as
+			// successful while skipping the rest of the backlog (#67).
+			return total, fmt.Errorf("paged purge rows affected: %w", err)
+		}
 		total += n
 		if n < int64(retentionPurgePageSize) {
 			return total, nil // backlog exhausted
@@ -963,8 +969,11 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 		return fmt.Errorf("failed to reset timed-out messages: %w", err)
 	}
 
-	rows, _ := result.RowsAffected()
-	if rows > 0 {
+	rows, raErr := rowsAffectedOrErr(result)
+	if raErr != nil {
+		gc.pq.logError("reset timed-out messages rows affected",
+			"table", tableName, "error", raErr)
+	} else if rows > 0 {
 		gc.pq.logInfo("reset timed-out messages", "count", rows, "table", tableName)
 	}
 
@@ -1003,8 +1012,11 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 		)
 	}
 
-	rows, _ := result.RowsAffected()
-	if rows > 0 {
+	rows, raErr := rowsAffectedOrErr(result)
+	if raErr != nil {
+		gc.pq.logError("reset timed-out subscriptions rows affected",
+			"table", tableName, "error", raErr)
+	} else if rows > 0 {
 		gc.pq.logInfo("reset timed-out subscriptions", "count", rows, "table", tableName)
 	}
 
@@ -1038,8 +1050,11 @@ func (gc *GarbageCollector) purgeInactiveSubscriptions(
 		return fmt.Errorf("failed to purge inactive subscriptions: %w", err)
 	}
 
-	rows, _ := result.RowsAffected()
-	if rows > 0 {
+	rows, raErr := rowsAffectedOrErr(result)
+	if raErr != nil {
+		gc.pq.logError("purge inactive subscriptions rows affected",
+			"table", tableName, "error", raErr)
+	} else if rows > 0 {
 		gc.pq.logInfo("purged inactive subscriptions", "count", rows, "table", tableName)
 	}
 
