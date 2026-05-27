@@ -375,8 +375,20 @@ func (pq *Queue) reclaimChannelAttempt(
 	tableName string,
 	row channelCandidate,
 ) (int, bool, error) {
-	if MessageStatus(row.status) != MessageStatusProcessing {
+	// Only 'processing' rows need a reclaim accounting pass; 'pending' rows
+	// are handed back to the caller verbatim. Any other status is unexpected
+	// here and used to be silently treated as pending — surface it instead so
+	// a future migration cannot regress this path (#65).
+	switch MessageStatus(row.status) {
+	case MessageStatusProcessing:
+		// fall through to reclaim accounting below.
+	case MessageStatusPending:
 		return row.retryCount, false, nil
+	default:
+		return 0, false, fmt.Errorf(
+			"unexpected channel message status %q for id %s",
+			row.status, row.id,
+		)
 	}
 
 	// A timeout reclaim counts as one redelivery attempt.

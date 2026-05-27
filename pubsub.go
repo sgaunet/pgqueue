@@ -519,8 +519,20 @@ func (pq *Queue) reclaimTopicAttempt(
 	maxRetries int,
 ) (int, bool, error) {
 	retryCount := row.retryCount
-	if MessageStatus(row.status) != MessageStatusProcessing {
+	// Mirror the channel reclaim path: only 'processing' rows need accounting;
+	// 'pending' rows pass through; anything else used to be silently coerced
+	// to pending and is now surfaced as an error so a future migration cannot
+	// regress this path (#65).
+	switch MessageStatus(row.status) {
+	case MessageStatusProcessing:
+		// fall through to reclaim accounting below.
+	case MessageStatusPending:
 		return retryCount, false, nil
+	default:
+		return 0, false, fmt.Errorf(
+			"unexpected subscription status %q for message %s subscriber %s",
+			row.status, row.msgID, subscriberID,
+		)
 	}
 
 	if retryCount+1 > maxRetries {
