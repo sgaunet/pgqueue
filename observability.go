@@ -8,6 +8,24 @@ import (
 // Attr is a single key/value attribute attached to a tracing span or a metric
 // observation. It is intentionally a plain struct so the observability hook
 // interfaces carry no third-party dependency.
+//
+// Supported value types — what every bundled adapter (otelpgqueue, prompgqueue)
+// is expected to handle natively:
+//
+//   - string, bool
+//   - int, int8, int16, int32, int64 (always rendered as int64)
+//   - uint8, uint16, uint32 (rendered as int64; uint and uint64 are rendered as
+//     a decimal string to avoid losing the high bit on values > math.MaxInt64)
+//   - float32, float64 (always rendered as float64)
+//   - time.Duration (rendered as an int64 nanosecond count)
+//   - time.Time (rendered as a RFC 3339 nanosecond string)
+//   - error (rendered via Error())
+//   - fmt.Stringer (rendered via String()) — the last-resort typed escape hatch
+//     for custom types
+//
+// Anything else is rendered with fmt.Sprintf("%v", v); adapters configured with
+// a logger (see otelpgqueue.WithTracerLogger) additionally emit a one-line
+// warning so the unexpected type is not silently coerced.
 type Attr struct {
 	Key   string
 	Value any

@@ -31,7 +31,10 @@ package otelpgqueue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
+	"strconv"
 	"time"
 
 	"github.com/sgaunet/pgqueue"
@@ -56,9 +59,21 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(m *Metrics) { m.logger = logger }
 }
 
+// TracerOption configures a Tracer adapter at construction time.
+type TracerOption func(*Tracer)
+
+// WithTracerLogger attaches a structured logger to the Tracer. When set, any
+// pgqueue.Attr whose value falls through the type switch to fmt.Sprintf is
+// logged at WARN so the unexpected type is not silently coerced (issue #93).
+// When nil (the default) the Tracer is silent.
+func WithTracerLogger(logger *slog.Logger) TracerOption {
+	return func(t *Tracer) { t.logger = logger }
+}
+
 // Tracer adapts an OpenTelemetry tracer to the pgqueue.Tracer hook interface.
 type Tracer struct {
 	tracer trace.Tracer
+	logger *slog.Logger
 }
 
 // compile-time check.
@@ -66,11 +81,17 @@ var _ pgqueue.Tracer = (*Tracer)(nil)
 
 // NewTracer builds a pgqueue.Tracer backed by tp. A nil provider falls back to
 // the global OpenTelemetry tracer provider.
-func NewTracer(tp trace.TracerProvider) *Tracer {
+func NewTracer(tp trace.TracerProvider, opts ...TracerOption) *Tracer {
+	t := &Tracer{}
 	if tp == nil {
-		return &Tracer{tracer: tracenoop.NewTracerProvider().Tracer(instrumentationName)}
+		t.tracer = tracenoop.NewTracerProvider().Tracer(instrumentationName)
+	} else {
+		t.tracer = tp.Tracer(instrumentationName)
 	}
-	return &Tracer{tracer: tp.Tracer(instrumentationName)}
+	for _, o := range opts {
+		o(t)
+	}
+	return t
 }
 
 // StartSpan begins an OpenTelemetry span and wraps it as a pgqueue.Span.
@@ -82,19 +103,20 @@ func (t *Tracer) StartSpan(
 	name string,
 	attrs ...pgqueue.Attr,
 ) (context.Context, pgqueue.Span) {
-	ctx, span := t.tracer.Start(ctx, name, trace.WithAttributes(toKeyValues(attrs)...))
+	ctx, span := t.tracer.Start(ctx, name, trace.WithAttributes(toKeyValues(attrs, t.logger)...))
 	// A misbehaving TracerProvider can return a nil span; substitute a no-op
 	// span so the otelSpan wrapper cannot panic on End/SetError (R-23).
 	if span == nil {
 		_, span = tracenoop.NewTracerProvider().
 			Tracer(instrumentationName).Start(ctx, name)
 	}
-	return ctx, &otelSpan{span: span}
+	return ctx, &otelSpan{span: span, logger: t.logger}
 }
 
 // otelSpan adapts an OpenTelemetry span to pgqueue.Span.
 type otelSpan struct {
-	span trace.Span
+	span   trace.Span
+	logger *slog.Logger
 }
 
 func (s *otelSpan) End() { s.span.End() }
@@ -108,33 +130,81 @@ func (s *otelSpan) SetError(err error) {
 }
 
 func (s *otelSpan) SetAttr(attrs ...pgqueue.Attr) {
-	s.span.SetAttributes(toKeyValues(attrs)...)
+	s.span.SetAttributes(toKeyValues(attrs, s.logger)...)
 }
 
 // toKeyValues converts pgqueue attributes to OpenTelemetry key/value pairs.
-func toKeyValues(attrs []pgqueue.Attr) []attribute.KeyValue {
+// The set of natively recognised types is documented on pgqueue.Attr; any
+// other value type falls back to fmt.Sprintf("%v", v) and, when logger is
+// non-nil, is logged once at WARN so the coercion is not silent (issue #93).
+func toKeyValues(attrs []pgqueue.Attr, logger *slog.Logger) []attribute.KeyValue {
 	if len(attrs) == 0 {
 		return nil
 	}
 	out := make([]attribute.KeyValue, 0, len(attrs))
 	for _, a := range attrs {
-		switch v := a.Value.(type) {
-		case string:
-			out = append(out, attribute.String(a.Key, v))
-		case int64:
-			out = append(out, attribute.Int64(a.Key, v))
-		case int:
-			out = append(out, attribute.Int(a.Key, v))
-		case bool:
-			out = append(out, attribute.Bool(a.Key, v))
-		case float64:
-			out = append(out, attribute.Float64(a.Key, v))
-		default:
-			// Fall back to a string rendering for unsupported value types.
-			out = append(out, attribute.String(a.Key, "unsupported"))
-		}
+		out = append(out, toKeyValue(a, logger))
 	}
 	return out
+}
+
+// toKeyValue converts a single pgqueue.Attr to an attribute.KeyValue. Split
+// out of toKeyValues because the type switch otherwise exceeds the cyclomatic
+// complexity threshold.
+func toKeyValue(a pgqueue.Attr, logger *slog.Logger) attribute.KeyValue {
+	switch v := a.Value.(type) {
+	case string:
+		return attribute.String(a.Key, v)
+	case bool:
+		return attribute.Bool(a.Key, v)
+	case int:
+		return attribute.Int(a.Key, v)
+	case int8:
+		return attribute.Int64(a.Key, int64(v))
+	case int16:
+		return attribute.Int64(a.Key, int64(v))
+	case int32:
+		return attribute.Int64(a.Key, int64(v))
+	case int64:
+		return attribute.Int64(a.Key, v)
+	case uint8:
+		return attribute.Int64(a.Key, int64(v))
+	case uint16:
+		return attribute.Int64(a.Key, int64(v))
+	case uint32:
+		return attribute.Int64(a.Key, int64(v))
+	case uint:
+		// uint can be 64-bit on this platform; values past MaxInt64 cannot fit
+		// in an OTel Int64 attribute, so render them as a decimal string to
+		// keep the high bit instead of silently truncating.
+		if uint64(v) > math.MaxInt64 {
+			return attribute.String(a.Key, strconv.FormatUint(uint64(v), 10))
+		}
+		return attribute.Int64(a.Key, int64(v))
+	case uint64:
+		if v > math.MaxInt64 {
+			return attribute.String(a.Key, strconv.FormatUint(v, 10))
+		}
+		return attribute.Int64(a.Key, int64(v))
+	case float32:
+		return attribute.Float64(a.Key, float64(v))
+	case float64:
+		return attribute.Float64(a.Key, v)
+	case time.Duration:
+		return attribute.Int64(a.Key, v.Nanoseconds())
+	case time.Time:
+		return attribute.String(a.Key, v.Format(time.RFC3339Nano))
+	case error:
+		return attribute.String(a.Key, v.Error())
+	case fmt.Stringer:
+		return attribute.String(a.Key, v.String())
+	default:
+		if logger != nil {
+			logger.Warn("otelpgqueue: unsupported attribute value type, coerced via fmt.Sprintf",
+				"key", a.Key, "type", fmt.Sprintf("%T", a.Value))
+		}
+		return attribute.String(a.Key, fmt.Sprintf("%v", a.Value))
+	}
 }
 
 // Metrics adapts OpenTelemetry instruments to the pgqueue.MetricsRecorder hook.
