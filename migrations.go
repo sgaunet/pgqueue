@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // errMalformedMigrations is the sentinel wrapped by every validateMigrations
@@ -19,7 +20,7 @@ var errMalformedMigrations = errors.New("malformed migrations slice")
 // IMPORTANT: when adding a new entry to the migrations slice below, bump this
 // constant to match that entry's version number. An init() check enforces that
 // SchemaVersion equals the last migration's version.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // migrationAdvisoryLockKey is a fixed PostgreSQL advisory-lock key (the ASCII
 // bytes of "pgqueue") used to serialize schema migrations across processes.
@@ -114,6 +115,11 @@ var migrations = []migration{
 		name:    "index dlq original_message_id",
 		apply:   migrateIndexDLQOriginalMessageID,
 	},
+	{
+		version: 3, //nolint:mnd // schema migration version number
+		name:    "non-negative retry_count and max_retries",
+		apply:   migrateNonNegativeRetryCounts,
+	},
 }
 
 // migrateIndexDLQOriginalMessageID is the v2 migration. It backfills the index
@@ -148,6 +154,131 @@ func migrateIndexDLQOriginalMessageID(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	return nil
+}
+
+// migrateNonNegativeRetryCounts is the v3 migration. createChannelTables,
+// createPubSubTables, and createDLQTable now emit CHECK constraints that pin
+// retry_count (and the channel msg table's max_retries) to non-negative values
+// so a stray direct-SQL UPDATE cannot wedge the retry/DLQ off-by-one guard in
+// channel.go. Pre-existing per-queue tables predate those constraints, so
+// discover them from pgqueue_metadata and ALTER each one. The constraints are
+// added NOT VALID first (a brief catalog-only lock) and then VALIDATEd in a
+// second statement (SHARE UPDATE EXCLUSIVE — concurrent reads and writes keep
+// running) so the migration stays usable against populated, in-use tables.
+// addAndValidateCheck swallows duplicate_object on ADD CONSTRAINT to stay
+// idempotent for queues whose newer CREATE TABLE already emitted the check.
+func migrateNonNegativeRetryCounts(ctx context.Context, tx *sql.Tx) error {
+	tableNames, err := listQueueTableNames(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	for _, tableName := range tableNames {
+		queueType, err := queueTypeForTable(ctx, tx, tableName)
+		if err != nil {
+			return err
+		}
+		if err := applyRetryCountChecks(ctx, tx, queueType, tableName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// applyRetryCountChecks adds the v3 NOT VALID + VALIDATE pair for every
+// retry_count / max_retries column the given queue actually has. tableName is
+// the sanitized per-queue identifier ([a-z0-9_]+, <= 28 chars) written by
+// sanitizeTableName, so direct interpolation is safe.
+func applyRetryCountChecks(
+	ctx context.Context, tx *sql.Tx, queueType QueueType, tableName string,
+) error {
+	checks := []struct{ table, column, expr string }{
+		{"pgqueue_dlq_" + tableName, "retry_count", "retry_count >= 0"},
+	}
+	switch queueType {
+	case QueueTypeChannel:
+		checks = append(checks,
+			struct{ table, column, expr string }{
+				"pgqueue_msg_" + tableName, "retry_count", "retry_count >= 0",
+			},
+			struct{ table, column, expr string }{
+				"pgqueue_msg_" + tableName, "max_retries",
+				"max_retries IS NULL OR max_retries >= 0",
+			},
+		)
+	case QueueTypePubSub:
+		checks = append(checks, struct{ table, column, expr string }{
+			"pgqueue_sub_" + tableName, "retry_count", "retry_count >= 0",
+		})
+	}
+
+	for _, c := range checks {
+		if err := addAndValidateCheck(ctx, tx, c.table, c.column, c.expr); err != nil {
+			return fmt.Errorf(
+				"failed to add %s check on %s: %w", c.column, c.table, err,
+			)
+		}
+	}
+
+	return nil
+}
+
+// addAndValidateCheck runs the standard NOT VALID + VALIDATE pair so the
+// constraint goes in without blocking concurrent writes on a populated table.
+// A duplicate_object error from ADD CONSTRAINT is treated as already-applied
+// (a queue created after the new CREATE TABLE began emitting the constraint
+// up front), and VALIDATE is still issued to cover an earlier interrupted run
+// that left the constraint NOT VALID.
+func addAndValidateCheck(
+	ctx context.Context, tx *sql.Tx, table, column, expr string,
+) error {
+	constraint := table + "_" + column + "_nonneg"
+	add := fmt.Sprintf(
+		`ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID`,
+		table, constraint, expr,
+	)
+	if _, err := tx.ExecContext(ctx, add); err != nil && !isDuplicateObjectError(err) {
+		return fmt.Errorf("add constraint %s: %w", constraint, err)
+	}
+	validate := fmt.Sprintf(
+		`ALTER TABLE %s VALIDATE CONSTRAINT %s`, table, constraint,
+	)
+	if _, err := tx.ExecContext(ctx, validate); err != nil {
+		return fmt.Errorf("validate constraint %s: %w", constraint, err)
+	}
+
+	return nil
+}
+
+// queueTypeForTable reads the queue_type column from pgqueue_metadata for a
+// given per-queue table name. The v3 migration uses it to decide whether to
+// patch the channel msg table or the pub/sub sub table.
+func queueTypeForTable(ctx context.Context, tx *sql.Tx, tableName string) (QueueType, error) {
+	var qt string
+	err := tx.QueryRowContext(ctx,
+		`SELECT queue_type FROM pgqueue_metadata WHERE table_name = $1`,
+		tableName,
+	).Scan(&qt)
+	if err != nil {
+		return "", fmt.Errorf(
+			"failed to read queue_type for table %q: %w", tableName, err,
+		)
+	}
+
+	return QueueType(qt), nil
+}
+
+// isDuplicateObjectError reports whether err is PostgreSQL's duplicate_object
+// SQLSTATE 42710. Both pgx and lib/pq surface it as a generic error whose
+// message contains "already exists", so the v3 migration matches on that to
+// stay idempotent against a queue whose newer CREATE TABLE already emitted the
+// CHECK constraint up front.
+func isDuplicateObjectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "already exists")
 }
 
 // listQueueTableNames reads every per-queue table_name recorded in
