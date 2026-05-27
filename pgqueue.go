@@ -896,21 +896,29 @@ func (pq *Queue) deleteQueue(
 		return fmt.Errorf("failed to execute queue deletion: %w", err)
 	}
 
+	// Invalidate the metadata cache and drop the push-delivery waker BEFORE
+	// commit so a panic or crash between commit and these cleanups cannot
+	// leave a stale cache entry or a leaked LISTEN behind. If commit then
+	// fails the queue still exists; both side effects are recoverable: the
+	// cache cold-fetches on the next access, and a consumer's wakeChan call
+	// re-registers the waker and LISTEN lazily. The post-commit invalidate
+	// remains as the in-process race guard: another goroutine that started a
+	// metadata lookup while the delete was in flight may have repopulated
+	// the cache between this pre-commit invalidate and Commit returning
+	// (#63).
+	if pq.mdcache != nil {
+		pq.mdcache.invalidate(string(queueType), name)
+	}
+	if pq.notifier != nil {
+		pq.notifier.forget(ctx, notifyChannelName(metadata.TableName))
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	// Invalidate the metadata cache entry for the deleted queue so subsequent
-	// operations do not serve stale table-name mappings.
 	if pq.mdcache != nil {
 		pq.mdcache.invalidate(string(queueType), name)
-	}
-
-	// Drop the push-delivery waker for the deleted queue so the notifier's
-	// waker map does not accumulate entries for queues that no longer exist.
-	// forget also best-effort UNLISTENs on the underlying Listener (#52).
-	if pq.notifier != nil {
-		pq.notifier.forget(ctx, notifyChannelName(metadata.TableName))
 	}
 
 	return nil
