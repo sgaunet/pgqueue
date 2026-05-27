@@ -42,11 +42,12 @@ func (recordingSpan) SetAttr(...pgqueue.Attr) {}
 
 // recordingMetrics is a test pgqueue.MetricsRecorder that counts every call.
 type recordingMetrics struct {
-	mu        sync.Mutex
-	publishes int
-	consumes  int
-	acks      int
-	nacks     int
+	mu              sync.Mutex
+	publishes       int
+	consumes        int
+	acks            int
+	nacks           int
+	ackAfterExpired int
 }
 
 func (rm *recordingMetrics) RecordPublish(_ string, count int) {
@@ -71,6 +72,12 @@ func (rm *recordingMetrics) RecordAck(_ string, ok bool) {
 	rm.mu.Unlock()
 }
 
+func (rm *recordingMetrics) RecordAckAfterExpired(_ string) {
+	rm.mu.Lock()
+	rm.ackAfterExpired++
+	rm.mu.Unlock()
+}
+
 func (rm *recordingMetrics) ObserveQueueDepth(string, int64) {}
 func (rm *recordingMetrics) ObserveDLQSize(string, int64)    {}
 
@@ -78,6 +85,12 @@ func (rm *recordingMetrics) snapshot() (publishes, consumes, acks, nacks int) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	return rm.publishes, rm.consumes, rm.acks, rm.nacks
+}
+
+func (rm *recordingMetrics) ackAfterExpiredCount() int {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	return rm.ackAfterExpired
 }
 
 // TestObservabilityHooksReceiveSpansAndMetrics verifies that a registered

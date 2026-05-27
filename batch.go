@@ -103,7 +103,9 @@ func (pq *Queue) publishBatchResolved(
 // Returns ErrMessageAlreadyAcked only if no messages were updated.
 // Receipts that were not in processing state under their claim token (including
 // expired claims) are silently skipped and nil is returned (partial success);
-// batch operations do not surface ErrClaimExpired per receipt.
+// batch operations do not surface ErrClaimExpired per receipt. Each silently
+// skipped receipt increments the RecordAckAfterExpired metric so operators can
+// detect partial success and the corresponding redeliveries.
 func (pq *Queue) AckChannelBatch(
 	ctx context.Context,
 	channelName string,
@@ -146,6 +148,7 @@ func (pq *Queue) AckChannelBatch(
 	if err != nil {
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
+	pq.recordAckAfterExpired(channelName, len(receipts)-int(rows))
 	if rows == 0 {
 		return ErrMessageAlreadyAcked
 	}
@@ -157,7 +160,9 @@ func (pq *Queue) AckChannelBatch(
 // Returns ErrMessageAlreadyAcked only if no messages were updated.
 // Receipts that were not in processing state under their claim token (including
 // expired claims) are silently skipped and nil is returned (partial success);
-// batch operations do not surface ErrClaimExpired per receipt.
+// batch operations do not surface ErrClaimExpired per receipt. Each silently
+// skipped receipt increments the RecordAckAfterExpired metric so operators can
+// detect partial success and the corresponding redeliveries.
 func (pq *Queue) AckTopicBatch(
 	ctx context.Context,
 	topicName string,
@@ -205,6 +210,7 @@ func (pq *Queue) AckTopicBatch(
 	if err != nil {
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
+	pq.recordAckAfterExpired(topicName, len(receipts)-int(rows))
 	if rows == 0 {
 		return ErrMessageAlreadyAcked
 	}
@@ -216,6 +222,9 @@ func (pq *Queue) AckTopicBatch(
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
 // A WithRetryDelay option overrides the computed backoff delay for the batch.
+// Receipts whose claim no longer matches a processing message are silently
+// skipped; each skipped receipt increments the RecordAckAfterExpired metric so
+// operators can detect partial success and the corresponding redeliveries.
 func (pq *Queue) NackChannelBatch(
 	ctx context.Context,
 	channelName string,
@@ -267,6 +276,7 @@ func (pq *Queue) NackChannelBatch(
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
+	pq.recordAckAfterExpired(channelName, len(receipts)-len(states))
 	return nil
 }
 
@@ -274,6 +284,9 @@ func (pq *Queue) NackChannelBatch(
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
 // A WithRetryDelay option overrides the computed backoff delay for the batch.
+// Receipts whose claim no longer matches a processing subscription are silently
+// skipped; each skipped receipt increments the RecordAckAfterExpired metric so
+// operators can detect partial success and the corresponding redeliveries.
 func (pq *Queue) NackTopicBatch(
 	ctx context.Context,
 	topicName string,
@@ -328,6 +341,7 @@ func (pq *Queue) NackTopicBatch(
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
+	pq.recordAckAfterExpired(topicName, len(receipts)-len(states))
 	return nil
 }
 

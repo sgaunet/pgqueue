@@ -139,12 +139,13 @@ func toKeyValues(attrs []pgqueue.Attr) []attribute.KeyValue {
 
 // Metrics adapts OpenTelemetry instruments to the pgqueue.MetricsRecorder hook.
 type Metrics struct {
-	logger     *slog.Logger
-	publishes  metric.Int64Counter
-	consumeDur metric.Float64Histogram
-	acks       metric.Int64Counter
-	queueDepth metric.Int64Gauge
-	dlqSize    metric.Int64Gauge
+	logger          *slog.Logger
+	publishes       metric.Int64Counter
+	consumeDur      metric.Float64Histogram
+	acks            metric.Int64Counter
+	ackAfterExpired metric.Int64Counter
+	queueDepth      metric.Int64Gauge
+	dlqSize         metric.Int64Gauge
 }
 
 // compile-time check.
@@ -165,30 +166,7 @@ func NewMetrics(mp metric.MeterProvider, opts ...Option) *Metrics {
 		o(m)
 	}
 	meter := mp.Meter(instrumentationName)
-
-	var errs []error
-	var err error
-	if m.publishes, err = meter.Int64Counter("pgqueue.publish.messages",
-		metric.WithDescription("Messages published to pgqueue queues")); err != nil {
-		errs = append(errs, err)
-	}
-	if m.consumeDur, err = meter.Float64Histogram("pgqueue.consume.duration",
-		metric.WithDescription("Message processing latency"),
-		metric.WithUnit("s")); err != nil {
-		errs = append(errs, err)
-	}
-	if m.acks, err = meter.Int64Counter("pgqueue.ack.total",
-		metric.WithDescription("Acknowledgement outcomes (ack and nack)")); err != nil {
-		errs = append(errs, err)
-	}
-	if m.queueDepth, err = meter.Int64Gauge("pgqueue.queue.depth",
-		metric.WithDescription("Pending message count")); err != nil {
-		errs = append(errs, err)
-	}
-	if m.dlqSize, err = meter.Int64Gauge("pgqueue.dlq.size",
-		metric.WithDescription("Dead-letter queue size")); err != nil {
-		errs = append(errs, err)
-	}
+	errs := m.buildInstruments(meter)
 	if len(errs) > 0 && m.logger != nil {
 		m.logger.Warn("otelpgqueue: some metric instruments failed to create",
 			"error", errors.Join(errs...))
@@ -221,6 +199,14 @@ func (m *Metrics) RecordAck(queue string, ok bool) {
 	}
 }
 
+// RecordAckAfterExpired counts one receipt whose claim no longer matched at
+// ack/nack time — the message will be redelivered.
+func (m *Metrics) RecordAckAfterExpired(queue string) {
+	if m.ackAfterExpired != nil {
+		m.ackAfterExpired.Add(context.Background(), 1, queueAttr(queue))
+	}
+}
+
 // ObserveQueueDepth records the current pending-message count for a queue.
 func (m *Metrics) ObserveQueueDepth(queue string, depth int64) {
 	if m.queueDepth != nil {
@@ -233,6 +219,43 @@ func (m *Metrics) ObserveDLQSize(queue string, size int64) {
 	if m.dlqSize != nil {
 		m.dlqSize.Record(context.Background(), size, queueAttr(queue))
 	}
+}
+
+// buildInstruments creates every metric instrument on m, returning the errors
+// from any individual instrument that failed. Split out of NewMetrics to keep
+// each function's cyclomatic complexity in check (a single new instrument
+// otherwise pushes NewMetrics past the lint threshold).
+func (m *Metrics) buildInstruments(meter metric.Meter) []error {
+	var errs []error
+	var err error
+	if m.publishes, err = meter.Int64Counter("pgqueue.publish.messages",
+		metric.WithDescription("Messages published to pgqueue queues")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.consumeDur, err = meter.Float64Histogram("pgqueue.consume.duration",
+		metric.WithDescription("Message processing latency"),
+		metric.WithUnit("s")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.acks, err = meter.Int64Counter("pgqueue.ack.total",
+		metric.WithDescription("Acknowledgement outcomes (ack and nack)")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.ackAfterExpired, err = meter.Int64Counter("pgqueue.ack.after_expired",
+		metric.WithDescription(
+			"Receipts ack'd/nack'd after their claim expired or no longer matched; messages will redeliver",
+		)); err != nil {
+		errs = append(errs, err)
+	}
+	if m.queueDepth, err = meter.Int64Gauge("pgqueue.queue.depth",
+		metric.WithDescription("Pending message count")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.dlqSize, err = meter.Int64Gauge("pgqueue.dlq.size",
+		metric.WithDescription("Dead-letter queue size")); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
 }
 
 // queueAttr is the common single-attribute option keyed by queue name.

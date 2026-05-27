@@ -33,11 +33,12 @@ const queueLabel = "queue"
 
 // Metrics is a Prometheus-backed pgqueue.MetricsRecorder.
 type Metrics struct {
-	publishes  *prometheus.CounterVec
-	consumeDur *prometheus.HistogramVec
-	acks       *prometheus.CounterVec
-	queueDepth *prometheus.GaugeVec
-	dlqSize    *prometheus.GaugeVec
+	publishes        *prometheus.CounterVec
+	consumeDur       *prometheus.HistogramVec
+	acks             *prometheus.CounterVec
+	ackAfterExpired  *prometheus.CounterVec
+	queueDepth       *prometheus.GaugeVec
+	dlqSize          *prometheus.GaugeVec
 }
 
 // compile-time check.
@@ -76,6 +77,12 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 		Help: "Acknowledgement outcomes by queue and result.",
 	}, []string{queueLabel, "result"})); err != nil {
 		return nil, fmt.Errorf("prompgqueue: register ack counter: %w", err)
+	}
+	if m.ackAfterExpired, err = registerCollector(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pgqueue_ack_after_expired_total",
+		Help: "Receipts ack'd/nack'd after their claim expired or no longer matched; messages will redeliver.",
+	}, []string{queueLabel})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register ack-after-expired counter: %w", err)
 	}
 	if m.queueDepth, err = registerCollector(reg, prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "pgqueue_queue_depth",
@@ -133,6 +140,12 @@ func (m *Metrics) RecordAck(queue string, ok bool) {
 		result = "ack"
 	}
 	m.acks.WithLabelValues(queue, result).Inc()
+}
+
+// RecordAckAfterExpired counts one receipt whose claim no longer matched at
+// ack/nack time — the message will be redelivered.
+func (m *Metrics) RecordAckAfterExpired(queue string) {
+	m.ackAfterExpired.WithLabelValues(queue).Inc()
 }
 
 // ObserveQueueDepth records the current pending-message count for a queue.

@@ -698,6 +698,127 @@ func newBackoffQueue(t *testing.T) (*pgqueue.Queue, func()) {
 	}
 }
 
+// newMetricsQueue builds a Queue with a recordingMetrics attached, returning
+// both for assertions on the RecordAckAfterExpired emissions driven by the
+// batch helpers.
+func newMetricsQueue(t *testing.T) (*pgqueue.Queue, *recordingMetrics, func()) {
+	t.Helper()
+	ctx := context.Background()
+	db, containerCleanup := setupTestContainer(t)
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+	metrics := &recordingMetrics{}
+	pq, err := pgqueue.New(ctx, db,
+		pgqueue.WithMetrics(metrics),
+		pgqueue.WithBackoffPolicy(pgqueue.BackoffPolicy{
+			BaseDelay:  time.Nanosecond,
+			MaxDelay:   time.Nanosecond,
+			Multiplier: 1,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	return pq, metrics, func() {
+		_ = pq.Close()
+		containerCleanup()
+	}
+}
+
+// TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts verifies that the
+// silently-skipped receipts of a partial-success AckChannelBatch are reported
+// to the registered MetricsRecorder via RecordAckAfterExpired (issue #113).
+func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
+	pq, metrics, cleanup := newMetricsQueue(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "ack-batch-expired"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// Publish 2 valid messages, then build a batch mixing real receipts with
+	// stale ones whose ClaimID is zero and whose MessageIDs do not match any
+	// processing row.
+	if _, err := pq.PublishChannelBatch(ctx, channelName, []pgqueue.PublishMessage{
+		{Payload: []byte("v1")},
+		{Payload: []byte("v2")},
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	valid := make([]pgqueue.Receipt, 0, 2)
+	for range 2 {
+		msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+		if err != nil {
+			t.Fatalf("consume: %v", err)
+		}
+		valid = append(valid, msg.Receipt())
+	}
+
+	staleA, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("uuid v7: %v", err)
+	}
+	staleB, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("uuid v7: %v", err)
+	}
+	mixed := []pgqueue.Receipt{
+		valid[0],
+		{MessageID: staleA},
+		valid[1],
+		{MessageID: staleB},
+	}
+	if err := pq.AckChannelBatch(ctx, channelName, mixed); err != nil {
+		t.Fatalf("ack batch: %v", err)
+	}
+
+	if got := metrics.ackAfterExpiredCount(); got != 2 {
+		t.Errorf("RecordAckAfterExpired emissions = %d, want 2 (one per skipped receipt)", got)
+	}
+}
+
+// TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts is the nack
+// counterpart of the AckChannelBatch test: receipts that do not match any
+// processing row are counted via RecordAckAfterExpired (issue #113).
+func TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
+	pq, metrics, cleanup := newMetricsQueue(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "nack-batch-expired"
+	if err := pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(3)); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	if _, err := pq.PublishChannelBatch(ctx, channelName, []pgqueue.PublishMessage{
+		{Payload: []byte("v1")},
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	staleA, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("uuid v7: %v", err)
+	}
+	mixed := []pgqueue.Receipt{msg.Receipt(), {MessageID: staleA}}
+	if err := pq.NackChannelBatch(ctx, channelName, mixed, "transient"); err != nil {
+		t.Fatalf("nack batch: %v", err)
+	}
+
+	if got := metrics.ackAfterExpiredCount(); got != 1 {
+		t.Errorf("RecordAckAfterExpired emissions = %d, want 1 (one per skipped receipt)", got)
+	}
+}
+
 // TestNackChannelBatchAppliesBackoff verifies that a batch nack honors the
 // queue's BackoffPolicy: the retried messages are not redelivered until the
 // backoff delay has elapsed, exactly as a single Nack would behave (FR-023).

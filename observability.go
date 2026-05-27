@@ -55,6 +55,13 @@ type MetricsRecorder interface {
 	RecordConsume(queue string, latency time.Duration)
 	// RecordAck reports an acknowledgement outcome; ok is false for a nack.
 	RecordAck(queue string, ok bool)
+	// RecordAckAfterExpired reports a receipt whose claim was no longer valid
+	// at ack/nack time — the message either expired and was reassigned to
+	// another consumer, or the claim never matched. The corresponding message
+	// will be redelivered. Emitted once per silently-skipped receipt by the
+	// batch ack/nack helpers; operators wire this to detect at-least-twice
+	// delivery driven by handlers outrunning the visibility timeout.
+	RecordAckAfterExpired(queue string)
 	// ObserveQueueDepth reports the current number of pending messages.
 	ObserveQueueDepth(queue string, depth int64)
 	// ObserveDLQSize reports the current dead-letter queue size.
@@ -110,6 +117,19 @@ func (pq *Queue) recordConsume(queue string, latency time.Duration) {
 func (pq *Queue) recordAck(queue string, ok bool) {
 	if pq.cfg.metrics != nil {
 		pq.cfg.metrics.RecordAck(queue, ok)
+	}
+}
+
+// recordAckAfterExpired reports n silently-skipped receipts whose claims no
+// longer matched at ack/nack time, if metrics are on. The batch helpers call
+// this once per skipped receipt so the per-receipt counter reflects the number
+// of messages that will redeliver.
+func (pq *Queue) recordAckAfterExpired(queue string, n int) {
+	if pq.cfg.metrics == nil || n <= 0 {
+		return
+	}
+	for range n {
+		pq.cfg.metrics.RecordAckAfterExpired(queue)
 	}
 }
 
