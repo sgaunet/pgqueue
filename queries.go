@@ -332,6 +332,12 @@ func (pq *Queue) checkTableNameNotExists(
 	return nil
 }
 
+// listQueuesPageSize bounds the metadata rows fetched per round-trip in
+// listQueuesRaw. The query is keyset-paginated by id (UUIDv7, time-ordered),
+// so per-statement memory stays bounded even when an operator skipped
+// WithMaxQueues and accumulated very many queues (#66).
+const listQueuesPageSize = 1000
+
 func (pq *Queue) listQueuesRaw(
 	ctx context.Context,
 	queueType string,
@@ -341,16 +347,42 @@ func (pq *Queue) listQueuesRaw(
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
 		FROM %s
 		WHERE queue_type = $1
-		ORDER BY created_at DESC
+		  AND ($2::uuid IS NULL OR id > $2)
+		ORDER BY id
+		LIMIT $3
 	`, pq.globalTable("pgqueue_metadata"))
 
-	rows, err := pq.db.QueryContext(ctx, query, queueType)
+	items := []QueueMetadata{}
+	var afterID any
+	for {
+		pageStart := len(items)
+		if err := pq.fetchQueueMetadataPage(
+			ctx, query, queueType, afterID, &items,
+		); err != nil {
+			return nil, err
+		}
+		fetched := len(items) - pageStart
+		if fetched < listQueuesPageSize {
+			return items, nil
+		}
+		afterID = items[len(items)-1].ID
+	}
+}
+
+// fetchQueueMetadataPage reads one keyset page of queue metadata into items.
+// Split out of listQueuesRaw so the per-page rows.Close cleanup is local and
+// the page loop stays focused.
+func (pq *Queue) fetchQueueMetadataPage(
+	ctx context.Context,
+	query, queueType string,
+	afterID any,
+	items *[]QueueMetadata,
+) error {
+	rows, err := pq.db.QueryContext(ctx, query, queueType, afterID, listQueuesPageSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query queues: %w", err)
+		return fmt.Errorf("failed to query queues: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-
-	items := []QueueMetadata{}
 	for rows.Next() {
 		var meta QueueMetadata
 		if err := rows.Scan(
@@ -363,16 +395,14 @@ func (pq *Queue) listQueuesRaw(
 			&meta.CreatedAt,
 			&meta.UpdatedAt,
 		); err != nil {
-			return nil, fmt.Errorf("failed to scan queue row: %w", err)
+			return fmt.Errorf("failed to scan queue row: %w", err)
 		}
-		items = append(items, meta)
+		*items = append(*items, meta)
 	}
-
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate queue rows: %w", err)
+		return fmt.Errorf("failed to iterate queue rows: %w", err)
 	}
-
-	return items, nil
+	return nil
 }
 
 // Subscriber query methods
