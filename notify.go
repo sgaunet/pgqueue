@@ -96,32 +96,41 @@ func (w *waker) signal() {
 	w.ch = make(chan struct{})
 }
 
+// listenEscalateThreshold is the number of consecutive Listen failures on the
+// same channel after which the notifier escalates from WARN to ERROR. Every
+// further multiple of this threshold re-fires an ERROR line so a persistently
+// degraded LISTEN stays visible in operator dashboards without spamming.
+const listenEscalateThreshold = 10
+
 // notifier demultiplexes a Listener's single notification stream into per-queue
 // wakers and lazily issues LISTEN for each queue a consumer blocks on.
 type notifier struct {
 	listener Listener
 	logger   *slog.Logger
 
-	mu        sync.Mutex
-	wakers    map[string]*waker // notification channel -> waker
-	listening map[string]bool   // notification channel -> LISTEN issued
-	closed    bool
+	mu             sync.Mutex
+	wakers         map[string]*waker // notification channel -> waker
+	listening      map[string]bool   // notification channel -> LISTEN issued
+	listenFailures map[string]int    // notification channel -> consecutive Listen failures (#68)
+	closed         bool
 
 	pumpOnce sync.Once
 }
 
 // newNotifier wraps a Listener. It returns nil when listener is nil so callers
 // can treat "no push delivery" as a simple nil check. The logger is used to
-// report a pump-goroutine panic; nil silences the report.
+// report a pump-goroutine panic and persistent LISTEN failures; nil silences
+// both reports.
 func newNotifier(listener Listener, logger *slog.Logger) *notifier {
 	if listener == nil {
 		return nil
 	}
 	return &notifier{
-		listener:  listener,
-		logger:    logger,
-		wakers:    make(map[string]*waker),
-		listening: make(map[string]bool),
+		listener:       listener,
+		logger:         logger,
+		wakers:         make(map[string]*waker),
+		listening:      make(map[string]bool),
+		listenFailures: make(map[string]int),
 	}
 }
 
@@ -154,13 +163,41 @@ func (n *notifier) wakeChan(ctx context.Context, notifyChannel string) <-chan st
 
 	if !n.listening[notifyChannel] {
 		// Issue LISTEN exactly once per channel, atomically with recording it.
+		// On error the channel stays unregistered: the safety-net poll still
+		// delivers the message and a later wakeChan call retries LISTEN. A
+		// persistently failing LISTEN used to be invisible to operators; now
+		// every failure logs at WARN and the count is escalated to ERROR
+		// every listenEscalateThreshold consecutive failures so a
+		// misconfigured Listener is impossible to miss (#68).
 		if err := n.listener.Listen(ctx, notifyChannel); err == nil {
 			n.listening[notifyChannel] = true
+			delete(n.listenFailures, notifyChannel)
+		} else {
+			n.listenFailures[notifyChannel]++
+			n.logListenFailure(notifyChannel, err, n.listenFailures[notifyChannel])
 		}
-		// On error the channel stays unregistered: the safety-net poll still
-		// delivers the message and a later wakeChan call retries LISTEN.
 	}
 	return w.wait()
+}
+
+// logListenFailure reports a Listen call failure. It always logs at WARN with
+// the channel, the underlying error and the consecutive-failure count, and
+// re-escalates to ERROR every listenEscalateThreshold failures so a
+// persistently degraded LISTEN remains visible in operator dashboards (#68).
+// Called with n.mu held.
+func (n *notifier) logListenFailure(channel string, err error, attempt int) {
+	if n.logger == nil {
+		return
+	}
+	n.logger.Warn("pgqueue: LISTEN failed; consumers degrade to safety-net poll",
+		"channel", channel,
+		"attempt", attempt,
+		"error", err)
+	if attempt%listenEscalateThreshold == 0 {
+		n.logger.Error("pgqueue: LISTEN keeps failing on this channel",
+			"channel", channel,
+			"consecutive_failures", attempt)
+	}
 }
 
 // forget drops the waker and LISTEN bookkeeping for a notify channel whose
@@ -178,6 +215,7 @@ func (n *notifier) forget(ctx context.Context, notifyChannel string) {
 	n.mu.Lock()
 	delete(n.wakers, notifyChannel)
 	delete(n.listening, notifyChannel)
+	delete(n.listenFailures, notifyChannel)
 	closed := n.closed
 	listener := n.listener
 	n.mu.Unlock()
