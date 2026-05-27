@@ -33,7 +33,11 @@ func (pq *Queue) GetStats(
 		QueueName: queueName,
 	}
 
-	// Get message counts by status
+	// Message counts and the DLQ count are gathered in a single statement so
+	// they share one snapshot under READ COMMITTED — otherwise messages can
+	// transition (pending → processing → completed, or nack → DLQ) between two
+	// separate queries and the returned counts would not sum to a real point
+	// in time (issue #112).
 	if queueType == QueueTypeChannel {
 		if err := pq.getChannelStats(ctx, tableName, stats); err != nil {
 			return nil, fmt.Errorf("failed to get channel stats: %w", err)
@@ -42,12 +46,6 @@ func (pq *Queue) GetStats(
 		if err := pq.getPubSubStats(ctx, tableName, stats); err != nil {
 			return nil, fmt.Errorf("failed to get pub/sub stats: %w", err)
 		}
-	}
-
-	// Get DLQ count
-	dlqQuery := "SELECT COUNT(*) FROM " + pq.dlqTable(tableName)
-	if err := pq.db.QueryRowContext(ctx, dlqQuery).Scan(&stats.DLQCount); err != nil {
-		return nil, fmt.Errorf("failed to get DLQ count: %w", err)
 	}
 
 	// Feed the observed depth to a registered MetricsRecorder (FR-018); a no-op
@@ -257,6 +255,8 @@ func (pq *Queue) getChannelStats(
 	// The oldest-pending age is computed in SQL (NOW() - created_at) rather
 	// than with time.Since on the application clock, so it is consistent with
 	// the database clock and never negative under NTP skew (R-19).
+	// The DLQ count rides on the same statement so all four counters share a
+	// single snapshot (issue #112).
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
@@ -266,9 +266,11 @@ func (pq *Queue) getChannelStats(
 			AVG(EXTRACT(EPOCH FROM (processed_at - created_at)))
 				FILTER (WHERE processed_at IS NOT NULL) AS avg_processing_time,
 			EXTRACT(EPOCH FROM (NOW() - MIN(created_at)
-				FILTER (WHERE status = '%s'))) AS oldest_pending_age
+				FILTER (WHERE status = '%s'))) AS oldest_pending_age,
+			(SELECT COUNT(*) FROM %s) AS dlq_count
 		FROM %s
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusCompleted, MessageStatusPending, pq.msgTable(tableName))
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusCompleted, MessageStatusPending,
+		pq.dlqTable(tableName), pq.msgTable(tableName))
 
 	var avgSeconds, oldestPendingAge sql.NullFloat64
 
@@ -278,6 +280,7 @@ func (pq *Queue) getChannelStats(
 		&stats.CompletedCount,
 		&avgSeconds,
 		&oldestPendingAge,
+		&stats.DLQCount,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get channel stats: %w", err)
@@ -315,6 +318,8 @@ func (pq *Queue) getPubSubStats(
 	stats *QueueStats,
 ) error {
 	// Age computed in SQL for clock consistency — see getChannelStats (R-19).
+	// The DLQ count rides on the same statement so all counters share a
+	// single snapshot (issue #112).
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
 		SELECT
@@ -324,9 +329,11 @@ func (pq *Queue) getPubSubStats(
 			AVG(EXTRACT(EPOCH FROM (acked_at - created_at)))
 				FILTER (WHERE acked_at IS NOT NULL) AS avg_processing_time,
 			EXTRACT(EPOCH FROM (NOW() - MIN(created_at)
-				FILTER (WHERE status = '%s'))) AS oldest_pending_age
+				FILTER (WHERE status = '%s'))) AS oldest_pending_age,
+			(SELECT COUNT(*) FROM %s) AS dlq_count
 		FROM %s
-	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, pq.subTable(tableName))
+	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending,
+		pq.dlqTable(tableName), pq.subTable(tableName))
 
 	var avgSeconds, oldestPendingAge sql.NullFloat64
 
@@ -336,6 +343,7 @@ func (pq *Queue) getPubSubStats(
 		&stats.CompletedCount,
 		&avgSeconds,
 		&oldestPendingAge,
+		&stats.DLQCount,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to get pub/sub stats: %w", err)
