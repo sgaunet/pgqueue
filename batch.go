@@ -3,7 +3,6 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -80,7 +79,7 @@ func (pq *Queue) publishBatchResolved(
 		}
 	}
 
-	ids, metadataJSONs, err := prepareBatchMessages(messages)
+	ids, metadataJSONs, err := pq.prepareBatchMessages(queueMeta, messages)
 	if err != nil {
 		return nil, err
 	}
@@ -434,23 +433,25 @@ func validateBatchSize(size int) error {
 	return nil
 }
 
-// prepareBatchMessages generates IDs and marshals metadata for all messages.
-func prepareBatchMessages(messages []PublishMessage) ([]uuid.UUID, [][]byte, error) {
+// prepareBatchMessages generates IDs and marshals metadata for all messages,
+// rejecting any message whose marshaled metadata exceeds the configured cap.
+func (pq *Queue) prepareBatchMessages(
+	queueMeta *QueueMetadata,
+	messages []PublishMessage,
+) ([]uuid.UUID, [][]byte, error) {
 	ids := make([]uuid.UUID, len(messages))
 	metadataJSONs := make([][]byte, len(messages))
 
 	for i := range messages {
-		var err error
-		ids[i], err = NewUUIDv7()
+		id, err := NewUUIDv7()
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to generate message ID: %w", err)
 		}
+		ids[i] = id
 
-		if messages[i].Metadata != nil {
-			metadataJSONs[i], err = json.Marshal(messages[i].Metadata)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to marshal metadata: %w", err)
-			}
+		metadataJSONs[i], err = pq.marshalAndValidateMetadata(queueMeta, messages[i].Metadata)
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 

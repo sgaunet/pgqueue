@@ -122,6 +122,64 @@ func TestValidateMaxMessageSize(t *testing.T) {
 	}
 }
 
+// TestApplyConfigOptionsMaxMetadataSize verifies the 0-coerces-to-default
+// behavior and that an explicit positive value (including MaxAllowedMetadataSize)
+// is preserved verbatim.
+func TestApplyConfigOptionsMaxMetadataSize(t *testing.T) {
+	if got := applyConfigOptions(nil).maxMetadataSize; got != defaultMaxMetadataSize {
+		t.Errorf("no option: maxMetadataSize = %d, want %d", got, defaultMaxMetadataSize)
+	}
+
+	max := applyConfigOptions([]Option{WithMaxMetadataSize(MaxAllowedMetadataSize)}).maxMetadataSize
+	if max != MaxAllowedMetadataSize {
+		t.Errorf("WithMaxMetadataSize(MaxAllowedMetadataSize): maxMetadataSize = %d, want %d",
+			max, MaxAllowedMetadataSize)
+	}
+
+	custom := applyConfigOptions([]Option{WithMaxMetadataSize(64 << 10)}).maxMetadataSize
+	if custom != 64<<10 {
+		t.Errorf("WithMaxMetadataSize(64 KiB): maxMetadataSize = %d, want %d", custom, 64<<10)
+	}
+}
+
+// TestValidateMaxMetadataSize covers the boundary behavior of the metadata
+// cap guard: zero is allowed (resolves to default downstream),
+// MaxAllowedMetadataSize is the inclusive upper bound, and anything outside
+// that range returns ErrInvalidConfig.
+func TestValidateMaxMetadataSize(t *testing.T) {
+	cases := []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{"zero", 0, false},
+		{"small positive", 1024, false},
+		{"at ceiling", MaxAllowedMetadataSize, false},
+		{"above ceiling", MaxAllowedMetadataSize + 1, true},
+		{"negative", -1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMaxMetadataSize(tc.size)
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Errorf("size=%d: err = %v, want ErrInvalidConfig", tc.size, err)
+				}
+			} else if err != nil {
+				t.Errorf("size=%d: unexpected err %v", tc.size, err)
+			}
+		})
+	}
+}
+
+// TestOnlySchemaOptionRejectsMaxMetadataSize confirms WithMaxMetadataSize is
+// not silently accepted by InitSchema.
+func TestOnlySchemaOptionRejectsMaxMetadataSize(t *testing.T) {
+	if onlySchemaOption([]Option{WithMaxMetadataSize(1024)}) {
+		t.Error("WithMaxMetadataSize: onlySchemaOption = true, want false")
+	}
+}
+
 // TestValidateConfigMaxMessageSize verifies the legacy Config struct enforces
 // the same ceiling as the functional-options path, so deprecated Init callers
 // see consistent rejection of out-of-range payload caps.

@@ -184,6 +184,7 @@ func onlySchemaOption(opts []Option) bool {
 	// field. The interface fields are tested with != nil, which never panics.
 	nonSchema := []bool{
 		probe.maxMessageSize != 0,
+		probe.maxMetadataSize != 0,
 		probe.defaultMaxRetries != 0,
 		probe.maxRetriesSet,
 		probe.defaultTTL != 0,
@@ -233,6 +234,34 @@ func validateMaxMessageSize(n int) error {
 		)
 	}
 	return nil
+}
+
+// validateMaxMetadataSize ensures a metadata-size cap is non-negative and
+// within PostgreSQL's JSONB per-value limit (MaxAllowedMetadataSize). Zero is
+// allowed and means "use the package default" at the layer that consumes it.
+func validateMaxMetadataSize(n int) error {
+	if n < 0 || n > MaxAllowedMetadataSize {
+		return fmt.Errorf(
+			"max metadata size %d out of range [0, %d]: %w",
+			n, MaxAllowedMetadataSize, ErrInvalidConfig,
+		)
+	}
+	return nil
+}
+
+// validateResolvedConfig runs the post-applyConfigOptions checks shared by New
+// so the constructor stays under the cyclomatic-complexity budget.
+func validateResolvedConfig(cfg queueConfig) error {
+	if err := validateMaxMessageSize(cfg.maxMessageSize); err != nil {
+		return err
+	}
+	if err := validateMaxMetadataSize(cfg.maxMetadataSize); err != nil {
+		return err
+	}
+	if cfg.defaultMaxRetries < 0 || int64(cfg.defaultTTL) < 0 || cfg.maxQueues < 0 {
+		return ErrInvalidConfig
+	}
+	return validateSchemaName(cfg.schemaName)
 }
 
 // validateRawOptions checks the raw, pre-normalization option values:
@@ -311,13 +340,7 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 	}
 
 	cfg := applyConfigOptions(opts)
-	if err := validateMaxMessageSize(cfg.maxMessageSize); err != nil {
-		return nil, err
-	}
-	if cfg.defaultMaxRetries < 0 || int64(cfg.defaultTTL) < 0 || cfg.maxQueues < 0 {
-		return nil, ErrInvalidConfig
-	}
-	if err := validateSchemaName(cfg.schemaName); err != nil {
+	if err := validateResolvedConfig(cfg); err != nil {
 		return nil, err
 	}
 
@@ -386,11 +409,15 @@ func (pq *Queue) CreateChannel(
 	if err := validateMaxMessageSize(o.maxMessageSize); err != nil {
 		return err
 	}
+	if err := validateMaxMetadataSize(o.maxMetadataSize); err != nil {
+		return err
+	}
 	co := ChannelOptions{
-		MaxMessageSize: o.maxMessageSize,
-		TTL:            o.ttl,
-		MaxRetries:     o.maxRetries,
-		MaxRetriesSet:  o.maxRetriesSet,
+		MaxMessageSize:  o.maxMessageSize,
+		MaxMetadataSize: o.maxMetadataSize,
+		TTL:             o.ttl,
+		MaxRetries:      o.maxRetries,
+		MaxRetriesSet:   o.maxRetriesSet,
 	}
 	return pq.createQueue(ctx, QueueTypeChannel, name, co)
 }
@@ -410,11 +437,15 @@ func (pq *Queue) CreateTopic(
 	if err := validateMaxMessageSize(o.maxMessageSize); err != nil {
 		return err
 	}
+	if err := validateMaxMetadataSize(o.maxMetadataSize); err != nil {
+		return err
+	}
 	to := TopicOptions{
-		MaxMessageSize: o.maxMessageSize,
-		TTL:            o.ttl,
-		MaxRetries:     o.maxRetries,
-		MaxRetriesSet:  o.maxRetriesSet,
+		MaxMessageSize:  o.maxMessageSize,
+		MaxMetadataSize: o.maxMetadataSize,
+		TTL:             o.ttl,
+		MaxRetries:      o.maxRetries,
+		MaxRetriesSet:   o.maxRetriesSet,
 	}
 	return pq.createQueue(ctx, QueueTypePubSub, name, to)
 }

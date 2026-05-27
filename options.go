@@ -12,10 +12,11 @@ type QueueOption func(*queueCreateOpts)
 
 // queueCreateOpts holds the resolved per-queue creation options.
 type queueCreateOpts struct {
-	maxMessageSize int
-	ttl            time.Duration
-	maxRetries     int
-	maxRetriesSet  bool // true when WithQueueMaxRetries was supplied
+	maxMessageSize  int
+	maxMetadataSize int
+	ttl             time.Duration
+	maxRetries      int
+	maxRetriesSet   bool // true when WithQueueMaxRetries was supplied
 }
 
 // WithQueueMaxRetries overrides the default maximum retry count for a specific
@@ -52,6 +53,20 @@ func WithQueueTTL(d time.Duration) QueueOption {
 func WithQueueMaxMessageSize(bytes int) QueueOption {
 	return func(o *queueCreateOpts) {
 		o.maxMessageSize = bytes
+	}
+}
+
+// WithQueueMaxMetadataSize overrides the maximum marshaled metadata size for a
+// specific channel or topic.
+//
+// Zero (the default) inherits the queue-wide cap configured via
+// WithMaxMetadataSize. Any positive value up to MaxAllowedMetadataSize
+// (PostgreSQL's JSONB per-value limit) is honored verbatim. Negative values
+// and values above MaxAllowedMetadataSize make CreateChannel/CreateTopic
+// return ErrInvalidConfig.
+func WithQueueMaxMetadataSize(bytes int) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.maxMetadataSize = bytes
 	}
 }
 

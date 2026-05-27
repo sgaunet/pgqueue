@@ -48,9 +48,10 @@ type Config struct {
 
 // TopicOptions holds configuration for a pub/sub topic.
 type TopicOptions struct {
-	MaxMessageSize int           // Maximum message size (0 = use default)
-	TTL            time.Duration // Message time-to-live (0 = no expiration)
-	MaxRetries     int           // Maximum retry attempts per subscriber
+	MaxMessageSize  int           // Maximum message size (0 = use default)
+	MaxMetadataSize int           // Maximum marshaled metadata size (0 = use default)
+	TTL             time.Duration // Message time-to-live (0 = no expiration)
+	MaxRetries      int           // Maximum retry attempts per subscriber
 	// MaxRetriesSet records whether MaxRetries was set explicitly, so an
 	// explicit MaxRetries of 0 ("no retries") is distinguishable from "unset".
 	MaxRetriesSet bool
@@ -58,9 +59,10 @@ type TopicOptions struct {
 
 // ChannelOptions holds configuration for a point-to-point channel.
 type ChannelOptions struct {
-	MaxMessageSize int           // Maximum message size (0 = use default)
-	TTL            time.Duration // Message time-to-live (0 = no expiration)
-	MaxRetries     int           // Maximum retry attempts
+	MaxMessageSize  int           // Maximum message size (0 = use default)
+	MaxMetadataSize int           // Maximum marshaled metadata size (0 = use default)
+	TTL             time.Duration // Message time-to-live (0 = no expiration)
+	MaxRetries      int           // Maximum retry attempts
 	// MaxRetriesSet records whether MaxRetries was set explicitly, so an
 	// explicit MaxRetries of 0 ("no retries") is distinguishable from "unset".
 	MaxRetriesSet bool

@@ -69,15 +69,9 @@ func (pq *Queue) PublishWithID(
 		}
 	}
 
-	// Marshal metadata if provided
-	var metadataJSON []byte
-	if metadata != nil {
-		metadataJSON, err = json.Marshal(metadata)
-		if err != nil {
-			return uuid.UUID{}, fmt.Errorf(
-				"failed to marshal metadata: %w", err,
-			)
-		}
+	metadataJSON, err := pq.marshalAndValidateMetadata(queueMeta, metadata)
+	if err != nil {
+		return uuid.UUID{}, err
 	}
 
 	// Publish based on queue type
@@ -148,6 +142,43 @@ func (pq *Queue) validatePayloadSize(
 	}
 
 	return nil
+}
+
+// resolveMaxMetadataSize returns the effective metadata-size cap for a queue,
+// preferring the per-queue MaxMetadataSize from its stored config and falling
+// back to the queue-wide cap.
+func (pq *Queue) resolveMaxMetadataSize(queueMeta *QueueMetadata) int {
+	var config struct {
+		MaxMetadataSize int `json:"MaxMetadataSize"`
+	}
+	if err := json.Unmarshal(queueMeta.Config, &config); err == nil && config.MaxMetadataSize > 0 {
+		return config.MaxMetadataSize
+	}
+	return pq.cfg.maxMetadataSize
+}
+
+// marshalAndValidateMetadata marshals message metadata to JSON and rejects it
+// if the result exceeds the per-queue or queue-wide cap. A nil metadata map
+// returns (nil, nil); the caller stores no JSONB value in that case.
+func (pq *Queue) marshalAndValidateMetadata(
+	queueMeta *QueueMetadata,
+	metadata map[string]any,
+) ([]byte, error) {
+	if metadata == nil {
+		return nil, nil
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+	limit := pq.resolveMaxMetadataSize(queueMeta)
+	if limit > 0 && len(metadataJSON) > limit {
+		return nil, fmt.Errorf(
+			"size %d exceeds limit %d: %w",
+			len(metadataJSON), limit, ErrMetadataSizeExceeded,
+		)
+	}
+	return metadataJSON, nil
 }
 
 // resolveMaxRetries resolves the effective max-retry count for a queue from its
@@ -336,12 +367,9 @@ func (pq *Queue) publishTyped(
 			return uuid.UUID{}, fmt.Errorf("failed to generate message ID: %w", err)
 		}
 	}
-	var metadataJSON []byte
-	if metadata != nil {
-		metadataJSON, err = json.Marshal(metadata)
-		if err != nil {
-			return uuid.UUID{}, fmt.Errorf("failed to marshal metadata: %w", err)
-		}
+	metadataJSON, err := pq.marshalAndValidateMetadata(queueMeta, metadata)
+	if err != nil {
+		return uuid.UUID{}, err
 	}
 
 	if queueType == QueueTypePubSub {

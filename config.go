@@ -17,6 +17,17 @@ const defaultMaxMessageSize = 256 * 1024
 // pick the smallest size that fits your workload.
 const MaxAllowedMessageSize = 1 << 30
 
+// defaultMaxMetadataSize is 16 KiB. It bounds the marshaled JSON size of a
+// message's metadata map so an unbounded callsite cannot exhaust storage or
+// bloat per-queue JSONB scans.
+const defaultMaxMetadataSize = 16 * 1024
+
+// MaxAllowedMetadataSize is the largest marshaled metadata size pgqueue will
+// accept, in bytes. It matches PostgreSQL's hard per-value limit for the JSONB
+// column used to store metadata (1 GiB). WithMaxMetadataSize and
+// WithQueueMaxMetadataSize reject any value above this with ErrInvalidConfig.
+const MaxAllowedMetadataSize = 1 << 30
+
 // Option is a functional configuration option for New and InitSchema.
 type Option func(*queueConfig)
 
@@ -24,6 +35,7 @@ type Option func(*queueConfig)
 // It is private; callers build it via functional options.
 type queueConfig struct {
 	maxMessageSize    int
+	maxMetadataSize   int
 	defaultMaxRetries int
 	maxRetriesSet     bool // true when WithDefaultMaxRetries was supplied
 	defaultTTL        time.Duration
@@ -50,6 +62,19 @@ type queueConfig struct {
 func WithMaxMessageSize(bytes int) Option {
 	return func(c *queueConfig) {
 		c.maxMessageSize = bytes
+	}
+}
+
+// WithMaxMetadataSize sets the maximum allowed size of a message's marshaled
+// JSON metadata, in bytes.
+//
+// Zero (the default) selects the built-in default of 16 KiB. Any positive
+// value up to MaxAllowedMetadataSize (PostgreSQL's JSONB per-value limit) is
+// honored verbatim. Negative values and values above MaxAllowedMetadataSize
+// make New return ErrInvalidConfig.
+func WithMaxMetadataSize(bytes int) Option {
+	return func(c *queueConfig) {
+		c.maxMetadataSize = bytes
 	}
 }
 
@@ -172,6 +197,9 @@ func applyConfigOptions(opts []Option) queueConfig {
 	}
 	if c.maxMessageSize == 0 {
 		c.maxMessageSize = defaultMaxMessageSize
+	}
+	if c.maxMetadataSize == 0 {
+		c.maxMetadataSize = defaultMaxMetadataSize
 	}
 	// Apply the default of 3 only when WithDefaultMaxRetries was not supplied,
 	// so an explicit WithDefaultMaxRetries(0) is honored as "no retries".

@@ -49,6 +49,10 @@ var (
 	// ErrMessageSizeExceeded is returned when a message payload exceeds the configured limit.
 	ErrMessageSizeExceeded = errors.New("message size exceeds limit")
 
+	// ErrMetadataSizeExceeded is returned when the marshaled JSON metadata of a
+	// message exceeds the configured per-queue or queue-wide cap.
+	ErrMetadataSizeExceeded = errors.New("message metadata size exceeds limit")
+
 	// ErrMessageNotFound is returned when a message cannot be found or is not in the expected state.
 	ErrMessageNotFound = errors.New("message not found or not in processing state")
 
