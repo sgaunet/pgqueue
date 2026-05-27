@@ -384,10 +384,12 @@ func (pq *Queue) reclaimChannelAttempt(
 		// fall through to reclaim accounting below.
 	case MessageStatusPending:
 		return row.retryCount, false, nil
+	case MessageStatusCompleted, MessageStatusAcked:
+		fallthrough
 	default:
 		return 0, false, fmt.Errorf(
-			"unexpected channel message status %q for id %s",
-			row.status, row.id,
+			"%w: channel message id %s status %q",
+			ErrUnexpectedMessageStatus, row.id, row.status,
 		)
 	}
 

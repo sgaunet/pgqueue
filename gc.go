@@ -186,6 +186,16 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	allQueues = append(allQueues, topics...)
 	allQueues = append(allQueues, channels...)
 
+	return errors.Join(gc.dispatchCollect(ctx, allQueues)...)
+}
+
+// dispatchCollect fans queues out to a bounded worker pool and aggregates
+// per-queue errors. It is the body of Collect, factored out to keep that
+// function under the funlen ceiling.
+func (gc *GarbageCollector) dispatchCollect(
+	ctx context.Context,
+	queues []QueueMetadata,
+) []error {
 	// dispatchCtx lets a worker short-circuit the dispatch loop when it sees
 	// a sentinel that means the pool is dead (sql.ErrConnDone, driver bad
 	// connection). In-flight workers keep running against the outer ctx for
@@ -204,7 +214,7 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 		errs = appendCappedErr(errs, queueName, qerr)
 	}
 
-	for _, queue := range allQueues {
+	for _, queue := range queues {
 		select {
 		case <-dispatchCtx.Done():
 			wg.Wait()
@@ -222,7 +232,7 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 					fmt.Errorf("garbage collection cancelled: %w", outerErr))
 			}
 			mu.Unlock()
-			return errors.Join(cancelErrs...)
+			return cancelErrs
 		case sem <- struct{}{}:
 			wg.Add(1)
 			go func(q QueueMetadata) {
@@ -249,7 +259,7 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	}
 
 	wg.Wait()
-	return errors.Join(errs...)
+	return errs
 }
 
 // isPoolDead reports whether err signals an unrecoverable connection-pool

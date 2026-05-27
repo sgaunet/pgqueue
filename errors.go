@@ -142,4 +142,9 @@ var (
 	ErrInvalidPerformedBy = errors.New(
 		"invalid PerformedBy: must be at most 256 bytes and contain no NUL/CR/LF",
 	)
+
+	// ErrUnexpectedMessageStatus is returned by reclaim paths when a row is
+	// found in a status that is neither pending nor processing — a state that
+	// indicates schema drift or a regressed migration (#65).
+	ErrUnexpectedMessageStatus = errors.New("unexpected message status")
 )

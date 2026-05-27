@@ -532,10 +532,12 @@ func (pq *Queue) reclaimTopicAttempt(
 		// fall through to reclaim accounting below.
 	case MessageStatusPending:
 		return retryCount, false, nil
+	case MessageStatusCompleted, MessageStatusAcked:
+		fallthrough
 	default:
 		return 0, false, fmt.Errorf(
-			"unexpected subscription status %q for message %s subscriber %s",
-			row.status, row.msgID, subscriberID,
+			"%w: subscription message %s subscriber %s status %q",
+			ErrUnexpectedMessageStatus, row.msgID, subscriberID, row.status,
 		)
 	}
 

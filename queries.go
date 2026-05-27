@@ -342,7 +342,6 @@ func (pq *Queue) listQueuesRaw(
 	ctx context.Context,
 	queueType string,
 ) ([]QueueMetadata, error) {
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
 	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
 		FROM %s

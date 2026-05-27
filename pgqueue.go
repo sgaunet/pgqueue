@@ -906,12 +906,7 @@ func (pq *Queue) deleteQueue(
 	// metadata lookup while the delete was in flight may have repopulated
 	// the cache between this pre-commit invalidate and Commit returning
 	// (#63).
-	if pq.mdcache != nil {
-		pq.mdcache.invalidate(string(queueType), name)
-	}
-	if pq.notifier != nil {
-		pq.notifier.forget(ctx, notifyChannelName(metadata.TableName))
-	}
+	pq.invalidateQueueCaches(ctx, queueType, name, metadata.TableName)
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
@@ -922,6 +917,21 @@ func (pq *Queue) deleteQueue(
 	}
 
 	return nil
+}
+
+// invalidateQueueCaches drops the metadata cache entry and the push-delivery
+// LISTEN waker for the named queue. See deleteQueue for ordering rationale.
+func (pq *Queue) invalidateQueueCaches(
+	ctx context.Context,
+	queueType QueueType,
+	name, tableName string,
+) {
+	if pq.mdcache != nil {
+		pq.mdcache.invalidate(string(queueType), name)
+	}
+	if pq.notifier != nil {
+		pq.notifier.forget(ctx, notifyChannelName(tableName))
+	}
 }
 
 func (pq *Queue) executeDelete(
