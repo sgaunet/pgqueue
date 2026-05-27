@@ -3,6 +3,7 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"sync"
@@ -151,6 +152,20 @@ func (gc *GarbageCollector) PurgeQueue(
 	return gc.executePurge(ctx, metadata.TableName, queueType)
 }
 
+// maxAccumulatedCollectErrs caps the per-queue errors recorded by a single
+// Collect pass. Under a sustained database outage every queue's worker fails;
+// without this cap, the joined error grows to len(allQueues) on every tick
+// and the GC ticker keeps spewing megabyte-sized logs (#62). The cap+1th
+// entry is a single truncation sentinel so the operator can tell errors were
+// dropped.
+const maxAccumulatedCollectErrs = 100
+
+// errCollectErrsTruncated is the static sentinel appended in place of the
+// (cap+1)th per-queue error in a single Collect pass (#62).
+var errCollectErrsTruncated = errors.New(
+	"(further per-queue errors truncated; check logs for the rest)",
+)
+
 // Collect performs a single garbage collection pass.
 func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	// Get all queues
@@ -171,21 +186,41 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 	allQueues = append(allQueues, topics...)
 	allQueues = append(allQueues, channels...)
 
+	// dispatchCtx lets a worker short-circuit the dispatch loop when it sees
+	// a sentinel that means the pool is dead (sql.ErrConnDone, driver bad
+	// connection). In-flight workers keep running against the outer ctx for
+	// correctness; we just stop queueing new ones (#62).
+	dispatchCtx, cancelDispatch := context.WithCancel(ctx)
+	defer cancelDispatch()
+
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, gc.config.MaxWorkers)
 
 	var mu sync.Mutex
 	var errs []error
+	recordErr := func(queueName string, qerr error) {
+		mu.Lock()
+		defer mu.Unlock()
+		errs = appendCappedErr(errs, queueName, qerr)
+	}
 
 	for _, queue := range allQueues {
 		select {
-		case <-ctx.Done():
+		case <-dispatchCtx.Done():
 			wg.Wait()
 			// Preserve errors from workers that already ran so they are
-			// not silently lost on cancellation.
+			// not silently lost on cancellation. If the dispatch was
+			// short-circuited by a pool-dead sentinel (not the outer
+			// ctx) ctx.Err is still nil — skip the cancellation note in
+			// that case.
 			mu.Lock()
-			cancelErrs := append(errs, //nolint:gocritic // intentional copy
-				fmt.Errorf("garbage collection cancelled: %w", ctx.Err()))
+			cancelErrs := errs
+			if outerErr := ctx.Err(); outerErr != nil {
+				//nolint:gocritic // intentional separate slice so the append
+				// does not alias errs.
+				cancelErrs = append(errs,
+					fmt.Errorf("garbage collection cancelled: %w", outerErr))
+			}
 			mu.Unlock()
 			return errors.Join(cancelErrs...)
 		case sem <- struct{}{}:
@@ -200,9 +235,10 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 						"queue", q.QueueName, "error", err,
 						"duration", time.Since(start),
 					)
-					mu.Lock()
-					errs = append(errs, fmt.Errorf("queue %s: %w", q.QueueName, err))
-					mu.Unlock()
+					recordErr(q.QueueName, err)
+					if isPoolDead(err) {
+						cancelDispatch()
+					}
 				} else if d := time.Since(start); d > gcSlowCollectThreshold {
 					gc.pq.logInfo("collected queue",
 						"queue", q.QueueName, "duration", d,
@@ -214,6 +250,28 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 
 	wg.Wait()
 	return errors.Join(errs...)
+}
+
+// isPoolDead reports whether err signals an unrecoverable connection-pool
+// state — there is no value in queueing more workers against a dead pool,
+// they will all fail with the same error and bloat the joined result.
+func isPoolDead(err error) bool {
+	return errors.Is(err, sql.ErrConnDone) || errors.Is(err, driver.ErrBadConn)
+}
+
+// appendCappedErr adds qerr to errs as "queue <name>: <qerr>" until the slice
+// reaches maxAccumulatedCollectErrs, then once appends a single truncation
+// sentinel and ignores every subsequent call. Split out for direct unit
+// testing (#62).
+func appendCappedErr(errs []error, queueName string, qerr error) []error {
+	switch {
+	case len(errs) < maxAccumulatedCollectErrs:
+		return append(errs, fmt.Errorf("queue %s: %w", queueName, qerr))
+	case len(errs) == maxAccumulatedCollectErrs:
+		return append(errs, errCollectErrsTruncated)
+	default:
+		return errs
+	}
 }
 
 func (gc *GarbageCollector) run(ctx context.Context) {
