@@ -135,4 +135,11 @@ var (
 	ErrReceiptMissingQueueType = errors.New(
 		"receipt missing QueueType: use AckChannel/AckTopic or obtain the receipt via ReceiveChannel/ReceiveTopic",
 	)
+
+	// ErrInvalidPerformedBy is returned when ReplayOptions.PerformedBy is
+	// longer than MaxPerformedByLen bytes or contains NUL/CR/LF, which would
+	// either bloat or break later inspection of pgqueue_replay_log.
+	ErrInvalidPerformedBy = errors.New(
+		"invalid PerformedBy: must be at most 256 bytes and contain no NUL/CR/LF",
+	)
 )

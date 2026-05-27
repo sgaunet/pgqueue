@@ -190,6 +190,12 @@ func (pq *Queue) GetReplayHistory(
 	)
 }
 
+// MaxPerformedByLen caps the byte length of ReplayOptions.PerformedBy so a
+// misconfigured caller cannot fill pgqueue_replay_log.created_by with megabyte
+// strings. Chosen to fit common audit identifiers (an operator email, a
+// service name, a JWT subject) with comfortable headroom.
+const MaxPerformedByLen = 256
+
 func validateReplayOpts(opts ReplayOptions) error {
 	if !opts.Confirm && !opts.DryRun {
 		return ErrConfirmationRequired
@@ -198,6 +204,14 @@ func validateReplayOpts(opts ReplayOptions) error {
 	// invalid LIMIT, surfacing an opaque database error instead of a clear one.
 	if opts.Limit < 0 {
 		return ErrInvalidConfig
+	}
+	// PerformedBy is stored verbatim in pgqueue_replay_log; reject anything that
+	// would either bloat the table or break later inspection via psql/grep.
+	if len(opts.PerformedBy) > MaxPerformedByLen {
+		return ErrInvalidPerformedBy
+	}
+	if strings.ContainsAny(opts.PerformedBy, "\x00\r\n") {
+		return ErrInvalidPerformedBy
 	}
 
 	return nil
