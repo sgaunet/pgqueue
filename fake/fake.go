@@ -7,7 +7,9 @@
 // and handler-based consume, ack/nack, retry with DLQ promotion at exactly
 // max-retries, fan-out per subscriber, and pause/resume. It deliberately does
 // not model visibility-timeout reclamation on a wall clock: a claimed message
-// stays claimed until it is acked or nacked.
+// stays claimed until it is acked or nacked. Tests that need to exercise
+// timeout-driven redelivery should use the real Queue against PostgreSQL —
+// see internal/integration for the redelivery test suite.
 //
 //	q := fake.New()
 //	q.CreateChannel(ctx, "orders")
@@ -18,6 +20,7 @@ package fake
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"sync"
 	"time"
@@ -149,7 +152,13 @@ func (q *Queue) PublishChannel(
 	if payload == nil {
 		return uuid.UUID{}, pgqueue.ErrNilPayload
 	}
-	id := uuid.New()
+	// Mirror the production schema, which stamps message IDs with uuidv7() so
+	// "ORDER BY id" reflects insertion order; v4 would break that contract
+	// for any consumer that exercises ordering against the fake.
+	id, err := pgqueue.NewUUIDv7()
+	if err != nil {
+		return uuid.UUID{}, fmt.Errorf("fake: generate message id: %w", err)
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	ch, ok := q.channels[name]
@@ -173,7 +182,11 @@ func (q *Queue) PublishTopic(
 	if payload == nil {
 		return uuid.UUID{}, pgqueue.ErrNilPayload
 	}
-	id := uuid.New()
+	// uuidv7 so "ORDER BY id" matches insertion order — see PublishChannel.
+	id, err := pgqueue.NewUUIDv7()
+	if err != nil {
+		return uuid.UUID{}, fmt.Errorf("fake: generate message id: %w", err)
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	t, ok := q.topics[name]
@@ -346,7 +359,12 @@ func (q *Queue) claim(ch *channel, base pgqueue.Receipt) (*pgqueue.Message, erro
 	}
 	e := ch.pending[0]
 	ch.pending = ch.pending[1:]
-	e.claimID = uuid.New()
+	claimID, err := pgqueue.NewUUIDv7()
+	if err != nil {
+		ch.pending = append([]*entry{e}, ch.pending...)
+		return nil, fmt.Errorf("fake: generate claim id: %w", err)
+	}
+	e.claimID = claimID
 	e.status = pgqueue.MessageStatusProcessing
 	ch.claimed[e.id] = e
 
