@@ -46,6 +46,14 @@ DefaultPolicy, so the GC bounds table growth out of the box; pass an explicit
 RetentionPolicy to tune it, or KeepForever fields to retain rows indefinitely.
 See NewGarbageCollector and RetentionPolicy.
 
+Transaction isolation: every internal transaction is opened with an explicit
+READ COMMITTED isolation level (the PostgreSQL default). The library's
+correctness arguments — FOR UPDATE SKIP LOCKED for ack races, statement-level
+snapshots for paged purges, claim-id matching for visibility-timeout
+reclamation — are written against READ COMMITTED. Operators must not change
+the pool's default_transaction_isolation to a higher level expecting pgqueue
+to inherit it; that setting is ignored by design (#64).
+
 Scalability ceiling: each queue creates 2-3 tables plus 6-7 indexes, and
 admin operations (GarbageCollector.Collect, ListChannels, ListTopics,
 GetUnhealthySubscribers) scale linearly with queue count. The table-per-queue

@@ -469,7 +469,7 @@ func applyMigration(ctx context.Context, conn *sql.Conn, m migration) error {
 		}
 	}
 
-	tx, err := conn.BeginTx(ctx, nil)
+	tx, err := conn.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}

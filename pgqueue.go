@@ -93,6 +93,14 @@ type PGQueue = Queue
 // queueNameRegex validates queue names (alphanumeric, underscore, dash).
 var queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// readCommittedTxOptions is the *sql.TxOptions every internal BeginTx call
+// should pass. PostgreSQL's default isolation is READ COMMITTED and the whole
+// codebase is written against that contract (FOR UPDATE SKIP LOCKED for ack
+// races, paged-purge with statement-level snapshots, etc.), so we set it
+// explicitly rather than inherit whatever the pool's
+// default_transaction_isolation happens to be (#64).
+var readCommittedTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
 // InitSchema initializes and migrates the base schema required by pgqueue.
 // This function must be called once at startup before creating or using any
 // queues or topics.
@@ -735,7 +743,7 @@ func (pq *Queue) createQueue(
 	}
 
 	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -877,7 +885,7 @@ func (pq *Queue) deleteQueue(
 	}
 
 	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}

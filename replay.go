@@ -350,7 +350,7 @@ func (pq *Queue) replayFromPage(
 	pageLimit int,
 	performedBy string,
 ) (replayFromPageResult, error) {
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return replayFromPageResult{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -544,7 +544,7 @@ func (pq *Queue) executeReplayMessage(
 	messageID uuid.UUID,
 	opts ReplayOptions,
 ) error {
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -680,7 +680,7 @@ func (pq *Queue) replayDLQPage(
 	pageLimit int,
 	performedBy string,
 ) (dlqPageResult, error) {
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return dlqPageResult{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}

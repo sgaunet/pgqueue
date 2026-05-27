@@ -296,7 +296,7 @@ func (gc *GarbageCollector) executePurge(
 	tableName string,
 	queueType QueueType,
 ) error {
-	tx, err := gc.pq.db.BeginTx(ctx, nil)
+	tx, err := gc.pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -426,7 +426,7 @@ func (gc *GarbageCollector) promoteExhaustedChannelPage(
 	tableName, selectQuery string,
 	defaultMax int,
 ) (int, error) {
-	tx, err := gc.pq.db.BeginTx(ctx, nil)
+	tx, err := gc.pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -550,7 +550,7 @@ func (gc *GarbageCollector) promoteExhaustedTopicPage(
 	tableName, selectQuery string,
 	maxRetries int,
 ) (int, error) {
-	tx, err := gc.pq.db.BeginTx(ctx, nil)
+	tx, err := gc.pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}

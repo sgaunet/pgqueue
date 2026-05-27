@@ -252,7 +252,7 @@ func (pq *Queue) NackChannelBatch(
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -313,7 +313,7 @@ func (pq *Queue) NackTopicBatch(
 		return err
 	}
 
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -481,7 +481,7 @@ func (pq *Queue) publishBatchToChannel(
 	metadataJSONs [][]byte,
 	maxRetries int,
 ) error {
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -539,7 +539,7 @@ func (pq *Queue) publishBatchToPubSub(
 	messages []PublishMessage,
 	metadataJSONs [][]byte,
 ) error {
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}

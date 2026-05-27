@@ -66,7 +66,7 @@ func (pq *Queue) ConsumeFromChannel(
 	}
 
 	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -129,7 +129,7 @@ func (pq *Queue) AckChannel(
 	// Run the UPDATE and, on a miss, the classifying SELECT in one transaction
 	// so the classification observes the same snapshot as the failed UPDATE —
 	// a concurrent reclaim cannot slip in between and flip the error type (R-09).
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -206,7 +206,7 @@ func (pq *Queue) nackChannelImpl(
 	}
 
 	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, nil)
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
