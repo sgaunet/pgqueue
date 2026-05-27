@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -190,6 +191,13 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 // Listen registers a channel for LISTEN. The actual LISTEN statement is issued
 // asynchronously by the run loop; the request is also remembered so it survives
 // a reconnect. Listen is safe for concurrent use.
+//
+// The channel name is splice-quoted into LISTEN — PostgreSQL does not accept
+// parameter binding there — with PG-correct identifier escaping (#70). It is
+// still the caller's responsibility to keep names within PostgreSQL's
+// identifier limits: at most 63 bytes (NAMEDATALEN-1) and no NUL bytes.
+// pgqueue's own callers always satisfy this via validateQueueName; third
+// parties using pglisten standalone should impose their own validation.
 func (l *Listener) Listen(_ context.Context, channel string) error {
 	l.mu.Lock()
 	if l.closed {
@@ -212,6 +220,10 @@ func (l *Listener) Listen(_ context.Context, channel string) error {
 // to release the server-side registration. It is the inverse of Listen and is
 // idempotent: unknown channels are a no-op. Called from pgqueue's queue-delete
 // path so a process that churns queues does not leak LISTENs (#52).
+//
+// The same identifier rules as Listen apply: the channel name is splice-quoted
+// into UNLISTEN with PG-correct escaping (#70), and the caller is responsible
+// for keeping names within PostgreSQL's identifier limits.
 func (l *Listener) Unlisten(_ context.Context, channel string) error {
 	l.mu.Lock()
 	if l.closed {
@@ -380,9 +392,12 @@ func (l *Listener) drainPending() error {
 	l.mu.Unlock()
 
 	for i, ch := range pending {
-		// LISTEN takes no parameters; the channel name is a validated pgqueue
-		// identifier, quoted so it is matched verbatim against pg_notify.
-		if _, err := conn.Exec(context.Background(), `LISTEN "`+ch+`"`); err != nil {
+		// LISTEN takes no parameters, so the channel name must be interpolated.
+		// quoteListenIdent applies PG-correct identifier escaping defensively:
+		// pgqueue's own callers pre-validate channel names, but pglisten is an
+		// exported package and third-party callers may pass arbitrary names
+		// (#70).
+		if _, err := conn.Exec(context.Background(), `LISTEN `+quoteListenIdent(ch)); err != nil {
 			// Re-queue the unissued channels so a reconnect retries them. The
 			// already-issued ones are skipped; reconnect rebuilds them from
 			// the channels map anyway.
@@ -395,11 +410,20 @@ func (l *Listener) drainPending() error {
 		// server-side registration. The channel is already gone from the
 		// channels map, so reconnect will not re-LISTEN it; and the next
 		// reconnect brings a fresh session with no residue regardless.
-		if _, err := conn.Exec(context.Background(), `UNLISTEN "`+ch+`"`); err != nil {
+		if _, err := conn.Exec(context.Background(), `UNLISTEN `+quoteListenIdent(ch)); err != nil {
 			l.logWarn("pglisten: UNLISTEN failed", "channel", ch, "error", err)
 		}
 	}
 	return nil
+}
+
+// quoteListenIdent renders ch as a quoted PostgreSQL identifier suitable for
+// LISTEN/UNLISTEN, doubling any embedded double quote per the SQL grammar.
+// LISTEN cannot use parameter binding, so this is the only safe way to splice
+// a channel name into the statement when callers may supply arbitrary values
+// (#70).
+func quoteListenIdent(ch string) string {
+	return `"` + strings.ReplaceAll(ch, `"`, `""`) + `"`
 }
 
 // reconnect re-establishes the connection and re-issues every known LISTEN. It

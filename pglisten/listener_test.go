@@ -203,6 +203,31 @@ func TestUnlistenAfterCloseReturnsErrListenerClosed(t *testing.T) {
 	}
 }
 
+// TestQuoteListenIdent is the issue #70 regression: pglisten is an exported
+// package, so a third-party caller may pass a channel name containing a
+// double-quote — and PostgreSQL's LISTEN does not accept parameter binding,
+// forcing the name to be interpolated. The identifier must be wrapped in
+// double quotes with any embedded quote doubled per the SQL grammar.
+func TestQuoteListenIdent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in, want string
+	}{
+		{"orders", `"orders"`},
+		{"with-dash", `"with-dash"`},
+		{"upper Case", `"upper Case"`},
+		{`bad"name`, `"bad""name"`},                  // single embedded quote
+		{`a"b"c`, `"a""b""c"`},                       // multiple quotes
+		{`"; DROP TABLE x; --`, `"""; DROP TABLE x; --"`}, // injection attempt
+		{"", `""`},
+	}
+	for _, tc := range cases {
+		if got := quoteListenIdent(tc.in); got != tc.want {
+			t.Errorf("quoteListenIdent(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestReconnectLogsAtWarn is part of the R-07 regression set: a reconnect
 // attempt is logged at WARN level (the reconnect loop logs via logWarn).
 func TestReconnectLogsAtWarn(t *testing.T) {
