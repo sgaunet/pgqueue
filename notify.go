@@ -13,6 +13,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"sync"
 )
 
@@ -98,6 +100,7 @@ func (w *waker) signal() {
 // wakers and lazily issues LISTEN for each queue a consumer blocks on.
 type notifier struct {
 	listener Listener
+	logger   *slog.Logger
 
 	mu        sync.Mutex
 	wakers    map[string]*waker // notification channel -> waker
@@ -108,13 +111,15 @@ type notifier struct {
 }
 
 // newNotifier wraps a Listener. It returns nil when listener is nil so callers
-// can treat "no push delivery" as a simple nil check.
-func newNotifier(listener Listener) *notifier {
+// can treat "no push delivery" as a simple nil check. The logger is used to
+// report a pump-goroutine panic; nil silences the report.
+func newNotifier(listener Listener, logger *slog.Logger) *notifier {
 	if listener == nil {
 		return nil
 	}
 	return &notifier{
 		listener:  listener,
+		logger:    logger,
 		wakers:    make(map[string]*waker),
 		listening: make(map[string]bool),
 	}
@@ -186,7 +191,23 @@ func (n *notifier) forget(ctx context.Context, notifyChannel string) {
 }
 
 // pump fans the Listener's notification stream out to the per-channel wakers.
+// A panic from a misbehaving third-party Listener (sending on a closed channel,
+// etc.) is recovered: the pump cannot restart, but waking every consumer one
+// last time lets them fall back to the safety-net poll instead of blocking on
+// a NOTIFY that will never arrive (#69).
 func (n *notifier) pump() {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if n.logger != nil {
+			n.logger.Error("pgqueue: listener notifications pump panicked",
+				"panic", r,
+				"stack", string(debug.Stack()))
+		}
+		n.wakeAll()
+	}()
 	for channel := range n.listener.Notifications() {
 		n.mu.Lock()
 		w := n.wakers[channel]
@@ -194,6 +215,26 @@ func (n *notifier) pump() {
 		if w != nil {
 			w.signal()
 		}
+	}
+}
+
+// wakeAll signals every currently-registered waker. Used by close() for the
+// orderly shutdown path and by the pump's panic-recovery so consumers that
+// were blocked on a now-dead notification stream fall back to the safety-net
+// poll instead of waiting forever (#69). Each signal is guarded with its own
+// recover so one broken waker cannot prevent the others from being woken.
+func (n *notifier) wakeAll() {
+	n.mu.Lock()
+	wakers := make([]*waker, 0, len(n.wakers))
+	for _, w := range n.wakers {
+		wakers = append(wakers, w)
+	}
+	n.mu.Unlock()
+	for _, w := range wakers {
+		func(w *waker) {
+			defer func() { _ = recover() }()
+			w.signal()
+		}(w)
 	}
 }
 
@@ -206,16 +247,10 @@ func (n *notifier) close() error {
 		return nil
 	}
 	n.closed = true
-	wakers := make([]*waker, 0, len(n.wakers))
-	for _, w := range n.wakers {
-		wakers = append(wakers, w)
-	}
 	n.mu.Unlock()
 
 	err := n.listener.Close()
-	for _, w := range wakers {
-		w.signal()
-	}
+	n.wakeAll()
 	if err != nil {
 		return fmt.Errorf("listener close: %w", err)
 	}

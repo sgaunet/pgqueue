@@ -365,7 +365,7 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 		cfg:      cfg,
 		logger:   cfg.logger,
 		mdcache:  newMetadataCache(),
-		notifier: newNotifier(cfg.listener),
+		notifier: newNotifier(cfg.listener, cfg.logger),
 		bgCtx:    bgCtx,
 		bgCancel: bgCancel,
 	}
