@@ -187,6 +187,76 @@ func TestObservabilityHooksReceiveSpansAndMetrics(t *testing.T) {
 	}
 }
 
+// TestAutoAckSurfacesClaimExpired is the issue #71 regression: when a handler
+// returns nil but the row's claim_id changed before the auto-ack ran (a slow
+// handler whose visibility timeout lapsed and was reclaimed), the auto-ack
+// fails with ErrClaimExpired and pgqueue must surface that as a
+// RecordAckAfterExpired emission rather than silently swallowing the error.
+// The test fakes the claim mismatch by UPDATE'ing claim_id inside the
+// handler so the path is exercised deterministically, without timing.
+func TestAutoAckSurfacesClaimExpired(t *testing.T) {
+	ctx := context.Background()
+	db, containerCleanup := setupTestContainer(t)
+	defer containerCleanup()
+
+	if err := pgqueue.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+	metrics := &recordingMetrics{}
+	pq, err := pgqueue.New(ctx, db, pgqueue.WithMetrics(metrics))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer func() { _ = pq.Close() }()
+
+	const channelName = "ack_expired_surface"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := pq.PublishChannel(ctx, channelName, []byte("payload")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	handled := make(chan struct{}, 1)
+	consumeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		_ = pq.ConsumeChannel(consumeCtx, channelName,
+			func(_ context.Context, msg *pgqueue.Message) error {
+				// Forge a claim mismatch so the upcoming auto-ack sees a
+				// claim_id different from the receipt and returns
+				// ErrClaimExpired. This is the same observable state a
+				// real visibility-timeout reclaim would leave behind.
+				if _, err := db.ExecContext(ctx,
+					"UPDATE pgqueue_msg_"+channelName+
+						" SET claim_id = uuidv7() WHERE id = $1",
+					msg.ID,
+				); err != nil {
+					t.Errorf("forge claim mismatch: %v", err)
+				}
+				select {
+				case handled <- struct{}{}:
+				default:
+				}
+				return nil
+			}, pgqueue.WithPollInterval(50*time.Millisecond))
+	}()
+
+	waitClosed(t, handled, "handler never ran")
+
+	// Auto-ack runs after the handler returns; poll briefly for the metric.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if metrics.ackAfterExpiredCount() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := metrics.ackAfterExpiredCount(); got != 1 {
+		t.Fatalf("RecordAckAfterExpired emissions = %d, want 1", got)
+	}
+}
+
 // TestObservabilityNoopWhenUnregistered verifies that a Queue created without
 // any Tracer or MetricsRecorder operates normally — the hooks are pure no-ops.
 func TestObservabilityNoopWhenUnregistered(t *testing.T) {

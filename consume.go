@@ -683,7 +683,12 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	ackCtx, ackCancel := context.WithTimeout(context.WithoutCancel(ctx), ackGracePeriod)
 	defer ackCancel()
 	if herr != nil {
-		if err := pq.nackReceipt(ackCtx, receipt, herr.Error()); err != nil && !errors.Is(err, ErrClaimExpired) {
+		err := pq.nackReceipt(ackCtx, receipt, herr.Error())
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrClaimExpired):
+			pq.signalAckAfterExpired(receipt, msg, "nack")
+		default:
 			pq.logError("failed to nack message after handler error",
 				"queue", receipt.QueueName,
 				"message_id", msg.ID.String(),
@@ -693,13 +698,33 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	}
 	// A failed ack is logged but not fatal: the message simply redelivers, which
 	// at-least-once tolerates. ErrClaimExpired is the expected outcome when the
-	// handler outran the visibility timeout, so it is not logged as an error.
-	if err := pq.ackReceipt(ackCtx, receipt); err != nil && !errors.Is(err, ErrClaimExpired) {
+	// handler outran the visibility timeout — surface it via the
+	// pgqueue_ack_after_expired metric and a WARN log so operators can detect
+	// at-least-twice delivery driven by slow handlers (issue #71).
+	err := pq.ackReceipt(ackCtx, receipt)
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrClaimExpired):
+		pq.signalAckAfterExpired(receipt, msg, "ack")
+	default:
 		pq.logError("failed to ack message after successful handler",
 			"queue", receipt.QueueName,
 			"message_id", msg.ID.String(),
 			"error", err)
 	}
+}
+
+// signalAckAfterExpired records one ErrClaimExpired observed at auto-ack/nack
+// time so operators see it: the per-receipt metric increments and a WARN log
+// names the queue, message, and which side (ack or nack) hit the stale claim.
+// The message will be redelivered by another consumer; the WARN line is the
+// only application-visible signal that already-completed work will run again.
+func (pq *Queue) signalAckAfterExpired(receipt Receipt, msg *Message, op string) {
+	pq.recordAckAfterExpired(receipt.QueueName, 1)
+	pq.logWarn("claim expired before auto-"+op+"; message will redeliver",
+		"queue", receipt.QueueName,
+		"message_id", msg.ID.String(),
+		"retry_count", msg.RetryCount)
 }
 
 // errHandlerPanic is the static base error for a recovered handler panic; the

@@ -694,6 +694,12 @@ func (pq *Queue) logInfo(msg string, args ...any) {
 	}
 }
 
+func (pq *Queue) logWarn(msg string, args ...any) {
+	if pq.logger != nil {
+		pq.logger.Warn(msg, args...)
+	}
+}
+
 func (pq *Queue) logError(msg string, args ...any) {
 	if pq.logger != nil {
 		pq.logger.Error(msg, args...)
