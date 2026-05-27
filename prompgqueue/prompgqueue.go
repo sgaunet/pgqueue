@@ -104,6 +104,14 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 // safe to call more than once against the same registerer — and surfaces any
 // other registration error to the caller.
 //
+// A descriptor collision against a *different* Go collector type (for example
+// a caller pre-registered a Counter where pgqueue ships a CounterVec) is also
+// surfaced as an error: silently returning the unregistered instance, as the
+// previous behavior did, meant writes went to a dangling object while the
+// already-registered metric stayed frozen at its initial values (issue #92).
+// Callers in that situation must either drop the conflicting registration or
+// hand pgqueue its own dedicated prometheus.Registerer.
+//
 //nolint:ireturn // T is a concrete collector type at every call site; the
 // generic constraint is only how the helper stays type-safe across them.
 func registerCollector[T prometheus.Collector](reg prometheus.Registerer, c T) (T, error) {
@@ -116,9 +124,11 @@ func registerCollector[T prometheus.Collector](reg prometheus.Registerer, c T) (
 		if existing, ok := are.ExistingCollector.(T); ok {
 			return existing, nil
 		}
-		// Already registered, but under a different Go type — reuse our
-		// instance; the descriptors match so scraping still works.
-		return c, nil
+		return c, fmt.Errorf(
+			"metric already registered as %T but pgqueue ships %T; "+
+				"use a dedicated prometheus.Registerer for pgqueue: %w",
+			are.ExistingCollector, c, err,
+		)
 	}
 	return c, fmt.Errorf("register collector: %w", err)
 }
