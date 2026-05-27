@@ -578,6 +578,11 @@ func (pq *Queue) moveToDLQ(
 	retryCount int,
 	metadataJSON sql.NullString,
 ) error {
+	// Defense-in-depth: nack entry points already truncate, but a future
+	// internal caller could land here without going through that path and
+	// would otherwise insert a multi-megabyte stack trace verbatim,
+	// inflating the DLQ table without bound (#126).
+	errorMsg = truncateErrorMsg(errorMsg)
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	dlqQuery := fmt.Sprintf(`
 		INSERT INTO %s

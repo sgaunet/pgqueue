@@ -349,6 +349,10 @@ func (pq *Queue) moveSubToDLQ(
 	subscriberID, errorMsg string,
 	state *subState,
 ) error {
+	// Defense-in-depth: mirror moveToDLQ — every entry point pre-truncates,
+	// but enforcing the cap here ensures the DLQ table cannot grow without
+	// bound if a future caller bypasses the nack path (#126).
+	errorMsg = truncateErrorMsg(errorMsg)
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	dlqQuery := fmt.Sprintf(`
 		INSERT INTO %s
