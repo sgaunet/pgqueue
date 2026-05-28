@@ -39,6 +39,45 @@ func (l *failingListener) Notifications() <-chan string {
 }
 func (l *failingListener) Close() error { return nil }
 
+// blockingListener is a Listener whose Listen blocks until released (or ctx is
+// cancelled), modelling the now-synchronous confirmation: it lets a test prove
+// wakeChan does not block on Listen and that exactly one confirmListen goroutine
+// is spawned per channel while one is in flight. calls counts Listen entries.
+type blockingListener struct {
+	release chan struct{}
+	err     error
+	ch      chan string
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (l *blockingListener) Listen(ctx context.Context, _ string) error {
+	l.mu.Lock()
+	l.calls++
+	l.mu.Unlock()
+	select {
+	case <-l.release:
+		return l.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *blockingListener) callCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+func (l *blockingListener) Notifications() <-chan string {
+	if l.ch == nil {
+		l.ch = make(chan string)
+	}
+	return l.ch
+}
+func (l *blockingListener) Close() error { return nil }
+
 // TestPumpRecoversPanicAndWakesAll is the issue #69 regression: a panic in
 // the pump-goroutine loop body must be recovered, logged at ERROR, and every
 // currently-blocked consumer must be woken so they fall back to the
@@ -95,12 +134,14 @@ func TestPumpRecoversPanicAndWakesAll(t *testing.T) {
 	}
 }
 
-// TestWakeChanLogsListenFailures is the issue #68 regression: a failing
-// Listener.Listen used to silently leave the channel unregistered. Every
-// failure must now log at WARN with the channel and underlying error, and
-// every listenEscalateThreshold consecutive failures must re-fire an ERROR
-// so a persistently misconfigured Listener is impossible to miss.
-func TestWakeChanLogsListenFailures(t *testing.T) {
+// TestConfirmListenLogsListenFailures is the issue #68 / #134 regression: a
+// failing synchronous Listen must surface through confirmListen. Every failure
+// logs at WARN with the channel and underlying error, and every
+// listenEscalateThreshold consecutive failures re-fires an ERROR so a
+// persistently degraded LISTEN is impossible to miss. confirmListen is driven
+// directly here because wakeChan now spawns it asynchronously (and guards
+// against more than one in-flight goroutine per channel).
+func TestConfirmListenLogsListenFailures(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
@@ -114,10 +155,8 @@ func TestWakeChanLogsListenFailures(t *testing.T) {
 
 	// Drive listenEscalateThreshold failures; each one bumps the per-channel
 	// counter and the threshold-th attempt escalates to ERROR.
-	for i := 1; i <= listenEscalateThreshold; i++ {
-		if got := n.wakeChan(context.Background(), channel); got == nil {
-			t.Fatalf("wakeChan returned nil at attempt %d", i)
-		}
+	for range listenEscalateThreshold {
+		n.confirmListen(channel)
 	}
 
 	out := buf.String()
@@ -138,18 +177,16 @@ func TestWakeChanLogsListenFailures(t *testing.T) {
 
 	// One more failure escalates to a fresh ERROR? No — we're at threshold+1,
 	// which is not a multiple, so only a WARN should land.
-	if got := n.wakeChan(context.Background(), channel); got == nil {
-		t.Fatal("wakeChan returned nil at attempt 11")
-	}
+	n.confirmListen(channel)
 	if got := strings.Count(buf.String(), "level=ERROR"); got != 1 {
 		t.Errorf("ERROR count after attempt 11 = %d, want 1", got)
 	}
 }
 
-// TestWakeChanResetsFailureCountOnSuccess confirms the per-channel failure
-// counter clears on a successful Listen, so a recovered transient failure
-// does not contribute to a future escalation.
-func TestWakeChanResetsFailureCountOnSuccess(t *testing.T) {
+// TestConfirmListenResetsFailureCountOnSuccess confirms the per-channel failure
+// counter clears on a successful Listen, so a recovered transient failure does
+// not contribute to a future escalation, and the channel is marked listening.
+func TestConfirmListenResetsFailureCountOnSuccess(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{},
 		&slog.HandlerOptions{Level: slog.LevelWarn}))
 
@@ -157,20 +194,75 @@ func TestWakeChanResetsFailureCountOnSuccess(t *testing.T) {
 	n := newNotifier(fl, logger)
 	const channel = "ch"
 	for range 3 {
-		_ = n.wakeChan(context.Background(), channel)
+		n.confirmListen(channel)
 	}
 	if got := n.listenFailures[channel]; got != 3 {
 		t.Fatalf("listenFailures = %d, want 3", got)
 	}
-	// Flip the Listener to succeed; next wakeChan resets the counter.
+	// Flip the Listener to succeed; next confirmListen resets the counter.
 	fl.err = nil
-	_ = n.wakeChan(context.Background(), channel)
+	n.confirmListen(channel)
 	if got, ok := n.listenFailures[channel]; ok {
 		t.Errorf("listenFailures still tracks %q with value %d after success", channel, got)
 	}
 	if !n.listening[channel] {
 		t.Errorf("listening[%q] = false after a successful Listen", channel)
 	}
+}
+
+// TestWakeChanConfirmsListenAsync proves wakeChan does not block on the now
+// synchronous Listen (#134): it returns a waker immediately while Listen is
+// still blocked, spawns exactly one confirmation goroutine per channel even
+// across concurrent callers, and marks the channel listening once Listen
+// returns.
+func TestWakeChanConfirmsListenAsync(t *testing.T) {
+	bl := &blockingListener{release: make(chan struct{})}
+	n := newNotifier(bl, nil)
+	if n == nil {
+		t.Fatal("newNotifier returned nil")
+	}
+	const channel = "pgqueue_msg_async"
+
+	// wakeChan must return without waiting for the blocked Listen.
+	done := make(chan (<-chan struct{}), 1)
+	go func() { done <- n.wakeChan(context.Background(), channel) }()
+	select {
+	case w := <-done:
+		if w == nil {
+			t.Fatal("wakeChan returned nil waker while push delivery is available")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wakeChan blocked on the synchronous Listen")
+	}
+
+	// A second arm while Listen is still in flight must not spawn a second
+	// goroutine.
+	_ = n.wakeChan(context.Background(), channel)
+	time.Sleep(50 * time.Millisecond)
+	if got := bl.callCount(); got != 1 {
+		t.Fatalf("Listen called %d times while one confirmation was in flight, want 1", got)
+	}
+
+	// Release Listen; the channel should flip to listening.
+	close(bl.release)
+	waitFor(t, func() bool {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		return n.listening[channel] && !n.listenInFlight[channel]
+	}, "channel was not marked listening after Listen returned")
+}
+
+// waitFor polls cond until it holds or a short deadline passes.
+func waitFor(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal(msg)
 }
 
 // TestPumpRecoveryIsSilentWithoutLogger confirms the pump panic-recovery does

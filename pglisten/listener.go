@@ -124,6 +124,25 @@ func WithKeepaliveInterval(d time.Duration) Option {
 // errListenerClosed is returned by Listen after the Listener has been closed.
 var errListenerClosed = errors.New("pglisten: listener is closed")
 
+// listenReq is a queued LISTEN request. done carries the outcome back to a
+// synchronous Listen caller: nil once the LISTEN is confirmed on the server, or
+// the error if issuing it failed. It is buffered (cap 1) so drainPending can
+// always deliver the result even if the caller already returned via ctx or
+// Close. A re-LISTEN queued by reconnect carries a nil done (no waiter).
+type listenReq struct {
+	channel string
+	done    chan error
+}
+
+// signal delivers the outcome to the waiting Listen caller, if any. The buffered
+// channel makes the send non-blocking; a nil done (a reconnect re-LISTEN) is a
+// no-op.
+func (r listenReq) signal(err error) {
+	if r.done != nil {
+		r.done <- err
+	}
+}
+
 // Listener is a pgx-backed pgqueue.Listener. It owns a dedicated PostgreSQL
 // connection, issues LISTEN for each requested channel, streams NOTIFY channel
 // names, and transparently reconnects (re-issuing every LISTEN) if the
@@ -139,7 +158,8 @@ type Listener struct {
 	mu        sync.Mutex
 	conn      *pgx.Conn
 	channels  map[string]bool // every channel to (re-)LISTEN on
-	pending   []string        // LISTEN requests not yet issued
+	confirmed map[string]bool // channels whose LISTEN is live on the current session
+	pending   []listenReq     // LISTEN requests not yet issued
 	unpending []string        // UNLISTEN requests not yet issued (#52)
 	closed    bool
 	done      chan struct{}
@@ -175,6 +195,7 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 		notifs:            make(chan string, notifyBuffer),
 		conn:              conn,
 		channels:          make(map[string]bool),
+		confirmed:         make(map[string]bool),
 		done:              make(chan struct{}),
 		reconnectPolicy:   ReconnectPolicy{}.normalized(),
 		keepaliveInterval: defaultKeepaliveInterval,
@@ -188,9 +209,18 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 	return l, nil
 }
 
-// Listen registers a channel for LISTEN. The actual LISTEN statement is issued
-// asynchronously by the run loop; the request is also remembered so it survives
-// a reconnect. Listen is safe for concurrent use.
+// Listen registers a channel for LISTEN and blocks until the LISTEN has been
+// confirmed on the server, ctx is cancelled, or the Listener is closed. A nil
+// return guarantees the channel is subscribed: notifications will now be
+// delivered. The channel is remembered so the subscription survives a
+// reconnect. Listen is idempotent and safe for concurrent use; a repeat call
+// for an already-confirmed channel returns nil immediately.
+//
+// The LISTEN itself is issued by the run loop (which owns the connection); this
+// method queues the request, nudges the loop, and waits for the outcome. ctx
+// bounds that wait — on cancellation it returns ctx.Err() while the request
+// stays queued, so the LISTEN may still take effect and a later call observes
+// it as already confirmed.
 //
 // The channel name is splice-quoted into LISTEN — PostgreSQL does not accept
 // parameter binding there — with PG-correct identifier escaping (#70). It is
@@ -198,21 +228,32 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 // identifier limits: at most 63 bytes (NAMEDATALEN-1) and no NUL bytes.
 // pgqueue's own callers always satisfy this via validateQueueName; third
 // parties using pglisten standalone should impose their own validation.
-func (l *Listener) Listen(_ context.Context, channel string) error {
+func (l *Listener) Listen(ctx context.Context, channel string) error {
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
 		return errListenerClosed
 	}
-	if !l.channels[channel] {
-		l.channels[channel] = true
-		l.pending = append(l.pending, channel)
+	if l.confirmed[channel] {
+		l.mu.Unlock()
+		return nil
 	}
+	l.channels[channel] = true
+	done := make(chan error, 1)
+	l.pending = append(l.pending, listenReq{channel: channel, done: done})
 	l.mu.Unlock()
 
 	// Break the in-progress wait so the run loop drains the request promptly.
 	l.requestInterrupt()
-	return nil
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-l.done:
+		return errListenerClosed
+	}
 }
 
 // Unlisten removes a channel from the LISTEN set so subsequent reconnects do
@@ -224,6 +265,13 @@ func (l *Listener) Listen(_ context.Context, channel string) error {
 // The same identifier rules as Listen apply: the channel name is splice-quoted
 // into UNLISTEN with PG-correct escaping (#70), and the caller is responsible
 // for keeping names within PostgreSQL's identifier limits.
+//
+// Unlike Listen, Unlisten does not wait for server-side confirmation: it is
+// deliberately fire-and-forget. A failed UNLISTEN is harmless — the channel is
+// already gone from the active set so no reconnect re-LISTENs it, and the next
+// reconnect brings a clean session with no residue regardless — so there is
+// nothing a caller could usefully do with a confirmation. The ctx is accepted
+// for interface symmetry but the work is asynchronous.
 func (l *Listener) Unlisten(_ context.Context, channel string) error {
 	l.mu.Lock()
 	if l.closed {
@@ -235,6 +283,7 @@ func (l *Listener) Unlisten(_ context.Context, channel string) error {
 		return nil
 	}
 	delete(l.channels, channel)
+	delete(l.confirmed, channel)
 	l.unpending = append(l.unpending, channel)
 	l.mu.Unlock()
 
@@ -391,19 +440,23 @@ func (l *Listener) drainPending() error {
 	conn := l.conn
 	l.mu.Unlock()
 
-	for i, ch := range pending {
+	for i, req := range pending {
 		// LISTEN takes no parameters, so the channel name must be interpolated.
 		// quoteListenIdent applies PG-correct identifier escaping defensively:
 		// pgqueue's own callers pre-validate channel names, but pglisten is an
 		// exported package and third-party callers may pass arbitrary names
 		// (#70).
-		if _, err := conn.Exec(context.Background(), `LISTEN `+quoteListenIdent(ch)); err != nil {
-			// Re-queue the unissued channels so a reconnect retries them. The
-			// already-issued ones are skipped; reconnect rebuilds them from
-			// the channels map anyway.
-			l.requeue(pending[i:])
-			return fmt.Errorf("pglisten: LISTEN %q: %w", ch, err)
+		if _, err := conn.Exec(context.Background(), `LISTEN `+quoteListenIdent(req.channel)); err != nil {
+			wrapped := fmt.Errorf("pglisten: LISTEN %q: %w", req.channel, err)
+			// Tell this request's caller the LISTEN failed, then re-queue the
+			// unissued requests so a reconnect retries them. The already-issued
+			// ones are skipped; reconnect rebuilds them from the channels map.
+			req.signal(wrapped)
+			l.requeue(pending[i+1:])
+			return wrapped
 		}
+		l.markConfirmed(req.channel)
+		req.signal(nil)
 	}
 	for _, ch := range unpending {
 		// UNLISTEN is best-effort: a failure here just means a stale
@@ -453,13 +506,29 @@ func (l *Listener) reconnect() bool {
 		}
 		l.mu.Lock()
 		l.conn = conn
-		// Re-LISTEN every channel still in the active set; any queued
-		// UNLISTENs are dropped because the fresh session has no
-		// LISTENs to unwind (#52).
-		l.pending = l.pending[:0]
+		// A fresh session carries no live LISTENs, so nothing is confirmed and
+		// any queued UNLISTENs are moot (#52).
+		l.confirmed = make(map[string]bool)
 		l.unpending = nil
+		// Re-LISTEN every channel still in the active set. Carry over the done
+		// channel of any request still waiting for confirmation so its Listen
+		// caller is signalled once the re-LISTEN lands instead of blocking
+		// until its ctx fires; channels with no waiter re-LISTEN with nil done.
+		waiters := make(map[string]chan error, len(l.pending))
+		for _, req := range l.pending {
+			if req.done != nil {
+				waiters[req.channel] = req.done
+			}
+		}
+		l.pending = make([]listenReq, 0, len(l.channels))
 		for ch := range l.channels {
-			l.pending = append(l.pending, ch)
+			l.pending = append(l.pending, listenReq{channel: ch, done: waiters[ch]})
+			delete(waiters, ch)
+		}
+		// Any leftover waiter is for a channel no longer in the active set
+		// (concurrently Unlistened); signal it so the caller unblocks.
+		for _, done := range waiters {
+			done <- nil
 		}
 		l.mu.Unlock()
 		return true
@@ -491,9 +560,18 @@ func (l *Listener) logWarn(msg string, args ...any) {
 	}
 }
 
-func (l *Listener) requeue(channels []string) {
+func (l *Listener) requeue(reqs []listenReq) {
 	l.mu.Lock()
-	l.pending = append(channels, l.pending...)
+	l.pending = append(reqs, l.pending...)
+	l.mu.Unlock()
+}
+
+// markConfirmed records that channel's LISTEN is live on the current session,
+// so a repeat Listen returns immediately without re-queueing. reconnect clears
+// the set because a fresh session carries no live LISTENs.
+func (l *Listener) markConfirmed(channel string) {
+	l.mu.Lock()
+	l.confirmed[channel] = true
 	l.mu.Unlock()
 }
 

@@ -228,6 +228,84 @@ func TestQuoteListenIdent(t *testing.T) {
 	}
 }
 
+// TestListenReturnsConfirmedImmediately verifies the idempotent fast path: a
+// repeat Listen for an already-confirmed channel returns nil without queueing a
+// new request (#134).
+func TestListenReturnsConfirmedImmediately(t *testing.T) {
+	l := newListenerForUnlistenTest()
+	l.confirmed = map[string]bool{"a": true}
+
+	if err := l.Listen(context.Background(), "a"); err != nil {
+		t.Fatalf("Listen(a) on confirmed channel: %v", err)
+	}
+	l.mu.Lock()
+	pending := len(l.pending)
+	l.mu.Unlock()
+	if pending != 0 {
+		t.Errorf("pending = %d after Listen on confirmed channel, want 0", pending)
+	}
+}
+
+// TestListenAfterCloseReturnsErrListenerClosed confirms Listen reports the
+// shutdown signal once the Listener is closed, rather than blocking (#134).
+func TestListenAfterCloseReturnsErrListenerClosed(t *testing.T) {
+	l := newListenerForUnlistenTest("a")
+	l.mu.Lock()
+	l.closed = true
+	l.mu.Unlock()
+
+	if err := l.Listen(context.Background(), "x"); !errors.Is(err, errListenerClosed) {
+		t.Errorf("Listen after close: got %v, want errListenerClosed", err)
+	}
+}
+
+// TestListenHonorsContextCancellation confirms the now-synchronous Listen
+// returns ctx.Err() when its confirmation wait is cancelled before the run loop
+// drains the request (#134). No run loop is started here, so the request never
+// confirms — cancellation is the only way out.
+func TestListenHonorsContextCancellation(t *testing.T) {
+	l := newListenerForUnlistenTest()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errc := make(chan error, 1)
+	go func() { errc <- l.Listen(ctx, "a") }()
+
+	// Let Listen queue its request and block on the select, then cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Listen returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Listen did not return after ctx cancellation")
+	}
+}
+
+// TestListenUnblockedByClose confirms a Listen blocked awaiting confirmation is
+// released with errListenerClosed when the Listener shuts down (the run loop
+// closes l.done), so callers never hang past Close (#134).
+func TestListenUnblockedByClose(t *testing.T) {
+	l := newListenerForUnlistenTest()
+
+	errc := make(chan error, 1)
+	go func() { errc <- l.Listen(context.Background(), "a") }()
+
+	time.Sleep(50 * time.Millisecond)
+	close(l.done) // mirror what Close does to release blocked waiters
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, errListenerClosed) {
+			t.Errorf("Listen returned %v, want errListenerClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Listen did not return after l.done closed")
+	}
+}
+
 // TestReconnectLogsAtWarn is part of the R-07 regression set: a reconnect
 // attempt is logged at WARN level (the reconnect loop logs via logWarn).
 func TestReconnectLogsAtWarn(t *testing.T) {

@@ -49,8 +49,14 @@ func (pq *Queue) emitNotify(ctx context.Context, tx *sql.Tx, tableName string) {
 // of waiting for the next safety-net poll. The core stays driver-agnostic:
 // concrete implementations (pgx, lib/pq) ship as optional sub-packages.
 type Listener interface {
-	// Listen begins listening on the given PostgreSQL notification channel. It
-	// is called once per distinct channel and must be safe for concurrent use.
+	// Listen begins listening on the given PostgreSQL notification channel and
+	// returns only once the LISTEN has been confirmed on the server (or ctx is
+	// cancelled / a deadline fires). A nil return therefore means the channel
+	// is genuinely subscribed: notifications will now be delivered. A non-nil
+	// return means the subscription is not active — the caller should treat
+	// push delivery as unavailable for the channel and may retry. ctx bounds
+	// the confirmation wait. It is called once per distinct channel and must be
+	// safe for concurrent use.
 	Listen(ctx context.Context, channel string) error
 	// Notifications returns a stream of notification channel names, one per
 	// received NOTIFY. The returned channel is closed when the Listener closes.
@@ -108,9 +114,20 @@ type notifier struct {
 	listener Listener
 	logger   *slog.Logger
 
+	// ctx scopes the confirmListen goroutines' Listen calls; cancel fires on
+	// close so a goroutine blocked confirming a LISTEN during an outage exits
+	// instead of leaking. It is the notifier's own lifetime, not any single
+	// consume call's, so one consumer stopping does not abort confirmation for
+	// channels other consumers still rely on — a deliberate stored lifetime
+	// context, not a request-scoped one.
+	//nolint:containedctx // notifier-lifetime cancellation handle, not request-scoped
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	mu             sync.Mutex
 	wakers         map[string]*waker // notification channel -> waker
-	listening      map[string]bool   // notification channel -> LISTEN issued
+	listening      map[string]bool   // notification channel -> LISTEN confirmed
+	listenInFlight map[string]bool   // notification channel -> confirmListen goroutine running
 	listenFailures map[string]int    // notification channel -> consecutive Listen failures (#68)
 	closed         bool
 
@@ -125,24 +142,35 @@ func newNotifier(listener Listener, logger *slog.Logger) *notifier {
 	if listener == nil {
 		return nil
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &notifier{
 		listener:       listener,
 		logger:         logger,
+		ctx:            ctx,
+		cancel:         cancel,
 		wakers:         make(map[string]*waker),
 		listening:      make(map[string]bool),
+		listenInFlight: make(map[string]bool),
 		listenFailures: make(map[string]int),
 	}
 }
 
 // wakeChan returns the channel a consume loop selects on to learn that a
-// message may have arrived on notifyChannel. It lazily issues LISTEN and starts
-// the demux pump. A nil return means push delivery is unavailable; the caller
-// then relies solely on the safety-net poll.
-func (n *notifier) wakeChan(ctx context.Context, notifyChannel string) <-chan struct{} {
-	// Hold n.mu across the whole decide -> LISTEN -> record sequence so the
+// message may have arrived on notifyChannel. It lazily confirms LISTEN (in a
+// background goroutine, see confirmListen) and starts the demux pump. A nil
+// return means push delivery is unavailable; the caller then relies solely on
+// the safety-net poll.
+//
+// Confirmation runs off the lock and off the consume hot path: Listen is now
+// synchronous (it blocks until the LISTEN is confirmed on the server), so
+// calling it under n.mu would serialize every consumer and stall close(). The
+// returned waker is handed back immediately; the safety-net poll covers the
+// brief window before LISTEN is confirmed.
+func (n *notifier) wakeChan(_ context.Context, notifyChannel string) <-chan struct{} {
+	// Hold n.mu across the whole decide -> spawn -> record sequence so the
 	// check-then-act is atomic: concurrent wakeChan callers for the same
-	// channel cannot double-issue LISTEN, and a caller cannot issue LISTEN
-	// after close() — close() takes the same lock (R-06).
+	// channel cannot double-spawn confirmation, and a caller cannot start
+	// confirming after close() — close() takes the same lock (R-06).
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -161,23 +189,41 @@ func (n *notifier) wakeChan(ctx context.Context, notifyChannel string) <-chan st
 	// under the lock is safe.
 	n.pumpOnce.Do(func() { go n.pump() })
 
-	if !n.listening[notifyChannel] {
-		// Issue LISTEN exactly once per channel, atomically with recording it.
-		// On error the channel stays unregistered: the safety-net poll still
-		// delivers the message and a later wakeChan call retries LISTEN. A
-		// persistently failing LISTEN used to be invisible to operators; now
-		// every failure logs at WARN and the count is escalated to ERROR
-		// every listenEscalateThreshold consecutive failures so a
-		// misconfigured Listener is impossible to miss (#68).
-		if err := n.listener.Listen(ctx, notifyChannel); err == nil {
-			n.listening[notifyChannel] = true
-			delete(n.listenFailures, notifyChannel)
-		} else {
-			n.listenFailures[notifyChannel]++
-			n.logListenFailure(notifyChannel, err, n.listenFailures[notifyChannel])
-		}
+	// Confirm LISTEN exactly once per channel. listenInFlight guards against a
+	// second goroutine while one is still blocked confirming, so a sustained
+	// outage cannot spawn a retry storm — at most one confirmation goroutine
+	// per channel is ever live. A later wakeChan retries only after the
+	// previous attempt has returned and (on failure) cleared the flag.
+	if !n.listening[notifyChannel] && !n.listenInFlight[notifyChannel] {
+		n.listenInFlight[notifyChannel] = true
+		go n.confirmListen(notifyChannel)
 	}
 	return w.wait()
+}
+
+// confirmListen synchronously confirms the LISTEN for notifyChannel and records
+// the outcome. It runs as a detached goroutine spawned by wakeChan so the
+// blocking Listen never stalls the consume hot path. On success the channel is
+// marked listening; on failure the consecutive-failure count is bumped and
+// logged — every failure at WARN, re-escalated to ERROR every
+// listenEscalateThreshold failures so a persistently degraded LISTEN is
+// impossible to miss (#68). Because Listen is now synchronous, a genuine
+// server-side LISTEN failure finally reaches this machinery instead of being
+// silently swallowed (#134). The Listen uses the notifier-scoped context so
+// close() can unblock a goroutine stuck confirming during an outage.
+func (n *notifier) confirmListen(notifyChannel string) {
+	err := n.listener.Listen(n.ctx, notifyChannel)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.listenInFlight, notifyChannel)
+	if err == nil {
+		n.listening[notifyChannel] = true
+		delete(n.listenFailures, notifyChannel)
+		return
+	}
+	n.listenFailures[notifyChannel]++
+	n.logListenFailure(notifyChannel, err, n.listenFailures[notifyChannel])
 }
 
 // logListenFailure reports a Listen call failure. It always logs at WARN with
@@ -215,6 +261,7 @@ func (n *notifier) forget(ctx context.Context, notifyChannel string) {
 	n.mu.Lock()
 	delete(n.wakers, notifyChannel)
 	delete(n.listening, notifyChannel)
+	delete(n.listenInFlight, notifyChannel)
 	delete(n.listenFailures, notifyChannel)
 	closed := n.closed
 	listener := n.listener
@@ -286,6 +333,11 @@ func (n *notifier) close() error {
 	}
 	n.closed = true
 	n.mu.Unlock()
+
+	// Cancel the notifier-scoped context so any confirmListen goroutine blocked
+	// inside Listen (e.g. confirming during an outage) unblocks and exits
+	// instead of leaking; closing the listener below also releases it.
+	n.cancel()
 
 	err := n.listener.Close()
 	n.wakeAll()

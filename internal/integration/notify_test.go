@@ -366,11 +366,11 @@ func TestPglistenUnlistenReleasesBackendRegistration(t *testing.T) {
 	defer func() { _ = listener.Close() }()
 
 	const ch = "unlisten_direct"
+	// Listen is synchronous (#134): when it returns nil the LISTEN is already
+	// live on the backend session, so no sleep is needed before NOTIFYing.
 	if err := listener.Listen(ctx, ch); err != nil {
 		t.Fatalf("Listen(%q): %v", ch, err)
 	}
-	// Let the run loop drain the LISTEN onto the backend session.
-	time.Sleep(200 * time.Millisecond)
 
 	// Pre-Unlisten: a NOTIFY from the main connection reaches the listener.
 	if _, err := db.ExecContext(ctx, `SELECT pg_notify($1, '')`, ch); err != nil {
@@ -412,5 +412,45 @@ drain:
 		t.Fatalf("post-Unlisten: unexpected NOTIFY received on %q; UNLISTEN did not take effect", got)
 	case <-time.After(1 * time.Second):
 		// Expected: no notification — the LISTEN was actually released.
+	}
+}
+
+// TestPglistenListenConfirmsSynchronously is the #134 regression guard: Listen
+// must not return until the LISTEN is live on the backend session. We prove it
+// by NOTIFYing immediately after Listen returns, with no intervening sleep — a
+// fire-and-forget Listen would race and frequently miss this NOTIFY, while a
+// synchronous one reliably delivers it.
+func TestPglistenListenConfirmsSynchronously(t *testing.T) {
+	db, connStr, cleanup := setupNotifyTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	listener, err := pglisten.New(ctx, connStr)
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	const ch = "listen_sync_confirm"
+	if err := listener.Listen(ctx, ch); err != nil {
+		t.Fatalf("Listen(%q): %v", ch, err)
+	}
+	// No sleep: a nil return must already mean the LISTEN is live.
+	if _, err := db.ExecContext(ctx, `SELECT pg_notify($1, '')`, ch); err != nil {
+		t.Fatalf("pg_notify: %v", err)
+	}
+	select {
+	case got := <-listener.Notifications():
+		if got != ch {
+			t.Fatalf("notification on wrong channel: got %q, want %q", got, ch)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Listen returned before the LISTEN was live; NOTIFY was missed")
+	}
+
+	// A repeat Listen for the same channel is the idempotent fast path and must
+	// return nil immediately.
+	if err := listener.Listen(ctx, ch); err != nil {
+		t.Fatalf("repeat Listen(%q): %v", ch, err)
 	}
 }
