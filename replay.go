@@ -514,7 +514,7 @@ func (pq *Queue) checkMessageExists(
 	tableName string,
 	messageID uuid.UUID,
 ) error {
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// Table name derived from a queueNameRegex-validated queue name; injection-safe.
 	checkQuery := fmt.Sprintf(
 		`SELECT status FROM %s WHERE id = $1`, pq.msgTable(tableName),
 	)

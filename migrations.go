@@ -377,7 +377,7 @@ func schemaVersion(ctx context.Context, q queryRower, versionTable string) (int,
 // the otherwise-unqualified base-schema DDL lands in that schema. search_path is
 // reliable here because the run holds one dedicated connection; it is RESET
 // before that connection returns to the pool.
-func runMigrations(ctx context.Context, db *sql.DB, schema string) error {
+func runMigrations(ctx context.Context, db DB, schema string) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire migration connection: %w", err)

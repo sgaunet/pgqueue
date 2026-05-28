@@ -258,7 +258,8 @@ func (pq *Queue) getQueueMetadata(
 	ctx context.Context,
 	queueType, queueName string,
 ) (*QueueMetadata, error) {
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	// The table name is a schema-qualified internal identifier, not user input,
+	// so this interpolation is injection-safe.
 	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
 		FROM %s
@@ -432,7 +433,8 @@ func (pq *Queue) checkTableNameNotExists(
 	ctx context.Context,
 	tableName string,
 ) error {
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	// The table name is a schema-qualified internal identifier, not user input,
+	// so this interpolation is injection-safe.
 	query := fmt.Sprintf(
 		`SELECT queue_name FROM %s WHERE table_name = $1 LIMIT 1`,
 		pq.globalTable("pgqueue_metadata"),
@@ -533,7 +535,7 @@ func (pq *Queue) registerSubscriber(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) (*Subscriber, error) {
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	// Schema-qualified internal table name, not user input; injection-safe.
 	query := fmt.Sprintf(`
 		INSERT INTO %s (topic_name, subscriber_id)
 		VALUES ($1, $2)
@@ -562,7 +564,7 @@ func (pq *Queue) unregisterSubscriber(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	// Schema-qualified internal table name, not user input; injection-safe.
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET active = FALSE
@@ -713,7 +715,7 @@ func (pq *Queue) getReplayHistory(
 	queueType, queueName string,
 	limit int,
 ) ([]ReplayLog, error) {
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	// Schema-qualified internal table name, not user input; injection-safe.
 	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, replay_type,
 		       replay_params, message_count, created_at, created_by

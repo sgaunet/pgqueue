@@ -64,9 +64,31 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_queue ON pgqueue_replay_log(qu
 CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_log(created_at);
 `
 
+// DB is the database handle pgqueue operates on. *sql.DB satisfies it, so an
+// existing *sql.DB caller passes it unchanged; the interface lets consumers
+// substitute a connection-pool wrapper, an instrumented handle, or a test
+// double without a breaking change.
+//
+// Conn and BeginTx still yield the concrete *sql.Conn / *sql.Tx (the migration
+// runner holds a session-level advisory lock on a dedicated *sql.Conn, and all
+// transactional work uses *sql.Tx), so an implementation must ultimately
+// delegate to a real database/sql handle rather than emulate one from scratch.
+type DB interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+	PingContext(ctx context.Context) error
+	Conn(ctx context.Context) (*sql.Conn, error)
+}
+
+// Compile-time proof the standard library handle satisfies DB, so passing a
+// *sql.DB to InitSchema/New stays a no-op for existing callers.
+var _ DB = (*sql.DB)(nil)
+
 // Queue is the main struct for the message queue system.
 type Queue struct {
-	db       *sql.DB
+	db       DB
 	cfg      queueConfig    // resolved config built from functional options
 	logger   *slog.Logger
 	closed   atomic.Bool    // set to true after Close() is called
@@ -141,7 +163,7 @@ var readCommittedTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-func InitSchema(ctx context.Context, db *sql.DB, opts ...Option) error {
+func InitSchema(ctx context.Context, db DB, opts ...Option) error {
 	if db == nil {
 		return ErrDBRequired
 	}
@@ -288,7 +310,7 @@ func validateBackoffPolicy(p BackoffPolicy) error {
 
 // checkDBReady verifies the database is reachable and runs a supported
 // PostgreSQL version.
-func checkDBReady(ctx context.Context, db *sql.DB) error {
+func checkDBReady(ctx context.Context, db DB) error {
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
@@ -321,7 +343,7 @@ func checkDBReady(ctx context.Context, db *sql.DB) error {
 //	    pgqueue.WithMaxMessageSize(1024*1024),
 //	    pgqueue.WithDefaultMaxRetries(5),
 //	)
-func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
+func New(ctx context.Context, db DB, opts ...Option) (*Queue, error) {
 	if db == nil {
 		return nil, ErrDBRequired
 	}
@@ -464,12 +486,12 @@ func (pq *Queue) ListChannels(ctx context.Context) ([]string, error) {
 // created via NewGarbageCollector, waits for handler-based consume loops
 // (ConsumeChannel/ConsumeTopic) to drain, then closes the LISTEN/NOTIFY
 // listener. After Close returns no Queue-owned goroutine issues a database
-// query, so the caller can safely close the underlying *sql.DB next:
+// query, so the caller can safely close the underlying DB handle next:
 //
 //	pq.Close()      // stops GC + consume loops + listener
 //	db.Close()      // then close the database connection
 //
-// Close does NOT close the *sql.DB, which is owned by the caller. It is
+// Close does NOT close the DB handle, which is owned by the caller. It is
 // idempotent: calling it multiple times is safe and returns nil.
 //
 // Close must not be called from inside a message handler run by

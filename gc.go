@@ -1012,7 +1012,8 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	tableName string,
 ) error {
 	msgTbl := gc.pq.msgTable(tableName)
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// The table name comes from a queueNameRegex-validated queue name, so this
+	// interpolation is injection-safe.
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -1053,7 +1054,8 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	tableName string,
 ) error {
 	subTbl := gc.pq.subTable(tableName)
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// The table name comes from a queueNameRegex-validated queue name, so this
+	// interpolation is injection-safe.
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -1100,7 +1102,7 @@ func (gc *GarbageCollector) purgeInactiveSubscriptions(
 	ctx context.Context,
 	queueName, tableName string,
 ) error {
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// Table name derived from a queueNameRegex-validated queue name; injection-safe.
 	query := fmt.Sprintf(`
 		DELETE FROM %s
 		WHERE subscriber_id IN (

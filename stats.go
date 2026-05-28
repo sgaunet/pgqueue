@@ -148,7 +148,7 @@ func (pq *Queue) GetSubscriberLag(
 	tableName := metadata.TableName
 
 	// Age computed in SQL for clock consistency — see getChannelStats (R-19).
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// Table name derived from a queueNameRegex-validated queue name; injection-safe.
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = '%s') AS pending_count,
@@ -204,7 +204,7 @@ func (pq *Queue) GetDLQStats(
 
 	tableName := metadata.TableName
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// Table name derived from a queueNameRegex-validated queue name; injection-safe.
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) AS total_count,
@@ -257,7 +257,7 @@ func (pq *Queue) getChannelStats(
 	// the database clock and never negative under NTP skew (R-19).
 	// The DLQ count rides on the same statement so all four counters share a
 	// single snapshot (issue #112).
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// Table name derived from a queueNameRegex-validated queue name; injection-safe.
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = '%s') AS pending,
@@ -320,7 +320,7 @@ func (pq *Queue) getPubSubStats(
 	// Age computed in SQL for clock consistency — see getChannelStats (R-19).
 	// The DLQ count rides on the same statement so all counters share a
 	// single snapshot (issue #112).
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// Table name derived from a queueNameRegex-validated queue name; injection-safe.
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) FILTER (WHERE status = '%s') AS pending,

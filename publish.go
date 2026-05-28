@@ -100,7 +100,8 @@ func (pq *Queue) resolveQueueMetadata(
 	// guarantees at most one row matches: a channel and a topic with the same
 	// queue_name would sanitize to the same physical table name and the second
 	// CreateChannel/CreateTopic would be rejected at creation time.
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	// The table name is a schema-qualified internal identifier, not user input,
+	// so this interpolation is injection-safe.
 	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
 		FROM %s

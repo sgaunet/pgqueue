@@ -58,7 +58,8 @@ func (pq *Queue) ListDLQMessages(
 		afterID = page.AfterID
 	}
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// The table name comes from a queueNameRegex-validated queue name, so this
+	// interpolation is injection-safe.
 	query := fmt.Sprintf(`
 		SELECT id, original_message_id, payload, failure_reason,
 		       retry_count, moved_at, metadata
