@@ -111,6 +111,37 @@ func (m *Message) Receipt() Receipt {
 	return Receipt{MessageID: m.ID, ClaimID: m.ClaimID}
 }
 
+// BatchResult reports the per-receipt outcome of AckBatch / NackBatch. When
+// those methods return a nil error the batch was processed and this enumerates
+// the result: Succeeded lists the receipts whose ack/nack committed, and Failed
+// lists the receipts that did not match a live claim, each with the reason. A
+// non-nil error from AckBatch / NackBatch signals an operational failure (the
+// queue is closed, the batch is too large, a receipt is missing its queue
+// binding, the queue does not exist, or a database error occurred); in that
+// case the returned BatchResult is zero and should be ignored.
+//
+// Partial success is not an error: a batch where some claims have expired
+// returns a nil error with those receipts in Failed, so the caller can retry or
+// discard them individually.
+type BatchResult struct {
+	// Succeeded holds the receipts whose ack/nack was applied, in input order
+	// within each queue.
+	Succeeded []Receipt
+	// Failed holds the receipts that did not match a live processing claim,
+	// each paired with the reason. Receipts are assumed unique within a batch.
+	Failed []FailedReceipt
+}
+
+// FailedReceipt pairs a receipt with the reason its ack/nack did not apply. The
+// Reason is one of ErrClaimExpired (redelivered to another consumer),
+// ErrMessageAlreadyAcked (already acked/nacked, or never legitimately
+// consumed), or ErrMessageNotFound (no such message), classified identically to
+// the single-receipt Ack/Nack path. Test it with errors.Is.
+type FailedReceipt struct {
+	Receipt Receipt
+	Reason  error
+}
+
 // SetReceipt binds a queue-aware Receipt onto a Message so that m.Receipt()
 // returns the full binding. ReceiveChannel and ReceiveTopic call this
 // internally; it is exported chiefly so in-memory test doubles (the

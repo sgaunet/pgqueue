@@ -22,10 +22,13 @@ import (
 func TestAckBatchRejectsReceiptMissingQueueType(t *testing.T) {
 	pq := &Queue{}
 
-	err := pq.AckBatch(context.Background(), []Receipt{{}})
+	res, err := pq.AckBatch(context.Background(), []Receipt{{}})
 
 	if !errors.Is(err, ErrReceiptMissingQueueType) {
 		t.Fatalf("AckBatch with an unbound receipt: err = %v, want ErrReceiptMissingQueueType", err)
+	}
+	if res.Succeeded != nil || res.Failed != nil {
+		t.Fatalf("AckBatch returned a non-zero result alongside an operational error: %+v", res)
 	}
 }
 
@@ -34,10 +37,13 @@ func TestAckBatchRejectsReceiptMissingQueueType(t *testing.T) {
 func TestNackBatchRejectsReceiptMissingQueueType(t *testing.T) {
 	pq := &Queue{}
 
-	err := pq.NackBatch(context.Background(), []Receipt{{}}, "reason")
+	res, err := pq.NackBatch(context.Background(), []Receipt{{}}, "reason")
 
 	if !errors.Is(err, ErrReceiptMissingQueueType) {
 		t.Fatalf("NackBatch with an unbound receipt: err = %v, want ErrReceiptMissingQueueType", err)
+	}
+	if res.Succeeded != nil || res.Failed != nil {
+		t.Fatalf("NackBatch returned a non-zero result alongside an operational error: %+v", res)
 	}
 }
 
@@ -45,10 +51,18 @@ func TestNackBatchRejectsReceiptMissingQueueType(t *testing.T) {
 // not be turned into an error by the new validation.
 func TestAckBatchEmptyStillSucceeds(t *testing.T) {
 	pq := &Queue{}
-	if err := pq.AckBatch(context.Background(), nil); err != nil {
+	res, err := pq.AckBatch(context.Background(), nil)
+	if err != nil {
 		t.Fatalf("AckBatch(nil) = %v, want nil", err)
 	}
-	if err := pq.NackBatch(context.Background(), nil, "reason"); err != nil {
+	if len(res.Succeeded) != 0 || len(res.Failed) != 0 {
+		t.Fatalf("AckBatch(nil) result = %+v, want empty", res)
+	}
+	res, err = pq.NackBatch(context.Background(), nil, "reason")
+	if err != nil {
 		t.Fatalf("NackBatch(nil) = %v, want nil", err)
+	}
+	if len(res.Succeeded) != 0 || len(res.Failed) != 0 {
+		t.Fatalf("NackBatch(nil) result = %+v, want empty", res)
 	}
 }

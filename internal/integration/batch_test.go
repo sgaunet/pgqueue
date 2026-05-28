@@ -345,9 +345,12 @@ func TestAckChannelBatch(t *testing.T) {
 		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.AckBatch(ctx, consumedReceipts)
+	res, err := pq.AckBatch(ctx, consumedReceipts)
 	if err != nil {
 		t.Fatalf("AckBatch failed: %v", err)
+	}
+	if len(res.Succeeded) != 5 || len(res.Failed) != 0 {
+		t.Fatalf("AckBatch result = %d succeeded, %d failed; want 5, 0", len(res.Succeeded), len(res.Failed))
 	}
 
 	stats, err := pq.GetStats(ctx, "ack-batch", pgqueue.QueueTypeChannel)
@@ -379,14 +382,28 @@ func TestAckChannelBatchNoneProcessing(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	// Not consumed → still pending, not processing. Zero ClaimID matches no rows.
+	// Not consumed → still pending, not processing. The receipts carry a zero
+	// ClaimID (never legitimately consumed), so each is classified
+	// ErrMessageAlreadyAcked — consistent with the single-receipt Ack — and
+	// reported per-receipt in BatchResult.Failed rather than as a top-level error.
 	receipts := make([]pgqueue.Receipt, len(ids))
 	for i, id := range ids {
 		receipts[i] = pgqueue.Receipt{MessageID: id, QueueName: "ack-none", QueueType: pgqueue.QueueTypeChannel}
 	}
-	err = pq.AckBatch(ctx, receipts)
-	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
-		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
+	res, err := pq.AckBatch(ctx, receipts)
+	if err != nil {
+		t.Fatalf("AckBatch returned an operational error: %v", err)
+	}
+	if len(res.Succeeded) != 0 {
+		t.Errorf("expected 0 succeeded, got %d", len(res.Succeeded))
+	}
+	if len(res.Failed) != len(receipts) {
+		t.Fatalf("expected %d failed, got %d", len(receipts), len(res.Failed))
+	}
+	for _, f := range res.Failed {
+		if !errors.Is(f.Reason, pgqueue.ErrMessageAlreadyAcked) {
+			t.Errorf("receipt %s: reason = %v, want ErrMessageAlreadyAcked", f.Receipt.MessageID, f.Reason)
+		}
 	}
 }
 
@@ -401,9 +418,12 @@ func TestAckChannelBatchEmptySlice(t *testing.T) {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
-	err = pq.AckBatch(ctx, nil)
+	res, err := pq.AckBatch(ctx, nil)
 	if err != nil {
 		t.Errorf("expected nil error for empty slice, got: %v", err)
+	}
+	if len(res.Succeeded) != 0 || len(res.Failed) != 0 {
+		t.Errorf("expected empty result for empty slice, got %+v", res)
 	}
 }
 
@@ -425,7 +445,7 @@ func TestAckChannelBatchTooLarge(t *testing.T) {
 		receipts[i] = pgqueue.Receipt{QueueName: "ack-large", QueueType: pgqueue.QueueTypeChannel}
 	}
 
-	err = pq.AckBatch(ctx, receipts)
+	_, err = pq.AckBatch(ctx, receipts)
 	if !errors.Is(err, pgqueue.ErrBatchTooLarge) {
 		t.Errorf("expected ErrBatchTooLarge, got: %v", err)
 	}
@@ -468,9 +488,12 @@ func TestAckTopicBatch(t *testing.T) {
 		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.AckBatch(ctx, consumedReceipts)
+	res, err := pq.AckBatch(ctx, consumedReceipts)
 	if err != nil {
 		t.Fatalf("AckBatch failed: %v", err)
+	}
+	if len(res.Succeeded) != 5 || len(res.Failed) != 0 {
+		t.Fatalf("AckBatch result = %d succeeded, %d failed; want 5, 0", len(res.Succeeded), len(res.Failed))
 	}
 }
 
@@ -497,14 +520,26 @@ func TestAckTopicBatchNoneProcessing(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	// Not consumed → zero ClaimID matches no rows.
+	// Not consumed → zero ClaimID. Each receipt is classified
+	// ErrMessageAlreadyAcked and reported per-receipt in BatchResult.Failed.
 	receipts := make([]pgqueue.Receipt, len(ids))
 	for i, id := range ids {
 		receipts[i] = pgqueue.Receipt{MessageID: id, QueueName: "ack-topic-none", QueueType: pgqueue.QueueTypePubSub, SubscriberID: "sub1"}
 	}
-	err = pq.AckBatch(ctx, receipts)
-	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
-		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
+	res, err := pq.AckBatch(ctx, receipts)
+	if err != nil {
+		t.Fatalf("AckBatch returned an operational error: %v", err)
+	}
+	if len(res.Succeeded) != 0 {
+		t.Errorf("expected 0 succeeded, got %d", len(res.Succeeded))
+	}
+	if len(res.Failed) != len(receipts) {
+		t.Fatalf("expected %d failed, got %d", len(receipts), len(res.Failed))
+	}
+	for _, f := range res.Failed {
+		if !errors.Is(f.Reason, pgqueue.ErrMessageAlreadyAcked) {
+			t.Errorf("receipt %s: reason = %v, want ErrMessageAlreadyAcked", f.Receipt.MessageID, f.Reason)
+		}
 	}
 }
 
@@ -541,9 +576,12 @@ func TestNackChannelBatch(t *testing.T) {
 		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackBatch(ctx, consumedReceipts, "transient error")
+	res, err := pq.NackBatch(ctx, consumedReceipts, "transient error")
 	if err != nil {
 		t.Fatalf("NackBatch failed: %v", err)
+	}
+	if len(res.Succeeded) != 5 || len(res.Failed) != 0 {
+		t.Fatalf("NackBatch result = %d succeeded, %d failed; want 5, 0", len(res.Succeeded), len(res.Failed))
 	}
 
 	// All messages should be back to pending
@@ -597,7 +635,7 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 		firstReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackBatch(ctx, firstReceipts, "first failure")
+	_, err = pq.NackBatch(ctx, firstReceipts, "first failure")
 	if err != nil {
 		t.Fatalf("first NackBatch failed: %v", err)
 	}
@@ -615,7 +653,7 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 		secondReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackBatch(ctx, secondReceipts, "second failure")
+	_, err = pq.NackBatch(ctx, secondReceipts, "second failure")
 	if err != nil {
 		t.Fatalf("second NackBatch failed: %v", err)
 	}
@@ -644,9 +682,12 @@ func TestNackChannelBatchEmptySlice(t *testing.T) {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
-	err = pq.NackBatch(ctx, nil, "error")
+	res, err := pq.NackBatch(ctx, nil, "error")
 	if err != nil {
 		t.Errorf("expected nil error for empty slice, got: %v", err)
+	}
+	if len(res.Succeeded) != 0 || len(res.Failed) != 0 {
+		t.Errorf("expected empty result for empty slice, got %+v", res)
 	}
 }
 
@@ -669,14 +710,28 @@ func TestNackChannelBatchNoneProcessing(t *testing.T) {
 		t.Fatalf("PublishBatch failed: %v", err)
 	}
 
-	// Not consumed → zero ClaimID matches no rows.
+	// Not consumed → zero ClaimID, but the message rows still exist (pending).
+	// Each receipt is classified ErrMessageAlreadyAcked — consistent with the
+	// single-receipt Nack — and reported per-receipt in BatchResult.Failed
+	// rather than as a top-level ErrMessageNotFound.
 	receipts := make([]pgqueue.Receipt, len(ids))
 	for i, id := range ids {
 		receipts[i] = pgqueue.Receipt{MessageID: id, QueueName: "nack-none", QueueType: pgqueue.QueueTypeChannel}
 	}
-	err = pq.NackBatch(ctx, receipts, "error")
-	if !errors.Is(err, pgqueue.ErrMessageNotFound) {
-		t.Errorf("expected ErrMessageNotFound, got: %v", err)
+	res, err := pq.NackBatch(ctx, receipts, "error")
+	if err != nil {
+		t.Fatalf("NackBatch returned an operational error: %v", err)
+	}
+	if len(res.Succeeded) != 0 {
+		t.Errorf("expected 0 succeeded, got %d", len(res.Succeeded))
+	}
+	if len(res.Failed) != len(receipts) {
+		t.Fatalf("expected %d failed, got %d", len(receipts), len(res.Failed))
+	}
+	for _, f := range res.Failed {
+		if !errors.Is(f.Reason, pgqueue.ErrMessageAlreadyAcked) {
+			t.Errorf("receipt %s: reason = %v, want ErrMessageAlreadyAcked", f.Receipt.MessageID, f.Reason)
+		}
 	}
 }
 
@@ -777,12 +832,26 @@ func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 		valid[1],
 		{MessageID: staleB, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel},
 	}
-	if err := pq.AckBatch(ctx, mixed); err != nil {
+	res, err := pq.AckBatch(ctx, mixed)
+	if err != nil {
 		t.Fatalf("ack batch: %v", err)
 	}
 
 	if got := metrics.ackAfterExpiredCount(); got != 2 {
 		t.Errorf("RecordAckAfterExpired emissions = %d, want 2 (one per skipped receipt)", got)
+	}
+	// The two valid receipts succeed; the two stale (nonexistent) ones fail with
+	// ErrMessageNotFound.
+	if len(res.Succeeded) != 2 {
+		t.Errorf("expected 2 succeeded, got %d", len(res.Succeeded))
+	}
+	if len(res.Failed) != 2 {
+		t.Fatalf("expected 2 failed, got %d", len(res.Failed))
+	}
+	for _, f := range res.Failed {
+		if !errors.Is(f.Reason, pgqueue.ErrMessageNotFound) {
+			t.Errorf("receipt %s: reason = %v, want ErrMessageNotFound", f.Receipt.MessageID, f.Reason)
+		}
 	}
 }
 
@@ -815,12 +884,22 @@ func TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 		t.Fatalf("uuid v7: %v", err)
 	}
 	mixed := []pgqueue.Receipt{msg.Receipt(), {MessageID: staleA, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel}}
-	if err := pq.NackBatch(ctx, mixed, "transient"); err != nil {
+	res, err := pq.NackBatch(ctx, mixed, "transient")
+	if err != nil {
 		t.Fatalf("nack batch: %v", err)
 	}
 
 	if got := metrics.ackAfterExpiredCount(); got != 1 {
 		t.Errorf("RecordAckAfterExpired emissions = %d, want 1 (one per skipped receipt)", got)
+	}
+	if len(res.Succeeded) != 1 {
+		t.Errorf("expected 1 succeeded, got %d", len(res.Succeeded))
+	}
+	if len(res.Failed) != 1 {
+		t.Fatalf("expected 1 failed, got %d", len(res.Failed))
+	}
+	if !errors.Is(res.Failed[0].Reason, pgqueue.ErrMessageNotFound) {
+		t.Errorf("reason = %v, want ErrMessageNotFound", res.Failed[0].Reason)
 	}
 }
 
@@ -851,7 +930,7 @@ func TestNackChannelBatchAppliesBackoff(t *testing.T) {
 		}
 		receipts = append(receipts, msg.Receipt())
 	}
-	if err := pq.NackBatch(ctx, receipts, "transient failure"); err != nil {
+	if _, err := pq.NackBatch(ctx, receipts, "transient failure"); err != nil {
 		t.Fatalf("nack batch: %v", err)
 	}
 
@@ -897,7 +976,7 @@ func TestNackTopicBatchAppliesBackoff(t *testing.T) {
 		}
 		receipts = append(receipts, msg.Receipt())
 	}
-	if err := pq.NackBatch(ctx, receipts, "transient failure"); err != nil {
+	if _, err := pq.NackBatch(ctx, receipts, "transient failure"); err != nil {
 		t.Fatalf("nack batch: %v", err)
 	}
 
@@ -910,6 +989,172 @@ func TestNackTopicBatchAppliesBackoff(t *testing.T) {
 	time.Sleep(1300 * time.Millisecond)
 	if _, err := pq.ReceiveTopic(ctx, topicName, subID); err != nil {
 		t.Fatalf("message not redelivered after backoff: %v", err)
+	}
+}
+
+// TestAckChannelBatchMixedOutcomes is the issue #133 (AUDIT A2) verification:
+// a batch mixing a valid receipt, an expired claim, an already-acked receipt,
+// and a nonexistent receipt must return a nil error with Succeeded holding
+// exactly the valid receipt and Failed carrying the correct per-receipt reason
+// for each of the other three.
+func TestAckChannelBatchMixedOutcomes(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const ch = "mixedack"
+	if err := pq.CreateChannel(ctx, ch); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	if _, err := pq.PublishBatch(ctx, ch, []pgqueue.PublishMessage{
+		{Payload: []byte("valid")},
+		{Payload: []byte("expired")},
+		{Payload: []byte("acked")},
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	byPayload := make(map[string]pgqueue.Receipt, 3)
+	for range 3 {
+		msg, err := pq.ReceiveChannel(ctx, ch, pgqueue.WithVisibilityTimeout(30*time.Second))
+		if err != nil {
+			t.Fatalf("consume: %v", err)
+		}
+		byPayload[string(msg.Payload)] = msg.Receipt()
+	}
+	validR := byPayload["valid"]
+	expiredR := byPayload["expired"]
+	ackedR := byPayload["acked"]
+
+	// Expired claim: rewrite the row's claim_id so the receipt's token no longer
+	// matches a still-processing row -> ErrClaimExpired.
+	otherClaim := uuid.New()
+	if _, err := db.ExecContext(ctx,
+		`UPDATE pgqueue_msg_mixedack SET claim_id = $1 WHERE id = $2`,
+		otherClaim, expiredR.MessageID,
+	); err != nil {
+		t.Fatalf("rewrite claim: %v", err)
+	}
+
+	// Already-acked: ack it under its own claim so it leaves 'processing' ->
+	// ErrMessageAlreadyAcked.
+	if err := pq.Ack(ctx, ackedR); err != nil {
+		t.Fatalf("single ack: %v", err)
+	}
+
+	// Nonexistent: a fresh ID that was never published -> ErrMessageNotFound.
+	missing, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("uuid v7: %v", err)
+	}
+	notFoundR := pgqueue.Receipt{MessageID: missing, QueueName: ch, QueueType: pgqueue.QueueTypeChannel}
+
+	res, err := pq.AckBatch(ctx, []pgqueue.Receipt{validR, expiredR, ackedR, notFoundR})
+	if err != nil {
+		t.Fatalf("AckBatch returned an operational error: %v", err)
+	}
+
+	if len(res.Succeeded) != 1 || res.Succeeded[0].MessageID != validR.MessageID {
+		t.Fatalf("Succeeded = %+v, want exactly the valid receipt %s", res.Succeeded, validR.MessageID)
+	}
+
+	wantReason := map[uuid.UUID]error{
+		expiredR.MessageID:  pgqueue.ErrClaimExpired,
+		ackedR.MessageID:    pgqueue.ErrMessageAlreadyAcked,
+		notFoundR.MessageID: pgqueue.ErrMessageNotFound,
+	}
+	if len(res.Failed) != len(wantReason) {
+		t.Fatalf("Failed count = %d, want %d (%+v)", len(res.Failed), len(wantReason), res.Failed)
+	}
+	for _, f := range res.Failed {
+		want, ok := wantReason[f.Receipt.MessageID]
+		if !ok {
+			t.Errorf("unexpected failed receipt %s", f.Receipt.MessageID)
+			continue
+		}
+		if !errors.Is(f.Reason, want) {
+			t.Errorf("receipt %s: reason = %v, want %v", f.Receipt.MessageID, f.Reason, want)
+		}
+	}
+}
+
+// TestNackChannelBatchMixedOutcomes is the nack counterpart of
+// TestAckChannelBatchMixedOutcomes: it exercises the nack path's Succeeded /
+// Failed partitioning, which is fed by fetchBatchMessageStates rather than an
+// UPDATE ... RETURNING.
+func TestNackChannelBatchMixedOutcomes(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const ch = "mixednack"
+	if err := pq.CreateChannel(ctx, ch, pgqueue.WithQueueMaxRetries(3)); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	if _, err := pq.PublishBatch(ctx, ch, []pgqueue.PublishMessage{
+		{Payload: []byte("valid")},
+		{Payload: []byte("expired")},
+		{Payload: []byte("acked")},
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	byPayload := make(map[string]pgqueue.Receipt, 3)
+	for range 3 {
+		msg, err := pq.ReceiveChannel(ctx, ch, pgqueue.WithVisibilityTimeout(30*time.Second))
+		if err != nil {
+			t.Fatalf("consume: %v", err)
+		}
+		byPayload[string(msg.Payload)] = msg.Receipt()
+	}
+	validR := byPayload["valid"]
+	expiredR := byPayload["expired"]
+	ackedR := byPayload["acked"]
+
+	otherClaim := uuid.New()
+	if _, err := db.ExecContext(ctx,
+		`UPDATE pgqueue_msg_mixednack SET claim_id = $1 WHERE id = $2`,
+		otherClaim, expiredR.MessageID,
+	); err != nil {
+		t.Fatalf("rewrite claim: %v", err)
+	}
+	if err := pq.Ack(ctx, ackedR); err != nil {
+		t.Fatalf("single ack: %v", err)
+	}
+	missing, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("uuid v7: %v", err)
+	}
+	notFoundR := pgqueue.Receipt{MessageID: missing, QueueName: ch, QueueType: pgqueue.QueueTypeChannel}
+
+	res, err := pq.NackBatch(ctx, []pgqueue.Receipt{validR, expiredR, ackedR, notFoundR}, "boom")
+	if err != nil {
+		t.Fatalf("NackBatch returned an operational error: %v", err)
+	}
+
+	if len(res.Succeeded) != 1 || res.Succeeded[0].MessageID != validR.MessageID {
+		t.Fatalf("Succeeded = %+v, want exactly the valid receipt %s", res.Succeeded, validR.MessageID)
+	}
+
+	wantReason := map[uuid.UUID]error{
+		expiredR.MessageID:  pgqueue.ErrClaimExpired,
+		ackedR.MessageID:    pgqueue.ErrMessageAlreadyAcked,
+		notFoundR.MessageID: pgqueue.ErrMessageNotFound,
+	}
+	if len(res.Failed) != len(wantReason) {
+		t.Fatalf("Failed count = %d, want %d (%+v)", len(res.Failed), len(wantReason), res.Failed)
+	}
+	for _, f := range res.Failed {
+		want, ok := wantReason[f.Receipt.MessageID]
+		if !ok {
+			t.Errorf("unexpected failed receipt %s", f.Receipt.MessageID)
+			continue
+		}
+		if !errors.Is(f.Reason, want) {
+			t.Errorf("receipt %s: reason = %v, want %v", f.Receipt.MessageID, f.Reason, want)
+		}
 	}
 }
 

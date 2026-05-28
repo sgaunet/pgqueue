@@ -99,23 +99,24 @@ func (pq *Queue) publishBatchResolved(
 	)
 }
 
-// ackChannelBatch acknowledges multiple messages from a channel in a single operation.
-// Returns ErrMessageAlreadyAcked only if no messages were updated.
-// Receipts that were not in processing state under their claim token (including
-// expired claims) are silently skipped and nil is returned (partial success);
-// batch operations do not surface ErrClaimExpired per receipt. Each silently
-// skipped receipt increments the RecordAckAfterExpired metric so operators can
-// detect partial success and the corresponding redeliveries.
+// ackChannelBatch acknowledges multiple messages from a channel in a single
+// operation and returns the per-receipt outcome. Receipts that matched a live
+// processing claim are acked and appear in BatchResult.Succeeded; the rest are
+// classified (ErrClaimExpired / ErrMessageAlreadyAcked / ErrMessageNotFound)
+// and appear in BatchResult.Failed. Partial success is not an error. Each
+// failed receipt increments the RecordAckAfterExpired metric so operators can
+// detect the corresponding redeliveries. A non-nil error is operational (bad
+// batch size, missing queue, or a database failure).
 func (pq *Queue) ackChannelBatch(
 	ctx context.Context,
 	channelName string,
 	receipts []Receipt,
-) error {
+) (BatchResult, error) {
 	if len(receipts) == 0 {
-		return nil
+		return BatchResult{}, nil
 	}
 	if err := validateBatchSize(len(receipts)); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 
 	queueMeta, err := pq.getQueueMetadata(
@@ -123,12 +124,23 @@ func (pq *Queue) ackChannelBatch(
 	)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+			return BatchResult{}, fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
 		}
-		return fmt.Errorf("failed to get channel metadata: %w", err)
+		return BatchResult{}, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	// Run the UPDATE (with RETURNING, to learn which receipts matched) and the
+	// classifying SELECT for the misses in one transaction so the classification
+	// observes the same snapshot as the UPDATE — a concurrent reclaim cannot
+	// flip a receipt's reason between the two (matches single-ack R-09).
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
+	if err != nil {
+		return BatchResult{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// G201 is not applicable: the query (with the regex-validated table name) is
+	// passed to queryMatchedIDs as a parameter, not built at the exec call site.
 	query := fmt.Sprintf(`
 		UPDATE %s AS m
 		SET status = '%s', processed_at = NOW()
@@ -136,47 +148,109 @@ func (pq *Queue) ackChannelBatch(
 		WHERE m.id = u.id
 		  AND m.claim_id = u.claim_id
 		  AND m.status = '%s'
+		RETURNING m.id
 	`, pq.msgTable(queueMeta.TableName), MessageStatusCompleted, MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimLiterals(receipts)
-	result, err := pq.db.ExecContext(ctx, query, ids, claims)
+	matched, err := queryMatchedIDs(ctx, tx, query, ids, claims)
 	if err != nil {
-		return fmt.Errorf("failed to acknowledge messages: %w", err)
+		return BatchResult{}, fmt.Errorf("failed to acknowledge messages: %w", err)
 	}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	pq.recordAckAfterExpired(channelName, len(receipts)-int(rows))
-	if rows == 0 {
-		return ErrMessageAlreadyAcked
-	}
-
-	return nil
+	msgTable := pq.msgTable(queueMeta.TableName)
+	return pq.finishBatch(tx, channelName, receipts, matched,
+		func(misses []Receipt) ([]FailedReceipt, error) {
+			return classifyChannelBatchMisses(ctx, tx, msgTable, misses)
+		})
 }
 
-// ackTopicBatch acknowledges multiple messages for a subscriber in a single operation.
-// Returns ErrMessageAlreadyAcked only if no messages were updated.
-// Receipts that were not in processing state under their claim token (including
-// expired claims) are silently skipped and nil is returned (partial success);
-// batch operations do not surface ErrClaimExpired per receipt. Each silently
-// skipped receipt increments the RecordAckAfterExpired metric so operators can
-// detect partial success and the corresponding redeliveries.
+// queryMatchedIDs runs an UPDATE ... RETURNING id (or a SELECT id) and collects
+// the returned message IDs into a set, used to learn which receipts a batch
+// statement actually matched.
+func queryMatchedIDs(
+	ctx context.Context,
+	tx *sql.Tx,
+	query string,
+	args ...any,
+) (map[uuid.UUID]bool, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query matched ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	matched := make(map[uuid.UUID]bool)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan matched id: %w", err)
+		}
+		matched[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate matched ids: %w", err)
+	}
+	return matched, nil
+}
+
+// finishBatch partitions receipts into Succeeded (those whose message ID is in
+// matched) and Failed (classified via classify), commits tx, and records the
+// skipped-receipt metric. Input order is preserved within Succeeded and Failed.
+// classify is invoked only when there are misses.
+func (pq *Queue) finishBatch(
+	tx *sql.Tx,
+	queueName string,
+	receipts []Receipt,
+	matched map[uuid.UUID]bool,
+	classify func(misses []Receipt) ([]FailedReceipt, error),
+) (BatchResult, error) {
+	var res BatchResult
+	var misses []Receipt
+	for _, r := range receipts {
+		if matched[r.MessageID] {
+			res.Succeeded = append(res.Succeeded, r)
+		} else {
+			misses = append(misses, r)
+		}
+	}
+
+	if len(misses) > 0 {
+		failed, err := classify(misses)
+		if err != nil {
+			return BatchResult{}, err
+		}
+		res.Failed = failed
+	}
+
+	if err := tx.Commit(); err != nil {
+		return BatchResult{}, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	pq.recordAckAfterExpired(queueName, len(res.Failed))
+	return res, nil
+}
+
+// ackTopicBatch acknowledges multiple messages for a subscriber in a single
+// operation and returns the per-receipt outcome. Receipts that matched a live
+// processing claim are acked and appear in BatchResult.Succeeded; the rest are
+// classified (ErrClaimExpired / ErrMessageAlreadyAcked / ErrMessageNotFound)
+// and appear in BatchResult.Failed. Partial success is not an error. Each
+// failed receipt increments the RecordAckAfterExpired metric so operators can
+// detect the corresponding redeliveries. A non-nil error is operational.
 func (pq *Queue) ackTopicBatch(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
 	receipts []Receipt,
-) error {
+) (BatchResult, error) {
 	if err := validateSubscriberID(subscriberID); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 	if len(receipts) == 0 {
-		return nil
+		return BatchResult{}, nil
 	}
 	if err := validateBatchSize(len(receipts)); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 
 	queueMeta, err := pq.getQueueMetadata(
@@ -184,12 +258,19 @@ func (pq *Queue) ackTopicBatch(
 	)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+			return BatchResult{}, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
 		}
-		return fmt.Errorf("failed to get topic metadata: %w", err)
+		return BatchResult{}, fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
-	//nolint:gosec // G201: table name validated by queueNameRegex
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
+	if err != nil {
+		return BatchResult{}, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// G201 is not applicable: the query (with the regex-validated table name) is
+	// passed to queryMatchedIDs as a parameter, not built at the exec call site.
 	query := fmt.Sprintf(`
 		UPDATE %s AS s
 		SET status = '%s', acked_at = NOW()
@@ -198,48 +279,46 @@ func (pq *Queue) ackTopicBatch(
 		  AND s.claim_id = u.claim_id
 		  AND s.subscriber_id = $3
 		  AND s.status = '%s'
+		RETURNING s.message_id
 	`, pq.subTable(queueMeta.TableName), MessageStatusAcked, MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimLiterals(receipts)
-	result, err := pq.db.ExecContext(ctx, query, ids, claims, subscriberID)
+	matched, err := queryMatchedIDs(ctx, tx, query, ids, claims, subscriberID)
 	if err != nil {
-		return fmt.Errorf("failed to acknowledge messages: %w", err)
+		return BatchResult{}, fmt.Errorf("failed to acknowledge messages: %w", err)
 	}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	pq.recordAckAfterExpired(topicName, len(receipts)-int(rows))
-	if rows == 0 {
-		return ErrMessageAlreadyAcked
-	}
-
-	return nil
+	subTable := pq.subTable(queueMeta.TableName)
+	return pq.finishBatch(tx, topicName, receipts, matched,
+		func(misses []Receipt) ([]FailedReceipt, error) {
+			return classifyTopicBatchMisses(ctx, tx, subTable, subscriberID, misses)
+		})
 }
 
-// nackChannelBatch negatively acknowledges multiple messages from a channel.
-// Messages that exceed max retries are moved to DLQ; others are retried.
-// The errorMsg is truncated to 1024 characters if it exceeds that length.
-// A WithRetryDelay option overrides the computed backoff delay for the batch.
-// Receipts whose claim no longer matches a processing message are silently
-// skipped; each skipped receipt increments the RecordAckAfterExpired metric so
-// operators can detect partial success and the corresponding redeliveries.
+// nackChannelBatch negatively acknowledges multiple messages from a channel and
+// returns the per-receipt outcome. Receipts that matched a live processing
+// claim are retried or moved to DLQ (when retries are exhausted) and appear in
+// BatchResult.Succeeded; the rest are classified (ErrClaimExpired /
+// ErrMessageAlreadyAcked / ErrMessageNotFound) and appear in
+// BatchResult.Failed. Partial success is not an error. The errorMsg is
+// truncated to 1024 characters if it exceeds that length. A WithRetryDelay
+// option overrides the computed backoff delay for the batch. Each failed
+// receipt increments the RecordAckAfterExpired metric.
 func (pq *Queue) nackChannelBatch(
 	ctx context.Context,
 	channelName string,
 	receipts []Receipt,
 	errorMsg string,
 	opts ...NackOption,
-) error {
+) (BatchResult, error) {
 	errorMsg = truncateErrorMsg(errorMsg)
 	retryDelay := resolveNackRetryDelay(opts)
 
 	if len(receipts) == 0 {
-		return nil
+		return BatchResult{}, nil
 	}
 	if err := validateBatchSize(len(receipts)); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 
 	queueMeta, err := pq.getQueueMetadata(
@@ -247,14 +326,14 @@ func (pq *Queue) nackChannelBatch(
 	)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+			return BatchResult{}, fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
 		}
-		return fmt.Errorf("failed to get channel metadata: %w", err)
+		return BatchResult{}, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
 	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return BatchResult{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -262,31 +341,34 @@ func (pq *Queue) nackChannelBatch(
 		ctx, tx, queueMeta.TableName, receipts,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to get message states: %w", err)
-	}
-	if len(states) == 0 {
-		return ErrMessageNotFound
+		return BatchResult{}, fmt.Errorf("failed to get message states: %w", err)
 	}
 
 	if err := pq.processNackBatch(ctx, tx, queueMeta.TableName, states, errorMsg, retryDelay); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	matched := make(map[uuid.UUID]bool, len(states))
+	for _, s := range states {
+		matched[s.id] = true
 	}
 
-	pq.recordAckAfterExpired(channelName, len(receipts)-len(states))
-	return nil
+	msgTable := pq.msgTable(queueMeta.TableName)
+	return pq.finishBatch(tx, channelName, receipts, matched,
+		func(misses []Receipt) ([]FailedReceipt, error) {
+			return classifyChannelBatchMisses(ctx, tx, msgTable, misses)
+		})
 }
 
-// nackTopicBatch negatively acknowledges multiple messages for a subscriber from a topic.
-// Messages that exceed max retries are moved to DLQ; others are retried.
-// The errorMsg is truncated to 1024 characters if it exceeds that length.
-// A WithRetryDelay option overrides the computed backoff delay for the batch.
-// Receipts whose claim no longer matches a processing subscription are silently
-// skipped; each skipped receipt increments the RecordAckAfterExpired metric so
-// operators can detect partial success and the corresponding redeliveries.
+// nackTopicBatch negatively acknowledges multiple messages for a subscriber
+// from a topic and returns the per-receipt outcome. Subscriptions that matched
+// a live processing claim are retried or moved to DLQ (when retries are
+// exhausted) and appear in BatchResult.Succeeded; the rest are classified
+// (ErrClaimExpired / ErrMessageAlreadyAcked / ErrMessageNotFound) and appear in
+// BatchResult.Failed. Partial success is not an error. The errorMsg is
+// truncated to 1024 characters if it exceeds that length. A WithRetryDelay
+// option overrides the computed backoff delay for the batch. Each failed
+// receipt increments the RecordAckAfterExpired metric.
 func (pq *Queue) nackTopicBatch(
 	ctx context.Context,
 	topicName string,
@@ -294,28 +376,28 @@ func (pq *Queue) nackTopicBatch(
 	receipts []Receipt,
 	errorMsg string,
 	opts ...NackOption,
-) error {
+) (BatchResult, error) {
 	errorMsg = truncateErrorMsg(errorMsg)
 	retryDelay := resolveNackRetryDelay(opts)
 
 	if err := validateSubscriberID(subscriberID); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 	if len(receipts) == 0 {
-		return nil
+		return BatchResult{}, nil
 	}
 	if err := validateBatchSize(len(receipts)); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 
 	queueMeta, err := pq.getTopicMetadata(ctx, topicName)
 	if err != nil {
-		return err
+		return BatchResult{}, err
 	}
 
 	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return BatchResult{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -323,10 +405,7 @@ func (pq *Queue) nackTopicBatch(
 		ctx, tx, queueMeta.TableName, receipts, subscriberID,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to get subscription states: %w", err)
-	}
-	if len(states) == 0 {
-		return ErrMessageNotFound
+		return BatchResult{}, fmt.Errorf("failed to get subscription states: %w", err)
 	}
 
 	maxRetry := pq.resolveMaxRetries(queueMeta)
@@ -334,15 +413,19 @@ func (pq *Queue) nackTopicBatch(
 	if err := pq.processNackTopicBatch(
 		ctx, tx, queueMeta.TableName, subscriberID, states, maxRetry, errorMsg, retryDelay,
 	); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	matched := make(map[uuid.UUID]bool, len(states))
+	for _, s := range states {
+		matched[s.messageID] = true
 	}
 
-	pq.recordAckAfterExpired(topicName, len(receipts)-len(states))
-	return nil
+	subTable := pq.subTable(queueMeta.TableName)
+	return pq.finishBatch(tx, topicName, receipts, matched,
+		func(misses []Receipt) ([]FailedReceipt, error) {
+			return classifyTopicBatchMisses(ctx, tx, subTable, subscriberID, misses)
+		})
 }
 
 // getTopicMetadata retrieves topic metadata, translating not-found to ErrTopicNotFound.

@@ -77,10 +77,36 @@ func classifyClaimMiss(
 	var claimID uuid.NullUUID
 	err := q.QueryRowContext(ctx, statusQuery, args...).Scan(&status, &claimID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrMessageNotFound
+		return classifyClaimState(false, "", uuid.NullUUID{}, expectedClaim)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to classify claim miss: %w", err)
+	}
+	return classifyClaimState(true, status, claimID, expectedClaim)
+}
+
+// classifyClaimState is the pure decision shared by the single-receipt
+// (classifyClaimMiss) and batch (classifyBatchMisses) ack/nack-miss paths, so
+// both classify a receipt identically. found reports whether the targeted row
+// still exists; status and claimID are its current values when found. It
+// returns:
+//
+//   - ErrMessageNotFound — the row no longer exists.
+//   - ErrMessageAlreadyAcked — the caller never held a real claim (a zero
+//     expectedClaim — e.g. acking a message that was never consumed), or the
+//     receipt's own claim still owns the row but it has left 'processing'
+//     (completed/acked).
+//   - ErrClaimExpired — the caller held a real claim token (non-zero, as every
+//     delivery mints) but it no longer matches the row: fenced by a redelivery,
+//     a retry/nack, or a garbage-collector reset. The processing result is stale.
+func classifyClaimState(
+	found bool,
+	status string,
+	claimID uuid.NullUUID,
+	expectedClaim uuid.UUID,
+) error {
+	if !found {
+		return ErrMessageNotFound
 	}
 	// No real claim was presented (zero ClaimID): the caller never legitimately
 	// consumed this message, since every delivery mints a non-zero claim. This
@@ -127,6 +153,103 @@ func classifyTopicAckMiss(
 	)
 
 	return classifyClaimMiss(ctx, q, query, r.ClaimID, r.MessageID, subscriberID)
+}
+
+// claimRowState is a row's current (status, claim_id) as read by the batch
+// claim-miss classifier.
+type claimRowState struct {
+	status  string
+	claimID uuid.NullUUID
+}
+
+// classifyBatchMisses classifies each receipt that did not match a live
+// processing row, mirroring classifyClaimMiss per receipt over a single status
+// SELECT (instead of one query per receipt). statusQuery must SELECT
+// (id UUID, status TEXT, claim_id UUID) for the rows identified by its leading
+// uuid-array parameter ($1::text::uuid[]); extraArgs supplies any trailing
+// parameters (e.g. the subscriber_id for topics). Receipts whose ID is absent
+// from the result are reported ErrMessageNotFound. The returned slice is index
+// aligned with misses, preserving input order. Receipts are assumed unique.
+func classifyBatchMisses(
+	ctx context.Context,
+	tx *sql.Tx,
+	statusQuery string,
+	misses []Receipt,
+	extraArgs ...any,
+) ([]FailedReceipt, error) {
+	if len(misses) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]uuid.UUID, len(misses))
+	for i, r := range misses {
+		ids[i] = r.MessageID
+	}
+	args := append([]any{uuidArrayLiteral(ids)}, extraArgs...)
+
+	rows, err := tx.QueryContext(ctx, statusQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to classify batch claim misses: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	states := make(map[uuid.UUID]claimRowState, len(misses))
+	for rows.Next() {
+		var id uuid.UUID
+		var st claimRowState
+		if err := rows.Scan(&id, &st.status, &st.claimID); err != nil {
+			return nil, fmt.Errorf("failed to scan claim state: %w", err)
+		}
+		states[id] = st
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate claim states: %w", err)
+	}
+
+	failed := make([]FailedReceipt, len(misses))
+	for i, r := range misses {
+		st, found := states[r.MessageID]
+		failed[i] = FailedReceipt{
+			Receipt: r,
+			Reason:  classifyClaimState(found, st.status, st.claimID, r.ClaimID),
+		}
+	}
+	return failed, nil
+}
+
+// classifyChannelBatchMisses classifies receipts that missed a channel batch
+// ack/nack. msgTable is the schema-qualified channel message table.
+func classifyChannelBatchMisses(
+	ctx context.Context,
+	tx *sql.Tx,
+	msgTable string,
+	misses []Receipt,
+) ([]FailedReceipt, error) {
+	// G201 is not applicable: the query (with the regex-validated table name) is
+	// passed to classifyBatchMisses as a parameter, not built at the exec site.
+	query := fmt.Sprintf(
+		`SELECT id, status, claim_id FROM %s WHERE id = ANY($1::text::uuid[])`, msgTable,
+	)
+	return classifyBatchMisses(ctx, tx, query, misses)
+}
+
+// classifyTopicBatchMisses classifies receipts that missed a topic batch
+// ack/nack for the given subscriber. subTable is the schema-qualified
+// subscription table.
+func classifyTopicBatchMisses(
+	ctx context.Context,
+	tx *sql.Tx,
+	subTable, subscriberID string,
+	misses []Receipt,
+) ([]FailedReceipt, error) {
+	// G201 is not applicable: the query (with the regex-validated table name) is
+	// passed to classifyBatchMisses as a parameter, not built at the exec site.
+	query := fmt.Sprintf(
+		`SELECT message_id, status, claim_id FROM %s `+
+			`WHERE message_id = ANY($1::text::uuid[]) AND subscriber_id = $2`,
+		subTable,
+	)
+	return classifyBatchMisses(ctx, tx, query, misses, subscriberID)
 }
 
 // Metadata query methods

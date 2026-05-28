@@ -246,71 +246,94 @@ func groupReceiptsByQueue(rs []Receipt) (map[receiptGroupKey][]Receipt, error) {
 }
 
 // AckBatch acknowledges multiple messages using their Receipts. Receipts are
-// grouped by queue and acknowledged in a single batch operation per queue.
-// Each Receipt must carry the queue binding set by ReceiveChannel/ReceiveTopic.
-func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) error {
+// grouped by queue and acknowledged in a single batch operation per queue. Each
+// Receipt must carry the queue binding set by ReceiveChannel/ReceiveTopic.
+//
+// The returned BatchResult enumerates the per-receipt outcome: Succeeded lists
+// the receipts that were acked, and Failed lists those whose claim no longer
+// matched a processing message, each with the reason (ErrClaimExpired,
+// ErrMessageAlreadyAcked, or ErrMessageNotFound). Partial success is not an
+// error: a batch where some claims have expired returns a nil error with those
+// receipts in Failed. A non-nil error signals an operational failure (the queue
+// is closed, the batch is too large, a receipt is missing its queue binding,
+// the queue does not exist, or a database error); the BatchResult is then zero.
+func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) (BatchResult, error) {
 	if err := pq.checkClosed(); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 	if len(rs) == 0 {
-		return nil
+		return BatchResult{}, nil
 	}
 	groups, err := groupReceiptsByQueue(rs)
 	if err != nil {
-		return err
+		return BatchResult{}, err
 	}
+	var combined BatchResult
 	for k, receipts := range groups {
+		var res BatchResult
 		var err error
 		switch k.qt {
 		case QueueTypeChannel:
-			err = pq.ackChannelBatch(ctx, k.queueName, receipts)
+			res, err = pq.ackChannelBatch(ctx, k.queueName, receipts)
 		case QueueTypePubSub:
-			err = pq.ackTopicBatch(ctx, k.queueName, k.subscriberID, receipts)
+			res, err = pq.ackTopicBatch(ctx, k.queueName, k.subscriberID, receipts)
 		default:
 			continue
 		}
 		if err != nil {
-			return err
+			return BatchResult{}, err
 		}
+		combined.Succeeded = append(combined.Succeeded, res.Succeeded...)
+		combined.Failed = append(combined.Failed, res.Failed...)
 	}
-	return nil
+	return combined, nil
 }
 
 // NackBatch negatively acknowledges multiple messages using their Receipts.
 // Messages that have exhausted retries are moved to the DLQ; others are
 // retried. reason is recorded as the failure reason. A WithRetryDelay option
 // overrides the computed backoff delay for every message in the batch.
+//
+// The returned BatchResult enumerates the per-receipt outcome the same way as
+// AckBatch: Succeeded lists the receipts that were nacked (retried or moved to
+// DLQ), and Failed lists those whose claim no longer matched, each with the
+// reason. Partial success is not an error; a non-nil error is operational and
+// the BatchResult is then zero.
 func (pq *Queue) NackBatch(
 	ctx context.Context,
 	rs []Receipt,
 	reason string,
 	opts ...NackOption,
-) error {
+) (BatchResult, error) {
 	if err := pq.checkClosed(); err != nil {
-		return err
+		return BatchResult{}, err
 	}
 	if len(rs) == 0 {
-		return nil
+		return BatchResult{}, nil
 	}
 	groups, err := groupReceiptsByQueue(rs)
 	if err != nil {
-		return err
+		return BatchResult{}, err
 	}
+	var combined BatchResult
 	for k, receipts := range groups {
+		var res BatchResult
 		var err error
 		switch k.qt {
 		case QueueTypeChannel:
-			err = pq.nackChannelBatch(ctx, k.queueName, receipts, reason, opts...)
+			res, err = pq.nackChannelBatch(ctx, k.queueName, receipts, reason, opts...)
 		case QueueTypePubSub:
-			err = pq.nackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason, opts...)
+			res, err = pq.nackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason, opts...)
 		default:
 			continue
 		}
 		if err != nil {
-			return err
+			return BatchResult{}, err
 		}
+		combined.Succeeded = append(combined.Succeeded, res.Succeeded...)
+		combined.Failed = append(combined.Failed, res.Failed...)
 	}
-	return nil
+	return combined, nil
 }
 
 // isStopSignal reports whether err is the expected, non-fatal signal that a

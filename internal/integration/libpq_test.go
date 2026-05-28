@@ -112,7 +112,7 @@ func TestLibPQDriver(t *testing.T) {
 			receipts[i] = msg.Receipt()
 		}
 
-		if err := pq.AckBatch(ctx, receipts); err != nil {
+		if _, err := pq.AckBatch(ctx, receipts); err != nil {
 			t.Fatalf("AckBatch failed under lib/pq: %v", err)
 		}
 
@@ -148,7 +148,7 @@ func TestLibPQDriver(t *testing.T) {
 		}
 
 		// First nack: retry path (batchRetryMessages).
-		if err := pq.NackBatch(ctx, consume(), "retry"); err != nil {
+		if _, err := pq.NackBatch(ctx, consume(), "retry"); err != nil {
 			t.Fatalf("NackBatch retry failed under lib/pq: %v", err)
 		}
 		stats, err := pq.GetStats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
@@ -160,7 +160,7 @@ func TestLibPQDriver(t *testing.T) {
 		}
 
 		// Second nack: retry count exceeds max, DLQ path (batchMoveToDLQ).
-		if err := pq.NackBatch(ctx, consume(), "dlq"); err != nil {
+		if _, err := pq.NackBatch(ctx, consume(), "dlq"); err != nil {
 			t.Fatalf("NackBatch DLQ failed under lib/pq: %v", err)
 		}
 		stats, err = pq.GetStats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
@@ -192,7 +192,7 @@ func TestLibPQDriver(t *testing.T) {
 			receipts[i] = msg.Receipt()
 		}
 
-		if err := pq.AckBatch(ctx, receipts); err != nil {
+		if _, err := pq.AckBatch(ctx, receipts); err != nil {
 			t.Fatalf("AckBatch failed under lib/pq: %v", err)
 		}
 	})
@@ -223,11 +223,11 @@ func TestLibPQDriver(t *testing.T) {
 		}
 
 		// First nack: retry path (batchRetryPubSubMessages).
-		if err := pq.NackBatch(ctx, consume(), "retry"); err != nil {
+		if _, err := pq.NackBatch(ctx, consume(), "retry"); err != nil {
 			t.Fatalf("NackBatch retry failed under lib/pq: %v", err)
 		}
 		// Second nack: DLQ path (batchMoveToDLQ, pub/sub).
-		if err := pq.NackBatch(ctx, consume(), "dlq"); err != nil {
+		if _, err := pq.NackBatch(ctx, consume(), "dlq"); err != nil {
 			t.Fatalf("NackBatch DLQ failed under lib/pq: %v", err)
 		}
 
