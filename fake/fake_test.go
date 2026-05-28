@@ -32,7 +32,7 @@ func TestFakeChannelPublishConsumeAck(t *testing.T) {
 		t.Fatalf("expected ErrQueueEmpty, got %v", err)
 	}
 
-	if _, err := q.PublishChannel(ctx, "orders", []byte("payload")); err != nil {
+	if _, err := q.Publish(ctx, "orders", []byte("payload")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	msg, err := q.ReceiveChannel(ctx, "orders")
@@ -58,7 +58,7 @@ func TestFakeNackRetryThenDLQ(t *testing.T) {
 	if err := q.CreateChannel(ctx, "jobs"); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := q.PublishChannel(ctx, "jobs", []byte("poison")); err != nil {
+	if _, err := q.Publish(ctx, "jobs", []byte("poison")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
@@ -90,7 +90,7 @@ func TestFakeStaleClaimResolvesToClaimExpired(t *testing.T) {
 	if err := q.CreateChannel(ctx, "c"); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := q.PublishChannel(ctx, "c", []byte("m")); err != nil {
+	if _, err := q.Publish(ctx, "c", []byte("m")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
@@ -123,7 +123,7 @@ func TestFakeTopicFanOut(t *testing.T) {
 			t.Fatalf("subscribe %s: %v", sub, err)
 		}
 	}
-	if _, err := q.PublishTopic(ctx, "events", []byte("evt")); err != nil {
+	if _, err := q.Publish(ctx, "events", []byte("evt")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	for _, sub := range []string{"a", "b"} {
@@ -147,7 +147,7 @@ func TestFakePauseBlocksConsumption(t *testing.T) {
 	if err := q.CreateChannel(ctx, "p"); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := q.PublishChannel(ctx, "p", []byte("x")); err != nil {
+	if _, err := q.Publish(ctx, "p", []byte("x")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	if err := q.PauseChannel(ctx, "p"); err != nil {
@@ -174,7 +174,7 @@ func TestFakeHandlerConsume(t *testing.T) {
 	}
 	const total = 3
 	for i := range total {
-		if _, err := q.PublishChannel(ctx, "h", []byte{byte('0' + i)}); err != nil {
+		if _, err := q.Publish(ctx, "h", []byte{byte('0' + i)}); err != nil {
 			t.Fatalf("publish %d: %v", i, err)
 		}
 	}

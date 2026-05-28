@@ -30,19 +30,6 @@ var (
 	// ErrTopicNotFound is returned when a topic cannot be found.
 	ErrTopicNotFound = errors.New("topic not found")
 
-	// ErrConfirmationRequired is returned when a destructive operation is attempted without confirmation.
-	// ErrPurgeNotConfirmed and ErrDeleteNotConfirmed wrap this error, so callers can use
-	// errors.Is(err, ErrConfirmationRequired) to catch all confirmation-related errors.
-	ErrConfirmationRequired = errors.New(
-		"operation requires explicit confirmation or dry-run mode",
-	)
-
-	// ErrPurgeNotConfirmed is returned when PurgeQueue is called without confirm=true.
-	ErrPurgeNotConfirmed = fmt.Errorf("purge operation requires explicit confirmation: %w", ErrConfirmationRequired)
-
-	// ErrDeleteNotConfirmed is returned when DeleteChannel/DeleteTopic is called without confirm=true.
-	ErrDeleteNotConfirmed = fmt.Errorf("delete operation requires explicit confirmation: %w", ErrConfirmationRequired)
-
 	// ErrDuplicateMessageID is returned when publishing a message with an ID that already exists.
 	ErrDuplicateMessageID = errors.New("duplicate message ID")
 
@@ -133,7 +120,7 @@ var (
 	// when a Receipt was not populated by ReceiveChannel or ReceiveTopic and
 	// therefore does not carry the required queue binding.
 	ErrReceiptMissingQueueType = errors.New(
-		"receipt missing QueueType: use AckChannel/AckTopic or obtain the receipt via ReceiveChannel/ReceiveTopic",
+		"receipt missing QueueType: obtain the receipt via ReceiveChannel or ReceiveTopic",
 	)
 
 	// ErrInvalidPerformedBy is returned when ReplayOptions.PerformedBy is

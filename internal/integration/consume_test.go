@@ -27,10 +27,10 @@ func TestConsumeChannelHandlerAutoAck(t *testing.T) {
 	}
 
 	// okMsg always succeeds; failMsg fails on its first delivery then succeeds.
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("ok")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("ok")); err != nil {
 		t.Fatalf("failed to publish ok message: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("fail-once")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("fail-once")); err != nil {
 		t.Fatalf("failed to publish fail message: %v", err)
 	}
 
@@ -130,7 +130,7 @@ func TestChannelMessagesIteratorAndReceive(t *testing.T) {
 
 	const total = 5
 	for i := range total {
-		if _, err := pq.PublishChannel(ctx, channelName, []byte{byte('A' + i)}); err != nil {
+		if _, err := pq.Publish(ctx, channelName, []byte{byte('A' + i)}); err != nil {
 			t.Fatalf("failed to publish message %d: %v", i, err)
 		}
 	}
@@ -186,11 +186,11 @@ func TestConsumeChannelHandlerPanicRecovered(t *testing.T) {
 	// One payload ("boom") panics on its first delivery; the rest always succeed.
 	const okCount = 6
 	for i := range okCount {
-		if _, err := pq.PublishChannel(ctx, channelName, []byte{byte('a' + i)}); err != nil {
+		if _, err := pq.Publish(ctx, channelName, []byte{byte('a' + i)}); err != nil {
 			t.Fatalf("failed to publish ok message %d: %v", i, err)
 		}
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("boom")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("boom")); err != nil {
 		t.Fatalf("failed to publish panic message: %v", err)
 	}
 

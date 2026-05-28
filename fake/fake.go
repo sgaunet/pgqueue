@@ -13,7 +13,7 @@
 //
 //	q := fake.New()
 //	q.CreateChannel(ctx, "orders")
-//	q.PublishChannel(ctx, "orders", []byte(`{"id":1}`))
+//	q.Publish(ctx, "orders", []byte(`{"id":1}`))
 //	// run code under test against the pgqueue interfaces, backed by q
 package fake
 
@@ -145,8 +145,12 @@ func (q *Queue) Subscribe(_ context.Context, topicName, subscriberID string) err
 	return nil
 }
 
-// PublishChannel publishes a message to a channel, creating it on first use.
-func (q *Queue) PublishChannel(
+// Publish publishes a message to the named channel or topic. The destination
+// type is resolved by name — mirroring the real Queue, where a name is unique
+// across both types. A name registered as a topic fans the message out to a
+// copy in each current subscriber's queue; any other name is treated as a
+// channel and created on first use.
+func (q *Queue) Publish(
 	_ context.Context, name string, payload []byte, _ ...pgqueue.PublishOption,
 ) (uuid.UUID, error) {
 	if payload == nil {
@@ -161,6 +165,20 @@ func (q *Queue) PublishChannel(
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	if t, ok := q.topics[name]; ok {
+		for _, sub := range t.subs {
+			// Each subscriber gets an independent copy of the payload so a consumer
+			// mutating one delivered message cannot corrupt a fan-out sibling (R-16).
+			sub.pending = append(sub.pending, &entry{
+				id:      id,
+				payload: cloneBytes(payload),
+				status:  pgqueue.MessageStatusPending,
+			})
+		}
+		return id, nil
+	}
+
 	ch, ok := q.channels[name]
 	if !ok {
 		ch = newChannel()
@@ -171,38 +189,6 @@ func (q *Queue) PublishChannel(
 		payload: cloneBytes(payload),
 		status:  pgqueue.MessageStatusPending,
 	})
-	return id, nil
-}
-
-// PublishTopic publishes a message to a topic, fanning it out to a copy in each
-// current subscriber's queue.
-func (q *Queue) PublishTopic(
-	_ context.Context, name string, payload []byte, _ ...pgqueue.PublishOption,
-) (uuid.UUID, error) {
-	if payload == nil {
-		return uuid.UUID{}, pgqueue.ErrNilPayload
-	}
-	// uuidv7 so "ORDER BY id" matches insertion order — see PublishChannel.
-	id, err := pgqueue.NewUUIDv7()
-	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("fake: generate message id: %w", err)
-	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	t, ok := q.topics[name]
-	if !ok {
-		t = newTopic()
-		q.topics[name] = t
-	}
-	for _, sub := range t.subs {
-		// Each subscriber gets an independent copy of the payload so a consumer
-		// mutating one delivered message cannot corrupt a fan-out sibling (R-16).
-		sub.pending = append(sub.pending, &entry{
-			id:      id,
-			payload: cloneBytes(payload),
-			status:  pgqueue.MessageStatusPending,
-		})
-	}
 	return id, nil
 }
 

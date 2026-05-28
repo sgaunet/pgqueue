@@ -82,9 +82,9 @@ func (pq *Queue) consumeTopicPreflight(subscriberID string, visibilityTimeout ti
 	return validateSubscriberID(subscriberID)
 }
 
-// ConsumeFromTopic retrieves the next available message for a subscriber from a topic.
+// consumeFromTopic retrieves the next available message for a subscriber from a topic.
 // Returns nil message if no messages available.
-func (pq *Queue) ConsumeFromTopic(
+func (pq *Queue) consumeFromTopic(
 	ctx context.Context,
 	topicName, subscriberID string,
 	visibilityTimeout time.Duration,
@@ -142,13 +142,13 @@ func (pq *Queue) ConsumeFromTopic(
 	return msg, nil
 }
 
-// AckTopic acknowledges a message for a subscriber.
+// ackTopic acknowledges a message for a subscriber.
 //
-// The receipt must carry the claim token issued by the ConsumeFromTopic call
+// The receipt must carry the claim token issued by the consumeFromTopic call
 // that delivered the message (use msg.Receipt()). If the claim has expired —
 // the visibility timeout lapsed and the message was redelivered to this
-// subscriber — AckTopic returns ErrClaimExpired and does nothing.
-func (pq *Queue) AckTopic(
+// subscriber — ackTopic returns ErrClaimExpired and does nothing.
+func (pq *Queue) ackTopic(
 	ctx context.Context,
 	topicName, subscriberID string,
 	r Receipt,
@@ -204,20 +204,6 @@ func (pq *Queue) AckTopic(
 	}
 
 	return nil
-}
-
-// NackTopic negatively acknowledges a message for a subscriber (retry or move to DLQ).
-// The errorMsg is truncated to 1024 characters if it exceeds that length.
-//
-// The receipt must carry the claim token from the consume call that delivered
-// the message; a stale claim returns ErrClaimExpired (see AckTopic).
-func (pq *Queue) NackTopic(
-	ctx context.Context,
-	topicName, subscriberID string,
-	r Receipt,
-	errorMsg string,
-) error {
-	return pq.nackTopicImpl(ctx, topicName, subscriberID, r, errorMsg, 0)
 }
 
 // nackTopicWithOpts is the option-aware topic nack used by the queue-agnostic

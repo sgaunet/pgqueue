@@ -36,9 +36,9 @@ func validateVisibilityTimeout(d time.Duration) error {
 	return nil
 }
 
-// ConsumeFromChannel retrieves the next available message from a channel.
+// consumeFromChannel retrieves the next available message from a channel.
 // Returns nil if no messages are available.
-func (pq *Queue) ConsumeFromChannel(
+func (pq *Queue) consumeFromChannel(
 	ctx context.Context,
 	channelName string,
 	visibilityTimeout time.Duration,
@@ -98,13 +98,13 @@ func (pq *Queue) ConsumeFromChannel(
 	return msg, nil
 }
 
-// AckChannel acknowledges a message from a channel (marks as completed).
+// ackChannel acknowledges a message from a channel (marks as completed).
 //
-// The receipt must carry the claim token issued by the ConsumeFromChannel call
+// The receipt must carry the claim token issued by the consumeFromChannel call
 // that delivered the message (use msg.Receipt()). If the claim has since
 // expired — the visibility timeout lapsed and the message was redelivered to
-// another consumer — AckChannel returns ErrClaimExpired and does nothing.
-func (pq *Queue) AckChannel(
+// another consumer — ackChannel returns ErrClaimExpired and does nothing.
+func (pq *Queue) ackChannel(
 	ctx context.Context,
 	channelName string,
 	r Receipt,
@@ -153,20 +153,6 @@ func (pq *Queue) AckChannel(
 	}
 
 	return nil
-}
-
-// NackChannel negatively acknowledges a message from a channel (retry or move to DLQ).
-// The errorMsg is truncated to 1024 characters if it exceeds that length.
-//
-// The receipt must carry the claim token from the consume call that delivered
-// the message; a stale claim returns ErrClaimExpired (see AckChannel).
-func (pq *Queue) NackChannel(
-	ctx context.Context,
-	channelName string,
-	r Receipt,
-	errorMsg string,
-) error {
-	return pq.nackChannelImpl(ctx, channelName, r, errorMsg, 0)
 }
 
 // nackChannelWithOpts is the option-aware nack used by the queue-agnostic Nack.
@@ -400,7 +386,7 @@ func (pq *Queue) reclaimChannelAttempt(
 	// as the pub/sub consume path does for exhausted subscriptions
 	// (reclaimTopicAttempt). The GarbageCollector's promoteExhaustedChannelMessages
 	// stays as a backstop for rows no consumer reaches.
-	if retryCount > channelMaxRetries(pq.config.DefaultMaxRetries, row.maxRetries) {
+	if retryCount > channelMaxRetries(pq.cfg.defaultMaxRetries, row.maxRetries) {
 		if err := pq.moveToDLQ(
 			ctx, tx, tableName, row.id, errReasonVisibilityTimeout,
 			row.payload, retryCount, row.metadataJSON,
@@ -504,7 +490,7 @@ func (pq *Queue) claimChannelMessage(
 	// (a DLQ-replayed row) falls back to the configured default — the same
 	// resolution channelMaxRetries applies — so a consumer reading
 	// msg.MaxRetries never sees a misleading 0 meaning "unknown".
-	msg.MaxRetries = channelMaxRetries(pq.config.DefaultMaxRetries, row.maxRetries)
+	msg.MaxRetries = channelMaxRetries(pq.cfg.defaultMaxRetries, row.maxRetries)
 	if row.processedAt.Valid {
 		msg.ProcessedAt = &row.processedAt.Time
 	}
@@ -555,7 +541,7 @@ func (pq *Queue) handleNack(
 	retryDelay time.Duration,
 ) error {
 	// Determine max retries (use default if not set)
-	maxRetry := channelMaxRetries(pq.config.DefaultMaxRetries, state.maxRetries)
+	maxRetry := channelMaxRetries(pq.cfg.defaultMaxRetries, state.maxRetries)
 
 	// Check if we've exceeded max retries
 	if state.retryCount+1 > maxRetry {

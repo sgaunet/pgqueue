@@ -81,7 +81,7 @@ func publishOrders(ctx context.Context, pq *pgqueue.Queue, channelName string) {
 
 	fmt.Println("Publishing orders...")
 	for _, order := range orders {
-		msgID, err := pq.PublishChannel(ctx, channelName, []byte(order))
+		msgID, err := pq.Publish(ctx, channelName, []byte(order))
 		if err != nil {
 			log.Printf("failed to publish order: %v", err)
 			continue

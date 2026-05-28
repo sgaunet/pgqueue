@@ -168,7 +168,7 @@ func TestPublishAndConsumeChannel(t *testing.T) {
 	t.Logf("Published message: %s", msgID)
 
 	// Consume the message
-	msg, err := pq.ConsumeFromChannel(ctx, "orders", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "orders", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume message: %v", err)
 	}
@@ -182,18 +182,15 @@ func TestPublishAndConsumeChannel(t *testing.T) {
 	}
 
 	// Acknowledge the message
-	err = pq.AckChannel(ctx, "orders", msg.Receipt())
+	err = pq.Ack(ctx, msg.Receipt())
 	if err != nil {
 		t.Fatalf("failed to acknowledge message: %v", err)
 	}
 
 	// Try to consume again (should be empty)
-	msg2, err := pq.ConsumeFromChannel(ctx, "orders", 30*time.Second)
-	if err != nil {
-		t.Fatalf("failed to consume: %v", err)
-	}
-	if msg2 != nil {
-		t.Error("expected no messages, but got one")
+	_, err = pq.ReceiveChannel(ctx, "orders", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Errorf("expected ErrQueueEmpty, got: %v", err)
 	}
 }
 
@@ -256,7 +253,7 @@ func TestPubSubFanout(t *testing.T) {
 
 	// Each subscriber should receive the message
 	for _, sub := range subscribers {
-		msg, err := pq.ConsumeFromTopic(ctx, "events", sub, 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "events", sub, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume for %s: %v", sub, err)
 		}
@@ -270,7 +267,7 @@ func TestPubSubFanout(t *testing.T) {
 		}
 
 		// Acknowledge the message
-		err = pq.AckTopic(ctx, "events", sub, msg.Receipt())
+		err = pq.Ack(ctx, msg.Receipt())
 		if err != nil {
 			t.Fatalf("failed to ack for %s: %v", sub, err)
 		}
@@ -305,7 +302,7 @@ func TestMessageOrdering(t *testing.T) {
 
 		// Consume messages and verify order
 		for i := 0; i < messageCount; i++ {
-			msg, err := pq.ConsumeFromChannel(ctx, "ordered-channel", 30*time.Second)
+			msg, err := pq.ReceiveChannel(ctx, "ordered-channel", pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
 				t.Fatalf("failed to consume message %d: %v", i, err)
 			}
@@ -320,7 +317,7 @@ func TestMessageOrdering(t *testing.T) {
 			}
 
 			// Ack the message
-			err = pq.AckChannel(ctx, "ordered-channel", msg.Receipt())
+			err = pq.Ack(ctx, msg.Receipt())
 			if err != nil {
 				t.Fatalf("failed to ack message %d: %v", i, err)
 			}
@@ -354,7 +351,7 @@ func TestMessageOrdering(t *testing.T) {
 
 		// Consume messages and verify order
 		for i := 0; i < messageCount; i++ {
-			msg, err := pq.ConsumeFromTopic(ctx, "ordered-topic", subscriberID, 30*time.Second)
+			msg, err := pq.ReceiveTopic(ctx, "ordered-topic", subscriberID, pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
 				t.Fatalf("failed to consume message %d: %v", i, err)
 			}
@@ -369,7 +366,7 @@ func TestMessageOrdering(t *testing.T) {
 			}
 
 			// Ack the message
-			err = pq.AckTopic(ctx, "ordered-topic", subscriberID, msg.Receipt())
+			err = pq.Ack(ctx, msg.Receipt())
 			if err != nil {
 				t.Fatalf("failed to ack message %d: %v", i, err)
 			}
@@ -395,7 +392,7 @@ func TestDeleteChannel(t *testing.T) {
 	}
 
 	// Delete the channel
-	err = pq.DeleteChannel(ctx, "delete-me", true)
+	err = pq.DeleteChannel(ctx, "delete-me")
 	if err != nil {
 		t.Fatalf("failed to delete channel: %v", err)
 	}
@@ -455,7 +452,7 @@ func TestDeleteTopic(t *testing.T) {
 	}
 
 	// Delete the topic
-	err = pq.DeleteTopic(ctx, "delete-topic", true)
+	err = pq.DeleteTopic(ctx, "delete-topic")
 	if err != nil {
 		t.Fatalf("failed to delete topic: %v", err)
 	}
@@ -499,46 +496,18 @@ func TestDeleteTopic(t *testing.T) {
 	}
 }
 
-func TestDeleteChannelNotConfirmed(t *testing.T) {
-	pq, _, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	err := pq.CreateChannel(ctx, "no-delete")
-	if err != nil {
-		t.Fatalf("failed to create channel: %v", err)
-	}
-
-	// Attempt delete without confirmation
-	err = pq.DeleteChannel(ctx, "no-delete", false)
-	if !errors.Is(err, pgqueue.ErrDeleteNotConfirmed) {
-		t.Fatalf("expected ErrDeleteNotConfirmed, got: %v", err)
-	}
-
-	// Verify channel still exists
-	channels, err := pq.ListChannels(ctx)
-	if err != nil {
-		t.Fatalf("failed to list channels: %v", err)
-	}
-
-	if len(channels) != 1 {
-		t.Fatalf("expected channel to still exist, got %d channels", len(channels))
-	}
-}
-
 func TestDeleteNonExistentQueue(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	err := pq.DeleteChannel(ctx, "ghost-queue", true)
+	err := pq.DeleteChannel(ctx, "ghost-queue")
 	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
 		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
 	}
 
-	err = pq.DeleteTopic(ctx, "ghost-topic", true)
+	err = pq.DeleteTopic(ctx, "ghost-topic")
 	if !errors.Is(err, pgqueue.ErrQueueNotFound) {
 		t.Fatalf("expected ErrQueueNotFound, got: %v", err)
 	}
@@ -565,13 +534,10 @@ func TestChannelTTLEnforcedOnConsume(t *testing.T) {
 	// Wait for TTL to expire
 	time.Sleep(10 * time.Millisecond)
 
-	// Consume should return nil (message expired)
-	msg, err := pq.ConsumeFromChannel(ctx, "ttl-test", 30*time.Second)
-	if err != nil {
-		t.Fatalf("failed to consume: %v", err)
-	}
-	if msg != nil {
-		t.Error("expected nil message after TTL expiration, but got one")
+	// Consume should return ErrQueueEmpty (message expired, filtered out)
+	msg, err := pq.ReceiveChannel(ctx, "ttl-test", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Fatalf("expected ErrQueueEmpty after TTL expiration, got err=%v msg=%v", err, msg)
 	}
 
 	// Verify the message still exists in the table (not deleted, just filtered)
@@ -604,7 +570,7 @@ func TestChannelNoTTLDeliversAllMessages(t *testing.T) {
 	}
 
 	// Should still be consumable
-	msg, err := pq.ConsumeFromChannel(ctx, "no-ttl", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "no-ttl", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
@@ -640,13 +606,10 @@ func TestTopicTTLEnforcedOnConsume(t *testing.T) {
 	// Wait for TTL to expire
 	time.Sleep(10 * time.Millisecond)
 
-	// Consume should return nil (message expired)
-	msg, err := pq.ConsumeFromTopic(ctx, "ttl-topic", "sub-1", 30*time.Second)
-	if err != nil {
-		t.Fatalf("failed to consume: %v", err)
-	}
-	if msg != nil {
-		t.Error("expected nil message after TTL expiration, but got one")
+	// Consume should return ErrQueueEmpty (message expired, filtered out)
+	msg, err := pq.ReceiveTopic(ctx, "ttl-topic", "sub-1", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Fatalf("expected ErrQueueEmpty after TTL expiration, got err=%v msg=%v", err, msg)
 	}
 }
 
@@ -674,7 +637,7 @@ func TestPauseResumeChannel(t *testing.T) {
 	}
 
 	// Consume should fail with ErrQueuePaused
-	_, err = pq.ConsumeFromChannel(ctx, "pause-ch", 30*time.Second)
+	_, err = pq.ReceiveChannel(ctx, "pause-ch", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if !errors.Is(err, pgqueue.ErrQueuePaused) {
 		t.Fatalf("expected ErrQueuePaused, got: %v", err)
 	}
@@ -692,7 +655,7 @@ func TestPauseResumeChannel(t *testing.T) {
 	}
 
 	// Consume should work now
-	msg, err := pq.ConsumeFromChannel(ctx, "pause-ch", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "pause-ch", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume after resume: %v", err)
 	}
@@ -729,7 +692,7 @@ func TestPauseResumeTopic(t *testing.T) {
 	}
 
 	// Consume should fail
-	_, err = pq.ConsumeFromTopic(ctx, "pause-topic", "sub-1", 30*time.Second)
+	_, err = pq.ReceiveTopic(ctx, "pause-topic", "sub-1", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if !errors.Is(err, pgqueue.ErrQueuePaused) {
 		t.Fatalf("expected ErrQueuePaused, got: %v", err)
 	}
@@ -741,7 +704,7 @@ func TestPauseResumeTopic(t *testing.T) {
 	}
 
 	// Consume should work
-	msg, err := pq.ConsumeFromTopic(ctx, "pause-topic", "sub-1", 30*time.Second)
+	msg, err := pq.ReceiveTopic(ctx, "pause-topic", "sub-1", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume after resume: %v", err)
 	}
@@ -898,32 +861,29 @@ func TestNackTopicMovesToDLQ(t *testing.T) {
 	}
 
 	// First nack: retry (retryCount 0 + 1 = 1, not > maxRetry 1)
-	msg, err := pq.ConsumeFromTopic(ctx, "nack-dlq-topic", "sub1", 30*time.Second)
+	msg, err := pq.ReceiveTopic(ctx, "nack-dlq-topic", "sub1", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
-	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.Receipt(), "transient error")
+	err = pq.Nack(ctx, msg.Receipt(), "transient error")
 	if err != nil {
 		t.Fatalf("first nack failed: %v", err)
 	}
 
 	// Second nack: should move to DLQ (retryCount 1 + 1 = 2, > maxRetry 1)
-	msg, err = pq.ConsumeFromTopic(ctx, "nack-dlq-topic", "sub1", 30*time.Second)
+	msg, err = pq.ReceiveTopic(ctx, "nack-dlq-topic", "sub1", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume after retry: %v", err)
 	}
-	err = pq.NackTopic(ctx, "nack-dlq-topic", "sub1", msg.Receipt(), "permanent error")
+	err = pq.Nack(ctx, msg.Receipt(), "permanent error")
 	if err != nil {
 		t.Fatalf("second nack failed: %v", err)
 	}
 
 	// Message should no longer be consumable
-	msg, err = pq.ConsumeFromTopic(ctx, "nack-dlq-topic", "sub1", 30*time.Second)
-	if err != nil {
-		t.Fatalf("consume after DLQ failed: %v", err)
-	}
-	if msg != nil {
-		t.Error("expected no message after DLQ move, got one")
+	_, err = pq.ReceiveTopic(ctx, "nack-dlq-topic", "sub1", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Errorf("expected ErrQueueEmpty after DLQ move, got: %v", err)
 	}
 
 	// Verify DLQ has the message
@@ -968,15 +928,15 @@ func TestConcurrentConsumeExactlyOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for {
-				msg, err := pq.ConsumeFromChannel(ctx, "concurrent-consume", 30*time.Second)
+				msg, err := pq.ReceiveChannel(ctx, "concurrent-consume", pgqueue.WithVisibilityTimeout(30*time.Second))
+				if errors.Is(err, pgqueue.ErrQueueEmpty) {
+					return // Queue empty
+				}
 				if err != nil {
 					t.Errorf("consume error: %v", err)
 					return
 				}
-				if msg == nil {
-					return // Queue empty
-				}
-				if err := pq.AckChannel(ctx, "concurrent-consume", msg.Receipt()); err != nil {
+				if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 					t.Errorf("ack error: %v", err)
 					return
 				}
@@ -1035,20 +995,20 @@ func TestUnsubscribe(t *testing.T) {
 
 		// sub-active should get both messages
 		for i := range 2 {
-			msg, err := pq.ConsumeFromTopic(ctx, "unsub-test", "sub-active", 30*time.Second)
+			msg, err := pq.ReceiveTopic(ctx, "unsub-test", "sub-active", pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
 				t.Fatalf("sub-active consume %d failed: %v", i, err)
 			}
 			if msg == nil {
 				t.Fatalf("sub-active expected message %d, got nil", i)
 			}
-			if err := pq.AckTopic(ctx, "unsub-test", "sub-active", msg.Receipt()); err != nil {
+			if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 				t.Fatalf("sub-active ack failed: %v", err)
 			}
 		}
 
 		// sub-leaving should only get the one published before unsubscribe
-		msg, err := pq.ConsumeFromTopic(ctx, "unsub-test", "sub-leaving", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "unsub-test", "sub-leaving", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("sub-leaving consume failed: %v", err)
 		}
@@ -1058,17 +1018,14 @@ func TestUnsubscribe(t *testing.T) {
 		if string(msg.Payload) != "before-unsub" {
 			t.Errorf("sub-leaving expected 'before-unsub', got '%s'", msg.Payload)
 		}
-		if err := pq.AckTopic(ctx, "unsub-test", "sub-leaving", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("sub-leaving ack failed: %v", err)
 		}
 
 		// No more messages for sub-leaving
-		msg, err = pq.ConsumeFromTopic(ctx, "unsub-test", "sub-leaving", 30*time.Second)
-		if err != nil {
-			t.Fatalf("sub-leaving second consume failed: %v", err)
-		}
-		if msg != nil {
-			t.Error("sub-leaving should have no more messages")
+		_, err = pq.ReceiveTopic(ctx, "unsub-test", "sub-leaving", pgqueue.WithVisibilityTimeout(30*time.Second))
+		if !errors.Is(err, pgqueue.ErrQueueEmpty) {
+			t.Errorf("sub-leaving should have no more messages, got: %v", err)
 		}
 	})
 
@@ -1086,7 +1043,7 @@ func TestUnsubscribe(t *testing.T) {
 		}
 
 		// Consume (sets processing)
-		msg, err := pq.ConsumeFromTopic(ctx, "unsub-ack", "sub-x", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "unsub-ack", "sub-x", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -1100,7 +1057,7 @@ func TestUnsubscribe(t *testing.T) {
 		}
 
 		// Ack should still work
-		if err := pq.AckTopic(ctx, "unsub-ack", "sub-x", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("ack after unsubscribe should succeed: %v", err)
 		}
 	})
@@ -1139,7 +1096,7 @@ func TestUnsubscribe(t *testing.T) {
 		if _, err := pq.Publish(ctx, "unsub-resub", []byte("after-resub")); err != nil {
 			t.Fatalf("failed to publish: %v", err)
 		}
-		msg, err := pq.ConsumeFromTopic(ctx, "unsub-resub", "sub-r", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "unsub-resub", "sub-r", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume after re-subscribe: %v", err)
 		}
@@ -1170,12 +1127,12 @@ func TestMessageMetadataRoundTrip(t *testing.T) {
 			"tags": []any{"x", "y"},
 		}
 
-		_, err = pq.PublishWithID(ctx, "meta-ch", uuid.UUID{}, []byte("meta-payload"), metadata)
+		_, err = pq.Publish(ctx, "meta-ch", []byte("meta-payload"), pgqueue.WithMessageMetadata(metadata))
 		if err != nil {
 			t.Fatalf("failed to publish with metadata: %v", err)
 		}
 
-		msg, err := pq.ConsumeFromChannel(ctx, "meta-ch", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "meta-ch", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -1217,12 +1174,12 @@ func TestMessageMetadataRoundTrip(t *testing.T) {
 		}
 
 		metadata := map[string]any{"source": "test", "priority": float64(1)}
-		_, err = pq.PublishWithID(ctx, "meta-topic", uuid.UUID{}, []byte("topic-meta"), metadata)
+		_, err = pq.Publish(ctx, "meta-topic", []byte("topic-meta"), pgqueue.WithMessageMetadata(metadata))
 		if err != nil {
 			t.Fatalf("failed to publish: %v", err)
 		}
 
-		msg, err := pq.ConsumeFromTopic(ctx, "meta-topic", "sub-m", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "meta-topic", "sub-m", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -1248,7 +1205,7 @@ func TestMessageMetadataRoundTrip(t *testing.T) {
 			t.Fatalf("failed to publish: %v", err)
 		}
 
-		msg, err := pq.ConsumeFromChannel(ctx, "meta-nil", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "meta-nil", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -1312,7 +1269,7 @@ func TestPublishToTopicNoSubscribers(t *testing.T) {
 		t.Fatalf("failed to publish second message: %v", err)
 	}
 
-	msg, err := pq.ConsumeFromTopic(ctx, "no-subs-topic", "late-sub", 30*time.Second)
+	msg, err := pq.ReceiveTopic(ctx, "no-subs-topic", "late-sub", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
@@ -1324,15 +1281,12 @@ func TestPublishToTopicNoSubscribers(t *testing.T) {
 	}
 
 	// No more messages — the orphan message has no subscription record
-	if err := pq.AckTopic(ctx, "no-subs-topic", "late-sub", msg.Receipt()); err != nil {
+	if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack: %v", err)
 	}
-	msg, err = pq.ConsumeFromTopic(ctx, "no-subs-topic", "late-sub", 30*time.Second)
-	if err != nil {
-		t.Fatalf("failed to consume again: %v", err)
-	}
-	if msg != nil {
-		t.Error("expected no more messages for late subscriber")
+	_, err = pq.ReceiveTopic(ctx, "no-subs-topic", "late-sub", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if !errors.Is(err, pgqueue.ErrQueueEmpty) {
+		t.Errorf("expected no more messages for late subscriber, got: %v", err)
 	}
 }
 
@@ -1356,15 +1310,15 @@ func TestAckTopicWithoutConsume(t *testing.T) {
 	}
 
 	// Try to ack without consuming — subscription is in 'pending' state, not 'processing'.
-	// AckTopic requires status='processing', so rows=0 and it returns ErrMessageAlreadyAcked
+	// Ack requires status='processing', so rows=0 and it returns ErrMessageAlreadyAcked
 	// (this sentinel covers both "never consumed" and "already acked" cases).
-	err = pq.AckTopic(ctx, "ack-no-consume", "sub-eager", pgqueue.Receipt{MessageID: msgID})
+	err = pq.Ack(ctx, pgqueue.Receipt{MessageID: msgID, QueueName: "ack-no-consume", QueueType: pgqueue.QueueTypePubSub, SubscriberID: "sub-eager"})
 	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
 		t.Fatalf("expected ErrMessageAlreadyAcked, got: %v", err)
 	}
 
 	// Message should still be consumable
-	msg, err := pq.ConsumeFromTopic(ctx, "ack-no-consume", "sub-eager", 30*time.Second)
+	msg, err := pq.ReceiveTopic(ctx, "ack-no-consume", "sub-eager", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
@@ -1439,7 +1393,7 @@ func TestCloseJoinsBackgroundGoroutines(t *testing.T) {
 
 	// A handler-consume loop owned by the Queue.
 	for range 10 {
-		if _, err := pq.PublishChannel(ctx, channelName, []byte("work")); err != nil {
+		if _, err := pq.Publish(ctx, channelName, []byte("work")); err != nil {
 			t.Fatalf("publish: %v", err)
 		}
 	}

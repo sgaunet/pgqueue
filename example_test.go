@@ -35,8 +35,9 @@ func ExampleNew() {
 	defer func() { _ = q.Close() }()
 }
 
-// ExampleQueue_PublishChannel publishes a message to a point-to-point channel.
-func ExampleQueue_PublishChannel() {
+// ExampleQueue_Publish publishes a message; the queue type is resolved from the
+// queue's metadata, so the same call serves channels and topics.
+func ExampleQueue_Publish() {
 	var (
 		ctx context.Context
 		q   *pgqueue.Queue
@@ -44,7 +45,7 @@ func ExampleQueue_PublishChannel() {
 	if err := q.CreateChannel(ctx, "orders"); err != nil {
 		log.Fatal(err)
 	}
-	id, err := q.PublishChannel(ctx, "orders", []byte(`{"order":123}`))
+	id, err := q.Publish(ctx, "orders", []byte(`{"order":123}`))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -136,16 +137,16 @@ func ExampleQueue_ListDLQMessages() {
 }
 
 // ExampleQueue_ReplayDLQ replays every message from the dead-letter queue back
-// onto the main queue. Replay is a destructive operation, so Confirm is required.
-// ReplayDLQ returns a ReplayDLQResult distinguishing replayed from skipped
-// (un-replayable) rows.
+// onto the main queue. Pass ReplayOptions{DryRun: true} first if you want to
+// preview the count without re-injecting. ReplayDLQ returns a ReplayDLQResult
+// distinguishing replayed from skipped (un-replayable) rows.
 func ExampleQueue_ReplayDLQ() {
 	var (
 		ctx context.Context
 		q   *pgqueue.Queue
 	)
 	res, err := q.ReplayDLQ(ctx, "orders", pgqueue.QueueTypeChannel,
-		pgqueue.ReplayOptions{Confirm: true})
+		pgqueue.ReplayOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}

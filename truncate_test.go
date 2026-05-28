@@ -7,8 +7,8 @@ import (
 )
 
 // truncateErrorMsg is the sanitizer applied to every nack failure reason before
-// it is written to the error_message TEXT column (NackChannel, NackTopic,
-// NackChannelBatch, NackTopicBatch). PostgreSQL rejects invalid UTF-8 on a TEXT
+// it is written to the error_message TEXT column (Nack and NackBatch).
+// PostgreSQL rejects invalid UTF-8 on a TEXT
 // column, so the function's job is to return a string that is BOTH valid UTF-8
 // AND at most maxErrorMessageLength bytes — for any input, since a handler's
 // error message is arbitrary bytes (a handler processing binary data may return

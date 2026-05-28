@@ -51,9 +51,9 @@ func TestPublishBatchChannel(t *testing.T) {
 	// Consume all messages and verify all payloads present
 	payloadSet := make(map[string]bool)
 	for i := range messages {
-		msg, err := pq.ConsumeFromChannel(ctx, "batch-chan", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "batch-chan", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromChannel failed: %v", err)
+			t.Fatalf("ReceiveChannel failed: %v", err)
 		}
 		if msg == nil {
 			t.Fatalf("expected message %d, got nil", i)
@@ -102,9 +102,9 @@ func TestPublishBatchTopic(t *testing.T) {
 	// Both subscribers should get all 3 messages
 	for _, subID := range []string{"sub1", "sub2"} {
 		for i := 0; i < 3; i++ {
-			msg, err := pq.ConsumeFromTopic(ctx, "batch-topic", subID, 30*time.Second)
+			msg, err := pq.ReceiveTopic(ctx, "batch-topic", subID, pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
-				t.Fatalf("ConsumeFromTopic(%s) failed: %v", subID, err)
+				t.Fatalf("ReceiveTopic(%s) failed: %v", subID, err)
 			}
 			if msg == nil {
 				t.Fatalf("subscriber %s: expected message %d, got nil", subID, i)
@@ -218,9 +218,9 @@ func TestPublishBatchWithMetadata(t *testing.T) {
 	// Consume both and check metadata by payload
 	var withMeta, withoutMeta bool
 	for range 2 {
-		msg, err := pq.ConsumeFromChannel(ctx, "meta-batch", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "meta-batch", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromChannel failed: %v", err)
+			t.Fatalf("ReceiveChannel failed: %v", err)
 		}
 		switch string(msg.Payload) {
 		case "with-meta":
@@ -281,9 +281,9 @@ func TestPublishBatchOrderPreserved(t *testing.T) {
 	// Consume all and verify all payloads present
 	payloadSet := make(map[string]bool)
 	for range 10 {
-		msg, err := pq.ConsumeFromChannel(ctx, "order-batch", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "order-batch", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromChannel failed: %v", err)
+			t.Fatalf("ReceiveChannel failed: %v", err)
 		}
 		payloadSet[string(msg.Payload)] = true
 	}
@@ -338,16 +338,16 @@ func TestAckChannelBatch(t *testing.T) {
 	// Consume all
 	consumedReceipts := make([]pgqueue.Receipt, 5)
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "ack-batch", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "ack-batch", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromChannel failed: %v", err)
+			t.Fatalf("ReceiveChannel failed: %v", err)
 		}
 		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.AckChannelBatch(ctx, "ack-batch", consumedReceipts)
+	err = pq.AckBatch(ctx, consumedReceipts)
 	if err != nil {
-		t.Fatalf("AckChannelBatch failed: %v", err)
+		t.Fatalf("AckBatch failed: %v", err)
 	}
 
 	stats, err := pq.GetStats(ctx, "ack-batch", pgqueue.QueueTypeChannel)
@@ -382,9 +382,9 @@ func TestAckChannelBatchNoneProcessing(t *testing.T) {
 	// Not consumed → still pending, not processing. Zero ClaimID matches no rows.
 	receipts := make([]pgqueue.Receipt, len(ids))
 	for i, id := range ids {
-		receipts[i] = pgqueue.Receipt{MessageID: id}
+		receipts[i] = pgqueue.Receipt{MessageID: id, QueueName: "ack-none", QueueType: pgqueue.QueueTypeChannel}
 	}
-	err = pq.AckChannelBatch(ctx, "ack-none", receipts)
+	err = pq.AckBatch(ctx, receipts)
 	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
 		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestAckChannelBatchEmptySlice(t *testing.T) {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
-	err = pq.AckChannelBatch(ctx, "ack-empty", nil)
+	err = pq.AckBatch(ctx, nil)
 	if err != nil {
 		t.Errorf("expected nil error for empty slice, got: %v", err)
 	}
@@ -418,9 +418,14 @@ func TestAckChannelBatchTooLarge(t *testing.T) {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
+	// Every receipt carries the same channel binding so AckBatch groups them
+	// into a single over-limit batch and reaches the size guard.
 	receipts := make([]pgqueue.Receipt, pgqueue.MaxBatchSize+1)
+	for i := range receipts {
+		receipts[i] = pgqueue.Receipt{QueueName: "ack-large", QueueType: pgqueue.QueueTypeChannel}
+	}
 
-	err = pq.AckChannelBatch(ctx, "ack-large", receipts)
+	err = pq.AckBatch(ctx, receipts)
 	if !errors.Is(err, pgqueue.ErrBatchTooLarge) {
 		t.Errorf("expected ErrBatchTooLarge, got: %v", err)
 	}
@@ -456,16 +461,16 @@ func TestAckTopicBatch(t *testing.T) {
 
 	consumedReceipts := make([]pgqueue.Receipt, 5)
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromTopic(ctx, "ack-topic-batch", "sub1", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "ack-topic-batch", "sub1", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromTopic failed: %v", err)
+			t.Fatalf("ReceiveTopic failed: %v", err)
 		}
 		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.AckTopicBatch(ctx, "ack-topic-batch", "sub1", consumedReceipts)
+	err = pq.AckBatch(ctx, consumedReceipts)
 	if err != nil {
-		t.Fatalf("AckTopicBatch failed: %v", err)
+		t.Fatalf("AckBatch failed: %v", err)
 	}
 }
 
@@ -495,9 +500,9 @@ func TestAckTopicBatchNoneProcessing(t *testing.T) {
 	// Not consumed → zero ClaimID matches no rows.
 	receipts := make([]pgqueue.Receipt, len(ids))
 	for i, id := range ids {
-		receipts[i] = pgqueue.Receipt{MessageID: id}
+		receipts[i] = pgqueue.Receipt{MessageID: id, QueueName: "ack-topic-none", QueueType: pgqueue.QueueTypePubSub, SubscriberID: "sub1"}
 	}
-	err = pq.AckTopicBatch(ctx, "ack-topic-none", "sub1", receipts)
+	err = pq.AckBatch(ctx, receipts)
 	if !errors.Is(err, pgqueue.ErrMessageAlreadyAcked) {
 		t.Errorf("expected ErrMessageAlreadyAcked, got: %v", err)
 	}
@@ -529,16 +534,16 @@ func TestNackChannelBatch(t *testing.T) {
 
 	consumedReceipts := make([]pgqueue.Receipt, 5)
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "nack-batch", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "nack-batch", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromChannel failed: %v", err)
+			t.Fatalf("ReceiveChannel failed: %v", err)
 		}
 		consumedReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-batch", consumedReceipts, "transient error")
+	err = pq.NackBatch(ctx, consumedReceipts, "transient error")
 	if err != nil {
-		t.Fatalf("NackChannelBatch failed: %v", err)
+		t.Fatalf("NackBatch failed: %v", err)
 	}
 
 	// All messages should be back to pending
@@ -551,9 +556,9 @@ func TestNackChannelBatch(t *testing.T) {
 	}
 
 	// Verify retry count incremented
-	msg, err := pq.ConsumeFromChannel(ctx, "nack-batch", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "nack-batch", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
-		t.Fatalf("ConsumeFromChannel failed: %v", err)
+		t.Fatalf("ReceiveChannel failed: %v", err)
 	}
 	if msg.RetryCount != 1 {
 		t.Errorf("expected retry_count=1, got %d", msg.RetryCount)
@@ -585,24 +590,24 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 	// First round: consume and nack all (retry_count goes to 1)
 	firstReceipts := make([]pgqueue.Receipt, 3)
 	for i := 0; i < 3; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "nack-mixed", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "nack-mixed", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromChannel failed: %v", err)
+			t.Fatalf("ReceiveChannel failed: %v", err)
 		}
 		firstReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-mixed", firstReceipts, "first failure")
+	err = pq.NackBatch(ctx, firstReceipts, "first failure")
 	if err != nil {
-		t.Fatalf("first NackChannelBatch failed: %v", err)
+		t.Fatalf("first NackBatch failed: %v", err)
 	}
 
 	// Second round: consume and nack again (retry_count 1+1=2 > maxRetry 1 → DLQ)
 	secondReceipts := make([]pgqueue.Receipt, 3)
 	for i := 0; i < 3; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "nack-mixed", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "nack-mixed", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
-			t.Fatalf("ConsumeFromChannel round 2 failed: %v", err)
+			t.Fatalf("ReceiveChannel round 2 failed: %v", err)
 		}
 		if msg == nil {
 			t.Fatalf("expected message %d in round 2, got nil", i)
@@ -610,9 +615,9 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 		secondReceipts[i] = msg.Receipt()
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-mixed", secondReceipts, "second failure")
+	err = pq.NackBatch(ctx, secondReceipts, "second failure")
 	if err != nil {
-		t.Fatalf("second NackChannelBatch failed: %v", err)
+		t.Fatalf("second NackBatch failed: %v", err)
 	}
 
 	// All 3 should be in DLQ
@@ -639,7 +644,7 @@ func TestNackChannelBatchEmptySlice(t *testing.T) {
 		t.Fatalf("failed to create channel: %v", err)
 	}
 
-	err = pq.NackChannelBatch(ctx, "nack-empty", nil, "error")
+	err = pq.NackBatch(ctx, nil, "error")
 	if err != nil {
 		t.Errorf("expected nil error for empty slice, got: %v", err)
 	}
@@ -667,9 +672,9 @@ func TestNackChannelBatchNoneProcessing(t *testing.T) {
 	// Not consumed → zero ClaimID matches no rows.
 	receipts := make([]pgqueue.Receipt, len(ids))
 	for i, id := range ids {
-		receipts[i] = pgqueue.Receipt{MessageID: id}
+		receipts[i] = pgqueue.Receipt{MessageID: id, QueueName: "nack-none", QueueType: pgqueue.QueueTypeChannel}
 	}
-	err = pq.NackChannelBatch(ctx, "nack-none", receipts, "error")
+	err = pq.NackBatch(ctx, receipts, "error")
 	if !errors.Is(err, pgqueue.ErrMessageNotFound) {
 		t.Errorf("expected ErrMessageNotFound, got: %v", err)
 	}
@@ -742,7 +747,7 @@ func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 	// Publish 2 valid messages, then build a batch mixing real receipts with
 	// stale ones whose ClaimID is zero and whose MessageIDs do not match any
 	// processing row.
-	if _, err := pq.PublishChannelBatch(ctx, channelName, []pgqueue.PublishMessage{
+	if _, err := pq.PublishBatch(ctx, channelName, []pgqueue.PublishMessage{
 		{Payload: []byte("v1")},
 		{Payload: []byte("v2")},
 	}); err != nil {
@@ -751,7 +756,7 @@ func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 
 	valid := make([]pgqueue.Receipt, 0, 2)
 	for range 2 {
-		msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("consume: %v", err)
 		}
@@ -768,11 +773,11 @@ func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 	}
 	mixed := []pgqueue.Receipt{
 		valid[0],
-		{MessageID: staleA},
+		{MessageID: staleA, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel},
 		valid[1],
-		{MessageID: staleB},
+		{MessageID: staleB, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel},
 	}
-	if err := pq.AckChannelBatch(ctx, channelName, mixed); err != nil {
+	if err := pq.AckBatch(ctx, mixed); err != nil {
 		t.Fatalf("ack batch: %v", err)
 	}
 
@@ -794,13 +799,13 @@ func TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 
-	if _, err := pq.PublishChannelBatch(ctx, channelName, []pgqueue.PublishMessage{
+	if _, err := pq.PublishBatch(ctx, channelName, []pgqueue.PublishMessage{
 		{Payload: []byte("v1")},
 	}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
-	msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("consume: %v", err)
 	}
@@ -809,8 +814,8 @@ func TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("uuid v7: %v", err)
 	}
-	mixed := []pgqueue.Receipt{msg.Receipt(), {MessageID: staleA}}
-	if err := pq.NackChannelBatch(ctx, channelName, mixed, "transient"); err != nil {
+	mixed := []pgqueue.Receipt{msg.Receipt(), {MessageID: staleA, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel}}
+	if err := pq.NackBatch(ctx, mixed, "transient"); err != nil {
 		t.Fatalf("nack batch: %v", err)
 	}
 
@@ -831,7 +836,7 @@ func TestNackChannelBatchAppliesBackoff(t *testing.T) {
 	if err := pq.CreateChannel(ctx, channelName); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := pq.PublishChannelBatch(ctx, channelName, []pgqueue.PublishMessage{
+	if _, err := pq.PublishBatch(ctx, channelName, []pgqueue.PublishMessage{
 		{Payload: []byte("b1")},
 		{Payload: []byte("b2")},
 	}); err != nil {
@@ -846,7 +851,7 @@ func TestNackChannelBatchAppliesBackoff(t *testing.T) {
 		}
 		receipts = append(receipts, msg.Receipt())
 	}
-	if err := pq.NackChannelBatch(ctx, channelName, receipts, "transient failure"); err != nil {
+	if err := pq.NackBatch(ctx, receipts, "transient failure"); err != nil {
 		t.Fatalf("nack batch: %v", err)
 	}
 
@@ -877,7 +882,7 @@ func TestNackTopicBatchAppliesBackoff(t *testing.T) {
 	if err := pq.Subscribe(ctx, topicName, subID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	if _, err := pq.PublishTopicBatch(ctx, topicName, []pgqueue.PublishMessage{
+	if _, err := pq.PublishBatch(ctx, topicName, []pgqueue.PublishMessage{
 		{Payload: []byte("t1")},
 		{Payload: []byte("t2")},
 	}); err != nil {
@@ -892,7 +897,7 @@ func TestNackTopicBatchAppliesBackoff(t *testing.T) {
 		}
 		receipts = append(receipts, msg.Receipt())
 	}
-	if err := pq.NackTopicBatch(ctx, topicName, subID, receipts, "transient failure"); err != nil {
+	if err := pq.NackBatch(ctx, receipts, "transient failure"); err != nil {
 		t.Fatalf("nack batch: %v", err)
 	}
 
@@ -908,61 +913,3 @@ func TestNackTopicBatchAppliesBackoff(t *testing.T) {
 	}
 }
 
-// TestPublishBatchTypedMethodsRejectWrongType verifies that PublishChannelBatch
-// and PublishTopicBatch resolve the queue with their own type: invoking the
-// channel batch on a name that exists only as a topic (and vice versa) returns
-// a not-found error instead of silently publishing to the wrong-typed queue.
-func TestPublishBatchTypedMethodsRejectWrongType(t *testing.T) {
-	pq, _, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	const topicOnly = "batch-topic-only"
-	if err := pq.CreateTopic(ctx, topicOnly); err != nil {
-		t.Fatalf("failed to create topic: %v", err)
-	}
-	if err := pq.Subscribe(ctx, topicOnly, "sub1"); err != nil {
-		t.Fatalf("failed to subscribe: %v", err)
-	}
-
-	const channelOnly = "batch-channel-only"
-	if err := pq.CreateChannel(ctx, channelOnly); err != nil {
-		t.Fatalf("failed to create channel: %v", err)
-	}
-
-	msgs := []pgqueue.PublishMessage{{Payload: []byte("p1")}}
-
-	// PublishChannelBatch on a topic-only name must not silently publish to the
-	// topic; it must fail to find a channel of that name.
-	if _, err := pq.PublishChannelBatch(ctx, topicOnly, msgs); !errors.Is(err, pgqueue.ErrQueueNotFound) {
-		t.Errorf("PublishChannelBatch on a topic name: got err %v, want ErrQueueNotFound", err)
-	}
-	topicStats, err := pq.GetStats(ctx, topicOnly, pgqueue.QueueTypePubSub)
-	if err != nil {
-		t.Fatalf("topic GetStats failed: %v", err)
-	}
-	if topicStats.PendingCount != 0 {
-		t.Errorf("PublishChannelBatch leaked into the topic: %d pending", topicStats.PendingCount)
-	}
-
-	// Symmetrically, PublishTopicBatch on a channel-only name must fail.
-	if _, err := pq.PublishTopicBatch(ctx, channelOnly, msgs); !errors.Is(err, pgqueue.ErrTopicNotFound) {
-		t.Errorf("PublishTopicBatch on a channel name: got err %v, want ErrTopicNotFound", err)
-	}
-	chanStats, err := pq.GetStats(ctx, channelOnly, pgqueue.QueueTypeChannel)
-	if err != nil {
-		t.Fatalf("channel GetStats failed: %v", err)
-	}
-	if chanStats.PendingCount != 0 {
-		t.Errorf("PublishTopicBatch leaked into the channel: %d pending", chanStats.PendingCount)
-	}
-
-	// The typed methods still work for their own type.
-	if _, err := pq.PublishChannelBatch(ctx, channelOnly, msgs); err != nil {
-		t.Errorf("PublishChannelBatch on a channel: unexpected error %v", err)
-	}
-	if _, err := pq.PublishTopicBatch(ctx, topicOnly, msgs); err != nil {
-		t.Errorf("PublishTopicBatch on a topic: unexpected error %v", err)
-	}
-}

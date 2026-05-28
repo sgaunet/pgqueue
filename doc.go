@@ -23,7 +23,7 @@ Basic Usage:
 	// handle err
 	defer pq.Close()
 	_ = pq.CreateChannel(ctx, "orders")
-	msgID, err := pq.PublishChannel(ctx, "orders", []byte("order-123"))
+	msgID, err := pq.Publish(ctx, "orders", []byte("order-123"))
 	// handle err
 	msg, err := pq.ReceiveChannel(ctx, "orders") // ErrQueueEmpty if none
 	// handle err

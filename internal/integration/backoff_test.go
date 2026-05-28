@@ -40,7 +40,7 @@ func TestNackBackoffDelaysRedelivery(t *testing.T) {
 	}
 
 	// --- automatic backoff ---
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("retry-me")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("retry-me")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	msg, err := pq.ReceiveChannel(ctx, channelName)
@@ -63,7 +63,7 @@ func TestNackBackoffDelaysRedelivery(t *testing.T) {
 	}
 
 	// --- WithRetryDelay override ---
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("override-me")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("override-me")); err != nil {
 		t.Fatalf("publish override: %v", err)
 	}
 	om, err := pq.ReceiveChannel(ctx, channelName)
@@ -114,7 +114,7 @@ func TestTimeoutReclaimAppliesBackoff(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("crash-me")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("crash-me")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 

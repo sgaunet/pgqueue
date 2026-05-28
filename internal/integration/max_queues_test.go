@@ -52,7 +52,7 @@ func TestCreateQueue_MaxQueuesLimit(t *testing.T) {
 	}
 
 	// Freeing a slot allows creation again.
-	if err := pq.DeleteChannel(ctx, "max-ch-0", true); err != nil {
+	if err := pq.DeleteChannel(ctx, "max-ch-0"); err != nil {
 		t.Fatalf("DeleteChannel failed: %v", err)
 	}
 	if err := pq.CreateChannel(ctx, "max-ch-after-delete"); err != nil {

@@ -22,26 +22,19 @@ func rowsAffectedOrErr(result sql.Result) (int64, error) {
 	return n, nil
 }
 
-// Publish publishes a message to a topic or channel.
-// Returns the message ID (UUIDv7) on success.
+// Publish publishes a single message to the named channel or topic and returns
+// the message ID (UUIDv7). The queue type is resolved from the queue's metadata,
+// so the same call serves both channels and topics — the publisher does not need
+// to know which it is talking to.
+//
+// Use WithMessageID to supply a deterministic ID for publish-side dedup and
+// WithMessageMetadata to attach metadata. payload must not be nil (use []byte{}
+// for an empty payload).
 func (pq *Queue) Publish(
 	ctx context.Context,
 	queueName string,
 	payload []byte,
-) (uuid.UUID, error) {
-	return pq.PublishWithID(ctx, queueName, uuid.UUID{}, payload, nil)
-}
-
-// PublishWithID publishes a message with a specific ID for deduplication.
-// If messageID is the zero value (uuid.Nil), a new UUIDv7 will be generated.
-// payload must not be nil (use []byte{} for an empty payload).
-// metadata is optional and can be nil.
-func (pq *Queue) PublishWithID(
-	ctx context.Context,
-	queueName string,
-	messageID uuid.UUID,
-	payload []byte,
-	metadata map[string]any,
+	opts ...PublishOption,
 ) (uuid.UUID, error) {
 	if err := pq.checkClosed(); err != nil {
 		return uuid.UUID{}, err
@@ -49,45 +42,53 @@ func (pq *Queue) PublishWithID(
 	if payload == nil {
 		return uuid.UUID{}, ErrNilPayload
 	}
+	o := applyPublishOptions(opts)
 
+	ctx, span := pq.startSpan(ctx, "pgqueue.publish", StringAttr("queue", queueName))
+	id, err := pq.publishResolved(ctx, queueName, payload, o.messageID, o.metadata)
+	endSpan(span, err)
+	if err == nil {
+		pq.recordPublish(queueName, 1)
+	}
+	return id, err
+}
+
+// publishResolved resolves the queue metadata by name — the UNIQUE(table_name)
+// constraint on pgqueue_metadata guarantees at most one match across both queue
+// types — and inserts the message into the channel or pub/sub table accordingly.
+func (pq *Queue) publishResolved(
+	ctx context.Context,
+	queueName string,
+	payload []byte,
+	messageID uuid.UUID,
+	metadata map[string]any,
+) (uuid.UUID, error) {
 	queueMeta, err := pq.resolveQueueMetadata(ctx, queueName)
 	if err != nil {
 		return uuid.UUID{}, err
 	}
-
 	if err := pq.validatePayloadSize(queueMeta, payload); err != nil {
 		return uuid.UUID{}, err
 	}
-
-	// Generate message ID if not provided
 	if messageID == uuid.Nil {
 		messageID, err = NewUUIDv7()
 		if err != nil {
-			return uuid.UUID{}, fmt.Errorf(
-				"failed to generate message ID: %w", err,
-			)
+			return uuid.UUID{}, fmt.Errorf("failed to generate message ID: %w", err)
 		}
 	}
-
 	metadataJSON, err := pq.marshalAndValidateMetadata(queueMeta, metadata)
 	if err != nil {
 		return uuid.UUID{}, err
 	}
-
-	// Publish based on queue type
-	queueType := queueMeta.QueueType
-	if queueType == QueueTypePubSub {
+	if queueMeta.QueueType == QueueTypePubSub {
 		return messageID, pq.publishToPubSub(
 			ctx, queueMeta.QueueName, queueMeta.TableName,
 			messageID, payload, metadataJSON,
 		)
 	}
-
 	maxRetries := pq.resolveMaxRetries(queueMeta)
-
 	return messageID, pq.publishToChannel(
-		ctx, queueMeta.TableName,
-		messageID, payload, metadataJSON, maxRetries,
+		ctx, queueMeta.TableName, messageID, payload, metadataJSON, maxRetries,
 	)
 }
 
@@ -128,10 +129,10 @@ func (pq *Queue) validatePayloadSize(
 		MaxMessageSize int `json:"MaxMessageSize"`
 	}
 	if err := json.Unmarshal(queueMeta.Config, &config); err != nil {
-		config.MaxMessageSize = pq.config.MaxMessageSize
+		config.MaxMessageSize = pq.cfg.maxMessageSize
 	}
 	if config.MaxMessageSize == 0 {
-		config.MaxMessageSize = pq.config.MaxMessageSize
+		config.MaxMessageSize = pq.cfg.maxMessageSize
 	}
 
 	if len(payload) > config.MaxMessageSize {
@@ -205,7 +206,7 @@ func (pq *Queue) resolveMaxRetries(
 		}
 	}
 
-	return pq.config.DefaultMaxRetries
+	return pq.cfg.defaultMaxRetries
 }
 
 // publishToPubSub publishes a message to a pub/sub topic.
@@ -291,148 +292,6 @@ func (pq *Queue) createSubscriptionRecords(
 	}
 
 	return nil
-}
-
-// PublishChannel publishes a single message to a point-to-point channel.
-// Returns the message ID (UUIDv7) on success.
-//
-// Use WithMessageID to supply a deterministic ID for deduplication, and
-// WithMessageMetadata to attach metadata to the message.
-func (pq *Queue) PublishChannel(
-	ctx context.Context,
-	name string,
-	payload []byte,
-	opts ...PublishOption,
-) (uuid.UUID, error) {
-	if err := pq.checkClosed(); err != nil {
-		return uuid.UUID{}, err
-	}
-	ctx, span := pq.startSpan(ctx, "pgqueue.publish",
-		StringAttr("queue", name), StringAttr("queue_type", "channel"))
-	o := applyPublishOptions(opts)
-	id, err := pq.publishTyped(ctx, name, QueueTypeChannel, payload, o.messageID, o.metadata)
-	endSpan(span, err)
-	if err == nil {
-		pq.recordPublish(name, 1)
-	}
-	return id, err
-}
-
-// PublishTopic publishes a single message to a pub/sub topic, delivering it
-// to all active subscribers.
-// Returns the message ID (UUIDv7) on success.
-func (pq *Queue) PublishTopic(
-	ctx context.Context,
-	name string,
-	payload []byte,
-	opts ...PublishOption,
-) (uuid.UUID, error) {
-	if err := pq.checkClosed(); err != nil {
-		return uuid.UUID{}, err
-	}
-	ctx, span := pq.startSpan(ctx, "pgqueue.publish",
-		StringAttr("queue", name), StringAttr("queue_type", "pubsub"))
-	o := applyPublishOptions(opts)
-	id, err := pq.publishTyped(ctx, name, QueueTypePubSub, payload, o.messageID, o.metadata)
-	endSpan(span, err)
-	if err == nil {
-		pq.recordPublish(name, 1)
-	}
-	return id, err
-}
-
-// publishTyped is the shared implementation for PublishChannel/PublishTopic.
-func (pq *Queue) publishTyped(
-	ctx context.Context,
-	name string,
-	queueType QueueType,
-	payload []byte,
-	messageID uuid.UUID,
-	metadata map[string]any,
-) (uuid.UUID, error) {
-	if payload == nil {
-		return uuid.UUID{}, ErrNilPayload
-	}
-
-	queueMeta, err := pq.getQueueMetadata(ctx, string(queueType), name)
-	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("%s: %w", name, err)
-	}
-	if err := pq.validatePayloadSize(queueMeta, payload); err != nil {
-		return uuid.UUID{}, err
-	}
-	if messageID == uuid.Nil {
-		messageID, err = NewUUIDv7()
-		if err != nil {
-			return uuid.UUID{}, fmt.Errorf("failed to generate message ID: %w", err)
-		}
-	}
-	metadataJSON, err := pq.marshalAndValidateMetadata(queueMeta, metadata)
-	if err != nil {
-		return uuid.UUID{}, err
-	}
-
-	if queueType == QueueTypePubSub {
-		return messageID, pq.publishToPubSub(
-			ctx, queueMeta.QueueName, queueMeta.TableName,
-			messageID, payload, metadataJSON,
-		)
-	}
-	maxRetries := pq.resolveMaxRetries(queueMeta)
-	return messageID, pq.publishToChannel(
-		ctx, queueMeta.TableName, messageID, payload, metadataJSON, maxRetries,
-	)
-}
-
-// PublishChannelBatch publishes multiple messages to a point-to-point channel
-// in a single atomic operation. Returns message IDs in the same order as the
-// input messages.
-func (pq *Queue) PublishChannelBatch(
-	ctx context.Context,
-	name string,
-	msgs []PublishMessage,
-) ([]uuid.UUID, error) {
-	if err := pq.checkClosed(); err != nil {
-		return nil, err
-	}
-	if len(msgs) == 0 {
-		return []uuid.UUID{}, nil
-	}
-	if err := validateBatchSize(len(msgs)); err != nil {
-		return nil, err
-	}
-	// Resolve metadata with the channel type explicitly so a name that also
-	// exists as a topic cannot misroute this publish to the topic.
-	queueMeta, err := pq.getChannelMetadata(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	return pq.publishBatchResolved(ctx, queueMeta, msgs)
-}
-
-// PublishTopicBatch publishes multiple messages to a pub/sub topic in a single
-// atomic operation. Returns message IDs in the same order as the input messages.
-func (pq *Queue) PublishTopicBatch(
-	ctx context.Context,
-	name string,
-	msgs []PublishMessage,
-) ([]uuid.UUID, error) {
-	if err := pq.checkClosed(); err != nil {
-		return nil, err
-	}
-	if len(msgs) == 0 {
-		return []uuid.UUID{}, nil
-	}
-	if err := validateBatchSize(len(msgs)); err != nil {
-		return nil, err
-	}
-	// Resolve metadata with the topic type explicitly so a name that also
-	// exists as a channel cannot misroute this publish to the channel.
-	queueMeta, err := pq.getTopicMetadata(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-	return pq.publishBatchResolved(ctx, queueMeta, msgs)
 }
 
 // publishToChannel publishes a message to a point-to-point channel.

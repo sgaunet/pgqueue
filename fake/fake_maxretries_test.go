@@ -21,7 +21,7 @@ func TestFakeWithMaxRetriesZero(t *testing.T) {
 	if err := q.CreateChannel(ctx, "jobs"); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := q.PublishChannel(ctx, "jobs", []byte("poison")); err != nil {
+	if _, err := q.Publish(ctx, "jobs", []byte("poison")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 

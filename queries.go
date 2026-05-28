@@ -27,7 +27,7 @@ func (pq *Queue) getQueueTTL(configJSON []byte) time.Duration {
 		}
 	}
 
-	return pq.config.DefaultTTL
+	return pq.cfg.defaultTTL
 }
 
 // parseMetadataJSON parses a nullable JSON string into a metadata map. Corrupt

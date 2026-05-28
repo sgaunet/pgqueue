@@ -16,7 +16,7 @@ func TestClaimReturnsCopyForRedelivery(t *testing.T) {
 	if err := q.CreateChannel(ctx, "orders"); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := q.PublishChannel(ctx, "orders", []byte("original")); err != nil {
+	if _, err := q.Publish(ctx, "orders", []byte("original")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
@@ -55,7 +55,7 @@ func TestPublishTopicFanOutCopies(t *testing.T) {
 	if err := q.Subscribe(ctx, "events", "sub-b"); err != nil {
 		t.Fatalf("subscribe b: %v", err)
 	}
-	if _, err := q.PublishTopic(ctx, "events", []byte("shared")); err != nil {
+	if _, err := q.Publish(ctx, "events", []byte("shared")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 

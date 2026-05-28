@@ -197,9 +197,6 @@ func (pq *Queue) GetReplayHistory(
 const MaxPerformedByLen = 256
 
 func validateReplayOpts(opts ReplayOptions) error {
-	if !opts.Confirm && !opts.DryRun {
-		return ErrConfirmationRequired
-	}
 	// A negative limit is meaningless and would otherwise reach PostgreSQL as an
 	// invalid LIMIT, surfacing an opaque database error instead of a clear one.
 	if opts.Limit < 0 {

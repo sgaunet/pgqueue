@@ -123,10 +123,10 @@ func TestObservabilityHooksReceiveSpansAndMetrics(t *testing.T) {
 	}
 
 	// Publish two messages: one handled OK, one always failing (drives a nack).
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("ok")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("ok")); err != nil {
 		t.Fatalf("publish ok: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("bad")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("bad")); err != nil {
 		t.Fatalf("publish bad: %v", err)
 	}
 
@@ -159,7 +159,7 @@ func TestObservabilityHooksReceiveSpansAndMetrics(t *testing.T) {
 
 	// Replay drives a replay span.
 	if _, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel,
-		pgqueue.ReplayOptions{Confirm: true}); err != nil {
+		pgqueue.ReplayOptions{}); err != nil {
 		t.Fatalf("replay DLQ: %v", err)
 	}
 
@@ -213,7 +213,7 @@ func TestAutoAckSurfacesClaimExpired(t *testing.T) {
 	if err := pq.CreateChannel(ctx, channelName); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("payload")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("payload")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
@@ -268,7 +268,7 @@ func TestObservabilityNoopWhenUnregistered(t *testing.T) {
 	if err := pq.CreateChannel(ctx, channelName); err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("payload")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("payload")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	msg, err := pq.ReceiveChannel(ctx, channelName)

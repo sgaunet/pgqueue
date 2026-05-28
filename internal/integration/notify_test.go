@@ -104,7 +104,7 @@ func TestNotifyIdleConsumerWakesUnderOneSecond(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	publishedAt := time.Now()
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("wake up")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("wake up")); err != nil {
 		t.Fatalf("failed to publish message: %v", err)
 	}
 
@@ -177,7 +177,7 @@ func TestNotifyKeepalivePreservesPushDelivery(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	publishedAt := time.Now()
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("wake up")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("wake up")); err != nil {
 		t.Fatalf("failed to publish message: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func TestNotifySafetyNetPollDeliversMissedMessage(t *testing.T) {
 
 	// Publish BEFORE any consumer subscribes: the NOTIFY fires with nobody
 	// listening on this channel, so it is genuinely missed.
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("missed")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("missed")); err != nil {
 		t.Fatalf("failed to publish message: %v", err)
 	}
 

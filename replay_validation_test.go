@@ -39,7 +39,7 @@ func TestReplayOptionsPerformedByValidation(t *testing.T) {
 			t.Parallel()
 			err := pq.ReplayMessage(t.Context(), "queue", pgqueue.QueueTypeChannel,
 				uuid.Nil,
-				pgqueue.ReplayOptions{Confirm: true, PerformedBy: tc.performed},
+				pgqueue.ReplayOptions{PerformedBy: tc.performed},
 			)
 			if !errors.Is(err, pgqueue.ErrInvalidPerformedBy) {
 				t.Fatalf("want ErrInvalidPerformedBy, got %v", err)

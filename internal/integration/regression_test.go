@@ -28,7 +28,7 @@ func TestGracefulShutdownAcksInFlightMessage(t *testing.T) {
 	if err := pq.CreateChannel(ctx, channelName); err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("inflight")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("inflight")); err != nil {
 		t.Fatalf("failed to publish: %v", err)
 	}
 
@@ -132,7 +132,7 @@ func TestPubSubMaxPendingAgePreservesOtherSubscribers(t *testing.T) {
 		t.Fatalf("failed to subscribe fast: %v", err)
 	}
 
-	if _, err := pq.PublishTopic(ctx, topicName, []byte("shared")); err != nil {
+	if _, err := pq.Publish(ctx, topicName, []byte("shared")); err != nil {
 		t.Fatalf("failed to publish: %v", err)
 	}
 

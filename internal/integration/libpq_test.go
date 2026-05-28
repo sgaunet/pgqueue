@@ -105,15 +105,15 @@ func TestLibPQDriver(t *testing.T) {
 
 		receipts := make([]pgqueue.Receipt, libPQBatchSize)
 		for i := range receipts {
-			msg, err := pq.ConsumeFromChannel(ctx, "libpq-ack-chan", 30*time.Second)
+			msg, err := pq.ReceiveChannel(ctx, "libpq-ack-chan", pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
-				t.Fatalf("ConsumeFromChannel failed: %v", err)
+				t.Fatalf("ReceiveChannel failed: %v", err)
 			}
 			receipts[i] = msg.Receipt()
 		}
 
-		if err := pq.AckChannelBatch(ctx, "libpq-ack-chan", receipts); err != nil {
-			t.Fatalf("AckChannelBatch failed under lib/pq: %v", err)
+		if err := pq.AckBatch(ctx, receipts); err != nil {
+			t.Fatalf("AckBatch failed under lib/pq: %v", err)
 		}
 
 		stats, err := pq.GetStats(ctx, "libpq-ack-chan", pgqueue.QueueTypeChannel)
@@ -138,9 +138,9 @@ func TestLibPQDriver(t *testing.T) {
 		consume := func() []pgqueue.Receipt {
 			receipts := make([]pgqueue.Receipt, libPQBatchSize)
 			for i := range receipts {
-				msg, err := pq.ConsumeFromChannel(ctx, "libpq-nack-chan", 30*time.Second)
+				msg, err := pq.ReceiveChannel(ctx, "libpq-nack-chan", pgqueue.WithVisibilityTimeout(30*time.Second))
 				if err != nil {
-					t.Fatalf("ConsumeFromChannel failed: %v", err)
+					t.Fatalf("ReceiveChannel failed: %v", err)
 				}
 				receipts[i] = msg.Receipt()
 			}
@@ -148,8 +148,8 @@ func TestLibPQDriver(t *testing.T) {
 		}
 
 		// First nack: retry path (batchRetryMessages).
-		if err := pq.NackChannelBatch(ctx, "libpq-nack-chan", consume(), "retry"); err != nil {
-			t.Fatalf("NackChannelBatch retry failed under lib/pq: %v", err)
+		if err := pq.NackBatch(ctx, consume(), "retry"); err != nil {
+			t.Fatalf("NackBatch retry failed under lib/pq: %v", err)
 		}
 		stats, err := pq.GetStats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
 		if err != nil {
@@ -160,8 +160,8 @@ func TestLibPQDriver(t *testing.T) {
 		}
 
 		// Second nack: retry count exceeds max, DLQ path (batchMoveToDLQ).
-		if err := pq.NackChannelBatch(ctx, "libpq-nack-chan", consume(), "dlq"); err != nil {
-			t.Fatalf("NackChannelBatch DLQ failed under lib/pq: %v", err)
+		if err := pq.NackBatch(ctx, consume(), "dlq"); err != nil {
+			t.Fatalf("NackBatch DLQ failed under lib/pq: %v", err)
 		}
 		stats, err = pq.GetStats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
 		if err != nil {
@@ -185,15 +185,15 @@ func TestLibPQDriver(t *testing.T) {
 
 		receipts := make([]pgqueue.Receipt, libPQBatchSize)
 		for i := range receipts {
-			msg, err := pq.ConsumeFromTopic(ctx, "libpq-ack-topic", "sub", 30*time.Second)
+			msg, err := pq.ReceiveTopic(ctx, "libpq-ack-topic", "sub", pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
-				t.Fatalf("ConsumeFromTopic failed: %v", err)
+				t.Fatalf("ReceiveTopic failed: %v", err)
 			}
 			receipts[i] = msg.Receipt()
 		}
 
-		if err := pq.AckTopicBatch(ctx, "libpq-ack-topic", "sub", receipts); err != nil {
-			t.Fatalf("AckTopicBatch failed under lib/pq: %v", err)
+		if err := pq.AckBatch(ctx, receipts); err != nil {
+			t.Fatalf("AckBatch failed under lib/pq: %v", err)
 		}
 	})
 
@@ -213,9 +213,9 @@ func TestLibPQDriver(t *testing.T) {
 		consume := func() []pgqueue.Receipt {
 			receipts := make([]pgqueue.Receipt, libPQBatchSize)
 			for i := range receipts {
-				msg, err := pq.ConsumeFromTopic(ctx, "libpq-nack-topic", "sub", 30*time.Second)
+				msg, err := pq.ReceiveTopic(ctx, "libpq-nack-topic", "sub", pgqueue.WithVisibilityTimeout(30*time.Second))
 				if err != nil {
-					t.Fatalf("ConsumeFromTopic failed: %v", err)
+					t.Fatalf("ReceiveTopic failed: %v", err)
 				}
 				receipts[i] = msg.Receipt()
 			}
@@ -223,12 +223,12 @@ func TestLibPQDriver(t *testing.T) {
 		}
 
 		// First nack: retry path (batchRetryPubSubMessages).
-		if err := pq.NackTopicBatch(ctx, "libpq-nack-topic", "sub", consume(), "retry"); err != nil {
-			t.Fatalf("NackTopicBatch retry failed under lib/pq: %v", err)
+		if err := pq.NackBatch(ctx, consume(), "retry"); err != nil {
+			t.Fatalf("NackBatch retry failed under lib/pq: %v", err)
 		}
 		// Second nack: DLQ path (batchMoveToDLQ, pub/sub).
-		if err := pq.NackTopicBatch(ctx, "libpq-nack-topic", "sub", consume(), "dlq"); err != nil {
-			t.Fatalf("NackTopicBatch DLQ failed under lib/pq: %v", err)
+		if err := pq.NackBatch(ctx, consume(), "dlq"); err != nil {
+			t.Fatalf("NackBatch DLQ failed under lib/pq: %v", err)
 		}
 
 		dlqStats, err := pq.GetDLQStats(ctx, "libpq-nack-topic", pgqueue.QueueTypePubSub)
@@ -240,7 +240,6 @@ func TestLibPQDriver(t *testing.T) {
 		}
 
 		res, err := pq.ReplayDLQ(ctx, "libpq-nack-topic", pgqueue.QueueTypePubSub, pgqueue.ReplayOptions{
-			Confirm:     true,
 			PerformedBy: "test",
 		})
 		if err != nil {
@@ -261,17 +260,16 @@ func TestLibPQDriver(t *testing.T) {
 			if _, err := pq.Publish(ctx, "libpq-replay", []byte("replay")); err != nil {
 				t.Fatalf("Publish failed: %v", err)
 			}
-			msg, err := pq.ConsumeFromChannel(ctx, "libpq-replay", 30*time.Second)
+			msg, err := pq.ReceiveChannel(ctx, "libpq-replay", pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
-				t.Fatalf("ConsumeFromChannel failed: %v", err)
+				t.Fatalf("ReceiveChannel failed: %v", err)
 			}
-			if err := pq.AckChannel(ctx, "libpq-replay", msg.Receipt()); err != nil {
-				t.Fatalf("AckChannel failed: %v", err)
+			if err := pq.Ack(ctx, msg.Receipt()); err != nil {
+				t.Fatalf("Ack failed: %v", err)
 			}
 		}
 
 		count, err := pq.ReplayFrom(ctx, "libpq-replay", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
-			Confirm:     true,
 			PerformedBy: "test",
 		})
 		if err != nil {
@@ -292,17 +290,16 @@ func TestLibPQDriver(t *testing.T) {
 			t.Fatalf("Publish failed: %v", err)
 		}
 		for range 2 {
-			msg, err := pq.ConsumeFromChannel(ctx, "libpq-replay-dlq", 30*time.Second)
+			msg, err := pq.ReceiveChannel(ctx, "libpq-replay-dlq", pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
-				t.Fatalf("ConsumeFromChannel failed: %v", err)
+				t.Fatalf("ReceiveChannel failed: %v", err)
 			}
-			if err := pq.NackChannel(ctx, "libpq-replay-dlq", msg.Receipt(), "fail"); err != nil {
-				t.Fatalf("NackChannel failed: %v", err)
+			if err := pq.Nack(ctx, msg.Receipt(), "fail"); err != nil {
+				t.Fatalf("Nack failed: %v", err)
 			}
 		}
 
 		res, err := pq.ReplayDLQ(ctx, "libpq-replay-dlq", pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
-			Confirm:     true,
 			PerformedBy: "test",
 		})
 		if err != nil {

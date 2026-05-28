@@ -14,7 +14,7 @@ import (
 // publishOne publishes a single payload to a channel, failing the test on error.
 func publishOne(t *testing.T, pq *pgqueue.Queue, channel string, payload []byte) {
 	t.Helper()
-	if _, err := pq.PublishChannel(context.Background(), channel, payload); err != nil {
+	if _, err := pq.Publish(context.Background(), channel, payload); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 }
@@ -125,7 +125,7 @@ func TestReplayDLQLargeBacklogPaged(t *testing.T) {
 	}
 
 	res, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel,
-		pgqueue.ReplayOptions{Confirm: true})
+		pgqueue.ReplayOptions{})
 	if err != nil {
 		t.Fatalf("ReplayDLQ: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestQueueMaxRetriesZeroChannel(t *testing.T) {
 	if err := pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(0)); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("fail-me")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("fail-me")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
@@ -202,7 +202,7 @@ func TestQueueMaxRetriesZeroTopic(t *testing.T) {
 	if err := pq.Subscribe(ctx, topicName, subID); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	if _, err := pq.PublishTopic(ctx, topicName, []byte("fail-me")); err != nil {
+	if _, err := pq.Publish(ctx, topicName, []byte("fail-me")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 
@@ -246,7 +246,7 @@ func TestDefaultMaxRetriesZero(t *testing.T) {
 	if err := pq.CreateChannel(ctx, channelName); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, channelName, []byte("fail-me")); err != nil {
+	if _, err := pq.Publish(ctx, channelName, []byte("fail-me")); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 

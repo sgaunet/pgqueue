@@ -116,7 +116,7 @@ func TestPublish_LargePayload(t *testing.T) {
 	}
 	t.Logf("published 10MB message: %s", msgID)
 
-	msg, err := pq.ConsumeFromChannel(ctx, "large-payload", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "large-payload", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
@@ -183,15 +183,15 @@ func TestPubSub_SubscriberChurn(t *testing.T) {
 		t.Helper()
 		var payloads []string
 		for {
-			msg, err := pq.ConsumeFromTopic(ctx, "churn-topic", subscriberID, 30*time.Second)
+			msg, err := pq.ReceiveTopic(ctx, "churn-topic", subscriberID, pgqueue.WithVisibilityTimeout(30*time.Second))
+			if errors.Is(err, pgqueue.ErrQueueEmpty) {
+				break
+			}
 			if err != nil {
 				t.Fatalf("subscriber %s: consume error: %v", subscriberID, err)
 			}
-			if msg == nil {
-				break
-			}
 			payloads = append(payloads, string(msg.Payload))
-			if err := pq.AckTopic(ctx, "churn-topic", subscriberID, msg.Receipt()); err != nil {
+			if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 				t.Fatalf("subscriber %s: ack error: %v", subscriberID, err)
 			}
 		}
@@ -248,8 +248,9 @@ func TestPublish_InvalidMetadata(t *testing.T) {
 
 	t.Run("channel_value", func(t *testing.T) {
 		msgID, _ := pgqueue.NewUUIDv7()
-		_, err := pq.PublishWithID(ctx, "meta-fail", msgID, []byte("test"),
-			map[string]any{"bad": make(chan int)})
+		_, err := pq.Publish(ctx, "meta-fail", []byte("test"),
+			pgqueue.WithMessageID(msgID),
+			pgqueue.WithMessageMetadata(map[string]any{"bad": make(chan int)}))
 		if err == nil {
 			t.Fatal("expected error for channel metadata, got nil")
 		}
@@ -260,8 +261,9 @@ func TestPublish_InvalidMetadata(t *testing.T) {
 
 	t.Run("func_value", func(t *testing.T) {
 		msgID, _ := pgqueue.NewUUIDv7()
-		_, err := pq.PublishWithID(ctx, "meta-fail", msgID, []byte("test"),
-			map[string]any{"bad": func() {}})
+		_, err := pq.Publish(ctx, "meta-fail", []byte("test"),
+			pgqueue.WithMessageID(msgID),
+			pgqueue.WithMessageMetadata(map[string]any{"bad": func() {}}))
 		if err == nil {
 			t.Fatal("expected error for func metadata, got nil")
 		}
@@ -303,7 +305,7 @@ func TestPublish_ContextTimeout(t *testing.T) {
 		defer cancel()
 		time.Sleep(5 * time.Millisecond) // Ensure context is expired
 
-		_, err := pq.ConsumeFromChannel(timeoutCtx, "ctx-timeout", 30*time.Second)
+		_, err := pq.ReceiveChannel(timeoutCtx, "ctx-timeout", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err == nil {
 			t.Fatal("expected error with expired context, got nil")
 		}
@@ -345,8 +347,8 @@ func TestPublishWithID_ConcurrentDuplicates(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, pubErr := pq.PublishWithID(ctx, "dedup-concurrent", messageID,
-				[]byte("dedup-payload"), nil)
+			_, pubErr := pq.Publish(ctx, "dedup-concurrent", []byte("dedup-payload"),
+				pgqueue.WithMessageID(messageID))
 			if pubErr == nil {
 				successCount.Add(1)
 			} else if errors.Is(pubErr, pgqueue.ErrDuplicateMessageID) {
@@ -400,7 +402,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 			t.Fatalf("failed to publish: %v", err)
 		}
 
-		msg, err := pq.ConsumeFromChannel(ctx, "binary-null", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "binary-null", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -423,7 +425,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 			t.Fatalf("failed to publish: %v", err)
 		}
 
-		msg, err := pq.ConsumeFromChannel(ctx, "binary-nonutf8", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "binary-nonutf8", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -446,7 +448,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 			t.Fatalf("failed to publish empty payload: %v", err)
 		}
 
-		msg, err := pq.ConsumeFromChannel(ctx, "binary-empty", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "binary-empty", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -472,7 +474,7 @@ func TestBinaryAndEmptyPayload(t *testing.T) {
 			t.Fatalf("failed to publish: %v", err)
 		}
 
-		msg, err := pq.ConsumeFromChannel(ctx, "binary-mixed", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "binary-mixed", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
@@ -503,7 +505,7 @@ func TestT022_NackErrorMsgUTF8TruncationBoundary(t *testing.T) {
 		t.Fatalf("failed to publish: %v", err)
 	}
 
-	msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil || msg == nil {
 		t.Fatalf("consume failed: %v", err)
 	}
@@ -515,7 +517,7 @@ func TestT022_NackErrorMsgUTF8TruncationBoundary(t *testing.T) {
 	// Fill 1022 bytes with ASCII 'a', then append "世界" (6 bytes), totalling 1028.
 	errorMsg := strings.Repeat("a", 1022) + "世界"
 
-	if err := pq.NackChannel(ctx, queueName, msg.Receipt(), errorMsg); err != nil {
+	if err := pq.Nack(ctx, msg.Receipt(), errorMsg); err != nil {
 		t.Fatalf("nack failed: %v", err)
 	}
 

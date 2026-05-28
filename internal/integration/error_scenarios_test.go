@@ -54,13 +54,13 @@ func TestConsumeFromNonExistentQueue(t *testing.T) {
 	ctx := context.Background()
 
 	// Try to consume from non-existent channel
-	_, err := pq.ConsumeFromChannel(ctx, "non-existent", 30*time.Second)
+	_, err := pq.ReceiveChannel(ctx, "non-existent", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err == nil {
 		t.Error("expected error when consuming from non-existent channel, got nil")
 	}
 
 	// Try to consume from non-existent topic
-	_, err = pq.ConsumeFromTopic(ctx, "non-existent", "subscriber-1", 30*time.Second)
+	_, err = pq.ReceiveTopic(ctx, "non-existent", "subscriber-1", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err == nil {
 		t.Error("expected error when consuming from non-existent topic, got nil")
 	}
@@ -81,7 +81,7 @@ func TestAckNonExistentMessage(t *testing.T) {
 
 	// Try to ack non-existent message
 	fakeID, _ := pgqueue.NewUUIDv7()
-	err = pq.AckChannel(ctx, "ack-error-test", pgqueue.Receipt{MessageID: fakeID})
+	err = pq.Ack(ctx, pgqueue.Receipt{MessageID: fakeID, QueueName: "ack-error-test", QueueType: pgqueue.QueueTypeChannel})
 	if err == nil {
 		t.Error("expected error when acking non-existent message, got nil")
 	}
@@ -279,13 +279,13 @@ func TestPublishWithDuplicateMessageID(t *testing.T) {
 
 	// Publish a message with a specific ID
 	messageID, _ := pgqueue.NewUUIDv7()
-	_, err = pq.PublishWithID(ctx, "dedup-test", messageID, []byte("first message"), nil)
+	_, err = pq.Publish(ctx, "dedup-test", []byte("first message"), pgqueue.WithMessageID(messageID))
 	if err != nil {
 		t.Fatalf("failed to publish first message: %v", err)
 	}
 
 	// Try to publish with the same message ID (should be deduplicated)
-	_, err = pq.PublishWithID(ctx, "dedup-test", messageID, []byte("duplicate message"), nil)
+	_, err = pq.Publish(ctx, "dedup-test", []byte("duplicate message"), pgqueue.WithMessageID(messageID))
 	if err == nil {
 		t.Error("expected error when publishing duplicate message ID, got nil")
 	}
@@ -323,64 +323,9 @@ func TestConsumeWithExpiredContext(t *testing.T) {
 	defer cancel()
 
 	// Try to consume with expired context
-	_, err = pq.ConsumeFromChannel(expiredCtx, "context-test", 30*time.Second)
+	_, err = pq.ReceiveChannel(expiredCtx, "context-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err == nil {
 		t.Error("expected error when consuming with expired context, got nil")
-	}
-}
-
-// TestReplayWithoutConfirmation tests replay operations without confirmation
-func TestReplayWithoutConfirmation(t *testing.T) {
-	pq, _, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// Create a channel and publish a message
-	err := pq.CreateChannel(ctx, "replay-confirm-test")
-	if err != nil {
-		t.Fatalf("failed to create channel: %v", err)
-	}
-
-	_, err = pq.Publish(ctx, "replay-confirm-test", []byte("test message"))
-	if err != nil {
-		t.Fatalf("failed to publish message: %v", err)
-	}
-
-	// Consume and ack the message
-	msg, err := pq.ConsumeFromChannel(ctx, "replay-confirm-test", 30*time.Second)
-	if err != nil {
-		t.Fatalf("failed to consume message: %v", err)
-	}
-	if err := pq.AckChannel(ctx, "replay-confirm-test", msg.Receipt()); err != nil {
-		t.Fatalf("failed to ack message: %v", err)
-	}
-
-	// Try to replay without confirmation (should fail)
-	_, err = pq.ReplayFrom(ctx, "replay-confirm-test", pgqueue.QueueTypeChannel, time.Now().Add(-1*time.Hour), pgqueue.ReplayOptions{
-		Confirm: false,
-		DryRun:  false,
-	})
-	if err == nil {
-		t.Error("expected error when replaying without confirmation, got nil")
-	}
-
-	// Try to replay message without confirmation (should fail)
-	err = pq.ReplayMessage(ctx, "replay-confirm-test", pgqueue.QueueTypeChannel, msg.ID, pgqueue.ReplayOptions{
-		Confirm: false,
-		DryRun:  false,
-	})
-	if err == nil {
-		t.Error("expected error when replaying message without confirmation, got nil")
-	}
-
-	// Try to replay DLQ without confirmation (should fail)
-	_, err = pq.ReplayDLQ(ctx, "replay-confirm-test", pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
-		Confirm: false,
-		DryRun:  false,
-	})
-	if err == nil {
-		t.Error("expected error when replaying DLQ without confirmation, got nil")
 	}
 }
 
@@ -405,14 +350,14 @@ func TestNackExceedsMaxRetries(t *testing.T) {
 
 	// Nack the message 3 times (should move to DLQ after 3rd nack)
 	for i := 0; i < 3; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "max-retry-test", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "max-retry-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message on attempt %d: %v", i+1, err)
 		}
 		if msg == nil {
 			t.Fatalf("consume returned nil on attempt %d", i+1)
 		}
-		if err := pq.NackChannel(ctx, "max-retry-test", msg.Receipt(), "test failure"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "test failure"); err != nil {
 			t.Fatalf("failed to nack message on attempt %d: %v", i+1, err)
 		}
 	}
@@ -476,8 +421,8 @@ func TestInvalidSubscriberID(t *testing.T) {
 		if err := pq.Unsubscribe(ctx, "sub-id-test", id); err == nil {
 			t.Errorf("Unsubscribe: expected error for invalid subscriber ID %q, got nil", id)
 		}
-		if _, err := pq.ConsumeFromTopic(ctx, "sub-id-test", id, 30*time.Second); err == nil {
-			t.Errorf("ConsumeFromTopic: expected error for invalid subscriber ID %q, got nil", id)
+		if _, err := pq.ReceiveTopic(ctx, "sub-id-test", id, pgqueue.WithVisibilityTimeout(30*time.Second)); err == nil {
+			t.Errorf("ReceiveTopic: expected error for invalid subscriber ID %q, got nil", id)
 		}
 	}
 
@@ -514,26 +459,26 @@ func TestVisibilityTimeoutBounds(t *testing.T) {
 	}
 
 	// Zero timeout should be rejected
-	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 0)
+	_, err = pq.ReceiveChannel(ctx, "vis-test", pgqueue.WithVisibilityTimeout(0))
 	if !errors.Is(err, pgqueue.ErrInvalidVisibilityTimeout) {
 		t.Errorf("zero timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
 	}
 
 	// Sub-millisecond timeout should be rejected
-	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 500*time.Microsecond)
+	_, err = pq.ReceiveChannel(ctx, "vis-test", pgqueue.WithVisibilityTimeout(500*time.Microsecond))
 	if !errors.Is(err, pgqueue.ErrInvalidVisibilityTimeout) {
 		t.Errorf("500µs timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
 	}
 
 	// Over 24h should be rejected
-	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 25*time.Hour)
+	_, err = pq.ReceiveChannel(ctx, "vis-test", pgqueue.WithVisibilityTimeout(25*time.Hour))
 	if !errors.Is(err, pgqueue.ErrInvalidVisibilityTimeout) {
 		t.Errorf("25h timeout: expected ErrInvalidVisibilityTimeout, got %v", err)
 	}
 
-	// Valid timeout should work (no message to consume, but no error)
-	_, err = pq.ConsumeFromChannel(ctx, "vis-test", 30*time.Second)
-	if err != nil {
+	// Valid timeout should work (no message to consume, ErrQueueEmpty is expected)
+	_, err = pq.ReceiveChannel(ctx, "vis-test", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if err != nil && !errors.Is(err, pgqueue.ErrQueueEmpty) {
 		t.Errorf("valid timeout: unexpected error %v", err)
 	}
 }
@@ -569,46 +514,6 @@ func TestGetStatsForNonExistentQueue(t *testing.T) {
 	_, err = pq.GetStats(ctx, "non-existent", pgqueue.QueueTypePubSub)
 	if err == nil {
 		t.Error("expected error when getting stats for non-existent topic, got nil")
-	}
-}
-
-// TestPurgeQueueWithoutConfirmation tests purging without confirmation
-func TestPurgeQueueWithoutConfirmation(t *testing.T) {
-	pq, _, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// Create a channel
-	err := pq.CreateChannel(ctx, "purge-confirm-test")
-	if err != nil {
-		t.Fatalf("failed to create channel: %v", err)
-	}
-
-	// Publish some messages
-	for i := 0; i < 5; i++ {
-		_, err := pq.Publish(ctx, "purge-confirm-test", []byte("test message"))
-		if err != nil {
-			t.Fatalf("failed to publish message: %v", err)
-		}
-	}
-
-	// Create garbage collector
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
-
-	// Try to purge without confirmation (should fail)
-	err = gc.PurgeQueue(ctx, "purge-confirm-test", pgqueue.QueueTypeChannel, false)
-	if err == nil {
-		t.Error("expected error when purging without confirmation, got nil")
-	}
-
-	// Verify messages still exist
-	depth, err := pq.GetQueueDepth(ctx, "purge-confirm-test", pgqueue.QueueTypeChannel)
-	if err != nil {
-		t.Fatalf("failed to get queue depth: %v", err)
-	}
-	if depth != 5 {
-		t.Errorf("expected 5 messages after failed purge, got %d", depth)
 	}
 }
 
@@ -742,19 +647,19 @@ func TestT020_StaleReceiptAfterNackRetryIsErrClaimExpired(t *testing.T) {
 	}
 
 	// First consume: get a receipt
-	msg1, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	msg1, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil || msg1 == nil {
 		t.Fatalf("first consume failed: %v", err)
 	}
 	staleReceipt := msg1.Receipt()
 
 	// Nack: message goes back to pending with a new claim_id=NULL (status=pending)
-	if err := pq.NackChannel(ctx, queueName, staleReceipt, "retry"); err != nil {
+	if err := pq.Nack(ctx, staleReceipt, "retry"); err != nil {
 		t.Fatalf("nack failed: %v", err)
 	}
 
 	// Second consume: message is redelivered with a NEW claim
-	msg2, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	msg2, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil || msg2 == nil {
 		t.Fatalf("second consume failed: %v", err)
 	}
@@ -764,13 +669,13 @@ func TestT020_StaleReceiptAfterNackRetryIsErrClaimExpired(t *testing.T) {
 	}
 
 	// Now try to ack using the STALE first receipt: must return ErrClaimExpired
-	err = pq.AckChannel(ctx, queueName, staleReceipt)
+	err = pq.Ack(ctx, staleReceipt)
 	if !errors.Is(err, pgqueue.ErrClaimExpired) {
 		t.Errorf("expected ErrClaimExpired for stale receipt, got: %v", err)
 	}
 
 	// The valid receipt must still work
-	if err := pq.AckChannel(ctx, queueName, msg2.Receipt()); err != nil {
+	if err := pq.Ack(ctx, msg2.Receipt()); err != nil {
 		t.Errorf("valid ack should succeed: %v", err)
 	}
 }

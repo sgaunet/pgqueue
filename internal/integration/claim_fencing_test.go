@@ -24,23 +24,23 @@ func TestClaimFencing(t *testing.T) {
 		if _, err := pq.Publish(ctx, "fence-chan", []byte("payload")); err != nil {
 			t.Fatalf("publish: %v", err)
 		}
-		msgA, err := pq.ConsumeFromChannel(ctx, "fence-chan", 50*time.Millisecond)
+		msgA, err := pq.ReceiveChannel(ctx, "fence-chan", pgqueue.WithVisibilityTimeout(50*time.Millisecond))
 		if err != nil || msgA == nil {
 			t.Fatalf("consumer A consume: msg=%v err=%v", msgA, err)
 		}
 		time.Sleep(100 * time.Millisecond) // let A's visibility timeout lapse
-		msgB, err := pq.ConsumeFromChannel(ctx, "fence-chan", 30*time.Second)
+		msgB, err := pq.ReceiveChannel(ctx, "fence-chan", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msgB == nil {
 			t.Fatalf("consumer B reclaim: msg=%v err=%v", msgB, err)
 		}
 		if msgA.ClaimID == msgB.ClaimID {
 			t.Fatal("expected B to receive a fresh claim token")
 		}
-		if err := pq.AckChannel(ctx, "fence-chan", msgA.Receipt()); !errors.Is(err, pgqueue.ErrClaimExpired) {
-			t.Errorf("stale AckChannel: got %v, want ErrClaimExpired", err)
+		if err := pq.Ack(ctx, msgA.Receipt()); !errors.Is(err, pgqueue.ErrClaimExpired) {
+			t.Errorf("stale Ack: got %v, want ErrClaimExpired", err)
 		}
-		if err := pq.AckChannel(ctx, "fence-chan", msgB.Receipt()); err != nil {
-			t.Errorf("current AckChannel: %v", err)
+		if err := pq.Ack(ctx, msgB.Receipt()); err != nil {
+			t.Errorf("current Ack: %v", err)
 		}
 	})
 
@@ -51,20 +51,20 @@ func TestClaimFencing(t *testing.T) {
 		if _, err := pq.Publish(ctx, "fence-chan-n", []byte("payload")); err != nil {
 			t.Fatalf("publish: %v", err)
 		}
-		msgA, err := pq.ConsumeFromChannel(ctx, "fence-chan-n", 50*time.Millisecond)
+		msgA, err := pq.ReceiveChannel(ctx, "fence-chan-n", pgqueue.WithVisibilityTimeout(50*time.Millisecond))
 		if err != nil || msgA == nil {
 			t.Fatalf("consumer A consume: msg=%v err=%v", msgA, err)
 		}
 		time.Sleep(100 * time.Millisecond)
-		msgB, err := pq.ConsumeFromChannel(ctx, "fence-chan-n", 30*time.Second)
+		msgB, err := pq.ReceiveChannel(ctx, "fence-chan-n", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msgB == nil {
 			t.Fatalf("consumer B reclaim: msg=%v err=%v", msgB, err)
 		}
-		if err := pq.NackChannel(ctx, "fence-chan-n", msgA.Receipt(), "stale"); !errors.Is(err, pgqueue.ErrClaimExpired) {
-			t.Errorf("stale NackChannel: got %v, want ErrClaimExpired", err)
+		if err := pq.Nack(ctx, msgA.Receipt(), "stale"); !errors.Is(err, pgqueue.ErrClaimExpired) {
+			t.Errorf("stale Nack: got %v, want ErrClaimExpired", err)
 		}
-		if err := pq.AckChannel(ctx, "fence-chan-n", msgB.Receipt()); err != nil {
-			t.Errorf("current AckChannel: %v", err)
+		if err := pq.Ack(ctx, msgB.Receipt()); err != nil {
+			t.Errorf("current Ack: %v", err)
 		}
 	})
 
@@ -78,23 +78,23 @@ func TestClaimFencing(t *testing.T) {
 		if _, err := pq.Publish(ctx, "fence-topic", []byte("payload")); err != nil {
 			t.Fatalf("publish: %v", err)
 		}
-		msgA, err := pq.ConsumeFromTopic(ctx, "fence-topic", "sub-1", 50*time.Millisecond)
+		msgA, err := pq.ReceiveTopic(ctx, "fence-topic", "sub-1", pgqueue.WithVisibilityTimeout(50*time.Millisecond))
 		if err != nil || msgA == nil {
 			t.Fatalf("consumer A consume: msg=%v err=%v", msgA, err)
 		}
 		time.Sleep(100 * time.Millisecond)
-		msgB, err := pq.ConsumeFromTopic(ctx, "fence-topic", "sub-1", 30*time.Second)
+		msgB, err := pq.ReceiveTopic(ctx, "fence-topic", "sub-1", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msgB == nil {
 			t.Fatalf("consumer B reclaim: msg=%v err=%v", msgB, err)
 		}
 		if msgA.ClaimID == msgB.ClaimID {
 			t.Fatal("expected B to receive a fresh claim token")
 		}
-		if err := pq.AckTopic(ctx, "fence-topic", "sub-1", msgA.Receipt()); !errors.Is(err, pgqueue.ErrClaimExpired) {
-			t.Errorf("stale AckTopic: got %v, want ErrClaimExpired", err)
+		if err := pq.Ack(ctx, msgA.Receipt()); !errors.Is(err, pgqueue.ErrClaimExpired) {
+			t.Errorf("stale Ack: got %v, want ErrClaimExpired", err)
 		}
-		if err := pq.AckTopic(ctx, "fence-topic", "sub-1", msgB.Receipt()); err != nil {
-			t.Errorf("current AckTopic: %v", err)
+		if err := pq.Ack(ctx, msgB.Receipt()); err != nil {
+			t.Errorf("current Ack: %v", err)
 		}
 	})
 }
@@ -127,12 +127,12 @@ func TestAckMissClassificationStable(t *testing.T) {
 		if _, err := pq.Publish(ctx, channelName, []byte("payload")); err != nil {
 			t.Fatalf("run %d: publish: %v", i, err)
 		}
-		msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msg == nil {
 			t.Fatalf("run %d: consume: msg=%v err=%v", i, msg, err)
 		}
 		// First ack succeeds.
-		if err := pq.AckChannel(ctx, channelName, msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("run %d: first ack: %v", i, err)
 		}
 
@@ -145,13 +145,13 @@ func TestAckMissClassificationStable(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			staleErr = pq.AckChannel(ctx, channelName, msg.Receipt())
+			staleErr = pq.Ack(ctx, msg.Receipt())
 		}()
 		go func() {
 			defer wg.Done()
 			// A reclaim attempt: there is nothing pending, so this just races
 			// the ack-miss classification path.
-			_, _ = pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+			_, _ = pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
 		}()
 		wg.Wait()
 
@@ -202,12 +202,12 @@ func TestAckTopicMissClassificationStable(t *testing.T) {
 		if _, err := pq.Publish(ctx, topicName, []byte("payload")); err != nil {
 			t.Fatalf("run %d: publish: %v", i, err)
 		}
-		msg, err := pq.ConsumeFromTopic(ctx, topicName, subID, 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, topicName, subID, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msg == nil {
 			t.Fatalf("run %d: consume: msg=%v err=%v", i, msg, err)
 		}
 		// First ack succeeds.
-		if err := pq.AckTopic(ctx, topicName, subID, msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("run %d: first ack: %v", i, err)
 		}
 
@@ -219,11 +219,11 @@ func TestAckTopicMissClassificationStable(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			staleErr = pq.AckTopic(ctx, topicName, subID, msg.Receipt())
+			staleErr = pq.Ack(ctx, msg.Receipt())
 		}()
 		go func() {
 			defer wg.Done()
-			_, _ = pq.ConsumeFromTopic(ctx, topicName, subID, 30*time.Second)
+			_, _ = pq.ReceiveTopic(ctx, topicName, subID, pgqueue.WithVisibilityTimeout(30*time.Second))
 		}()
 		wg.Wait()
 

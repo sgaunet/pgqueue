@@ -73,13 +73,12 @@ func (pq *Queue) ReceiveChannel(
 	if err := pq.checkClosed(); err != nil {
 		return nil, err
 	}
+	// applyConsumeOptions fills the default when WithVisibilityTimeout is absent;
+	// an explicit out-of-range value (including 0) flows through to
+	// consumeFromChannel and is rejected with ErrInvalidVisibilityTimeout.
 	o := applyConsumeOptions(opts)
-	vt := o.visibilityTimeout
-	if vt <= 0 {
-		vt = defaultVisibilityTimeout
-	}
 
-	msg, err := pq.ConsumeFromChannel(ctx, name, vt)
+	msg, err := pq.consumeFromChannel(ctx, name, o.visibilityTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -111,12 +110,8 @@ func (pq *Queue) ReceiveTopic(
 		return nil, err
 	}
 	o := applyConsumeOptions(opts)
-	vt := o.visibilityTimeout
-	if vt <= 0 {
-		vt = defaultVisibilityTimeout
-	}
 
-	msg, err := pq.ConsumeFromTopic(ctx, name, subscriberID, vt)
+	msg, err := pq.consumeFromTopic(ctx, name, subscriberID, o.visibilityTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -163,9 +158,9 @@ func (pq *Queue) ackReceipt(ctx context.Context, r Receipt) error {
 	var err error
 	switch r.QueueType {
 	case QueueTypeChannel:
-		err = pq.AckChannel(ctx, r.QueueName, r)
+		err = pq.ackChannel(ctx, r.QueueName, r)
 	case QueueTypePubSub:
-		err = pq.AckTopic(ctx, r.QueueName, r.SubscriberID, r)
+		err = pq.ackTopic(ctx, r.QueueName, r.SubscriberID, r)
 	default:
 		err = ErrReceiptMissingQueueType
 	}
@@ -268,9 +263,9 @@ func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) error {
 		var err error
 		switch k.qt {
 		case QueueTypeChannel:
-			err = pq.AckChannelBatch(ctx, k.queueName, receipts)
+			err = pq.ackChannelBatch(ctx, k.queueName, receipts)
 		case QueueTypePubSub:
-			err = pq.AckTopicBatch(ctx, k.queueName, k.subscriberID, receipts)
+			err = pq.ackTopicBatch(ctx, k.queueName, k.subscriberID, receipts)
 		default:
 			continue
 		}
@@ -305,9 +300,9 @@ func (pq *Queue) NackBatch(
 		var err error
 		switch k.qt {
 		case QueueTypeChannel:
-			err = pq.NackChannelBatch(ctx, k.queueName, receipts, reason, opts...)
+			err = pq.nackChannelBatch(ctx, k.queueName, receipts, reason, opts...)
 		case QueueTypePubSub:
-			err = pq.NackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason, opts...)
+			err = pq.nackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason, opts...)
 		default:
 			continue
 		}

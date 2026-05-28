@@ -10,8 +10,7 @@ import (
 // *Queue satisfies this interface. Use it to decouple code from the concrete
 // implementation or to substitute a fake.Queue in unit tests.
 type Publisher interface {
-	PublishChannel(ctx context.Context, name string, payload []byte, opts ...PublishOption) (uuid.UUID, error)
-	PublishTopic(ctx context.Context, name string, payload []byte, opts ...PublishOption) (uuid.UUID, error)
+	Publish(ctx context.Context, name string, payload []byte, opts ...PublishOption) (uuid.UUID, error)
 }
 
 // ChannelConsumer is the interface for consuming messages from a point-to-point

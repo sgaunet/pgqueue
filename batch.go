@@ -99,14 +99,14 @@ func (pq *Queue) publishBatchResolved(
 	)
 }
 
-// AckChannelBatch acknowledges multiple messages from a channel in a single operation.
+// ackChannelBatch acknowledges multiple messages from a channel in a single operation.
 // Returns ErrMessageAlreadyAcked only if no messages were updated.
 // Receipts that were not in processing state under their claim token (including
 // expired claims) are silently skipped and nil is returned (partial success);
 // batch operations do not surface ErrClaimExpired per receipt. Each silently
 // skipped receipt increments the RecordAckAfterExpired metric so operators can
 // detect partial success and the corresponding redeliveries.
-func (pq *Queue) AckChannelBatch(
+func (pq *Queue) ackChannelBatch(
 	ctx context.Context,
 	channelName string,
 	receipts []Receipt,
@@ -156,14 +156,14 @@ func (pq *Queue) AckChannelBatch(
 	return nil
 }
 
-// AckTopicBatch acknowledges multiple messages for a subscriber in a single operation.
+// ackTopicBatch acknowledges multiple messages for a subscriber in a single operation.
 // Returns ErrMessageAlreadyAcked only if no messages were updated.
 // Receipts that were not in processing state under their claim token (including
 // expired claims) are silently skipped and nil is returned (partial success);
 // batch operations do not surface ErrClaimExpired per receipt. Each silently
 // skipped receipt increments the RecordAckAfterExpired metric so operators can
 // detect partial success and the corresponding redeliveries.
-func (pq *Queue) AckTopicBatch(
+func (pq *Queue) ackTopicBatch(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
@@ -218,14 +218,14 @@ func (pq *Queue) AckTopicBatch(
 	return nil
 }
 
-// NackChannelBatch negatively acknowledges multiple messages from a channel.
+// nackChannelBatch negatively acknowledges multiple messages from a channel.
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
 // A WithRetryDelay option overrides the computed backoff delay for the batch.
 // Receipts whose claim no longer matches a processing message are silently
 // skipped; each skipped receipt increments the RecordAckAfterExpired metric so
 // operators can detect partial success and the corresponding redeliveries.
-func (pq *Queue) NackChannelBatch(
+func (pq *Queue) nackChannelBatch(
 	ctx context.Context,
 	channelName string,
 	receipts []Receipt,
@@ -280,14 +280,14 @@ func (pq *Queue) NackChannelBatch(
 	return nil
 }
 
-// NackTopicBatch negatively acknowledges multiple messages for a subscriber from a topic.
+// nackTopicBatch negatively acknowledges multiple messages for a subscriber from a topic.
 // Messages that exceed max retries are moved to DLQ; others are retried.
 // The errorMsg is truncated to 1024 characters if it exceeds that length.
 // A WithRetryDelay option overrides the computed backoff delay for the batch.
 // Receipts whose claim no longer matches a processing subscription are silently
 // skipped; each skipped receipt increments the RecordAckAfterExpired metric so
 // operators can detect partial success and the corresponding redeliveries.
-func (pq *Queue) NackTopicBatch(
+func (pq *Queue) nackTopicBatch(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
@@ -362,24 +362,6 @@ func (pq *Queue) getTopicMetadata(
 	return queueMeta, nil
 }
 
-// getChannelMetadata retrieves channel metadata, translating not-found to a
-// name-prefixed ErrQueueNotFound.
-func (pq *Queue) getChannelMetadata(
-	ctx context.Context,
-	channelName string,
-) (*QueueMetadata, error) {
-	queueMeta, err := pq.getQueueMetadata(
-		ctx, string(QueueTypeChannel), channelName,
-	)
-	if err != nil {
-		if errors.Is(err, ErrQueueNotFound) {
-			return nil, fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
-		}
-		return nil, fmt.Errorf("failed to get channel metadata: %w", err)
-	}
-	return queueMeta, nil
-}
-
 // processNackBatch partitions messages into retry vs DLQ and processes each
 // group. retryDelay, when positive, overrides the computed backoff delay for
 // every retried message (WithRetryDelay); zero uses the queue's BackoffPolicy.
@@ -396,7 +378,7 @@ func (pq *Queue) processNackBatch(
 	var dlqMessages []batchDLQMessage
 
 	for _, s := range states {
-		maxRetry := pq.config.DefaultMaxRetries
+		maxRetry := pq.cfg.defaultMaxRetries
 		if s.maxRetries.Valid {
 			maxRetry = int(s.maxRetries.Int32)
 		}

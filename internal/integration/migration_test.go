@@ -110,7 +110,7 @@ func TestVisibilityTimeoutReclaim(t *testing.T) {
 	}
 
 	// Consume but never ack, with a short visibility timeout.
-	first, err := pq.ConsumeFromChannel(ctx, "reclaim", 100*time.Millisecond)
+	first, err := pq.ReceiveChannel(ctx, "reclaim", pgqueue.WithVisibilityTimeout(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("first consume failed: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestVisibilityTimeoutReclaim(t *testing.T) {
 	}
 
 	// Before the timeout expires the message is invisible.
-	if msg, cErr := pq.ConsumeFromChannel(ctx, "reclaim", time.Second); cErr != nil {
+	if msg, cErr := pq.ReceiveChannel(ctx, "reclaim", pgqueue.WithVisibilityTimeout(time.Second)); cErr != nil && !errors.Is(cErr, pgqueue.ErrQueueEmpty) {
 		t.Fatalf("consume during timeout failed: %v", cErr)
 	} else if msg != nil {
 		t.Fatalf("message should be invisible before its visibility timeout expires")
@@ -127,7 +127,7 @@ func TestVisibilityTimeoutReclaim(t *testing.T) {
 
 	// After the timeout expires it is reclaimed by consume — no GC involved.
 	time.Sleep(200 * time.Millisecond)
-	second, err := pq.ConsumeFromChannel(ctx, "reclaim", time.Second)
+	second, err := pq.ReceiveChannel(ctx, "reclaim", pgqueue.WithVisibilityTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("reclaim consume failed: %v", err)
 	}

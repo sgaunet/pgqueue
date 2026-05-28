@@ -215,24 +215,3 @@ func applyConfigOptions(opts []Option) queueConfig {
 	c.backoffPolicy = c.backoffPolicy.normalized()
 	return c
 }
-
-// configFromLegacy converts the old Config struct fields into functional options.
-// It is used by the backward-compatible Init constructor.
-func configFromLegacy(cfg Config) []Option {
-	opts := []Option{
-		WithMaxMessageSize(cfg.MaxMessageSize),
-		WithDefaultTTL(cfg.DefaultTTL),
-		WithMaxQueues(cfg.MaxQueues),
-	}
-	// The legacy Config keeps its documented "0 = use default" semantics: only
-	// forward a positive value. WithDefaultMaxRetries(0) — which now means "no
-	// retries" — is reachable solely via the functional-options API. Negative
-	// values are already rejected by validateConfig before this is reached.
-	if cfg.DefaultMaxRetries > 0 {
-		opts = append(opts, WithDefaultMaxRetries(cfg.DefaultMaxRetries))
-	}
-	if cfg.Logger != nil {
-		opts = append(opts, WithLogger(cfg.Logger))
-	}
-	return opts
-}

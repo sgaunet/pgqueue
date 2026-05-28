@@ -40,11 +40,11 @@ func TestGetStats(t *testing.T) {
 
 	// Consume and ack 5 messages
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "stats-test", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "stats-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "stats-test", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -111,7 +111,7 @@ func TestGetQueueDepth(t *testing.T) {
 
 	// Consume 10 messages
 	for i := 0; i < 10; i++ {
-		_, err := pq.ConsumeFromChannel(ctx, "depth-test", 30*time.Second)
+		_, err := pq.ReceiveChannel(ctx, "depth-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
@@ -163,11 +163,11 @@ func TestGetSubscriberLag(t *testing.T) {
 
 	// Consume and ack 5 messages
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromTopic(ctx, "lag-test", "subscriber-1", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "lag-test", "subscriber-1", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "lag-test", "subscriber-1", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -216,11 +216,11 @@ func TestGetDLQStats(t *testing.T) {
 
 		// Consume and nack twice to send to DLQ
 		for j := 0; j < 2; j++ {
-			msg, err := pq.ConsumeFromChannel(ctx, "dlq-stats-test", 30*time.Second)
+			msg, err := pq.ReceiveChannel(ctx, "dlq-stats-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
 				t.Fatalf("failed to consume message: %v", err)
 			}
-			if err := pq.NackChannel(ctx, "dlq-stats-test", msg.Receipt(), "test failure"); err != nil {
+			if err := pq.Nack(ctx, msg.Receipt(), "test failure"); err != nil {
 				t.Fatalf("failed to nack message: %v", err)
 			}
 		}
@@ -276,11 +276,11 @@ func TestGetSubscriberHealth(t *testing.T) {
 
 	// sub-healthy consumes and acks all messages
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromTopic(ctx, "health-test", "sub-healthy", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "health-test", "sub-healthy", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "health-test", "sub-healthy", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -347,7 +347,7 @@ func TestGetSubscriberHealthStuckMessages(t *testing.T) {
 	// (A short timeout would let each consume reclaim the previous, now-expired
 	// message instead of a fresh one.)
 	for i := 0; i < 3; i++ {
-		_, err := pq.ConsumeFromTopic(ctx, "stuck-test", "sub-stuck", time.Minute)
+		_, err := pq.ReceiveTopic(ctx, "stuck-test", "sub-stuck", pgqueue.WithVisibilityTimeout(time.Minute))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
@@ -411,18 +411,18 @@ func TestGetUnhealthySubscribers(t *testing.T) {
 
 	// sub-ok acks all its messages on topic-a
 	for i := 0; i < 3; i++ {
-		msg, err := pq.ConsumeFromTopic(ctx, "unhealthy-a", "sub-ok", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "unhealthy-a", "sub-ok", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "unhealthy-a", "sub-ok", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack: %v", err)
 		}
 	}
 
 	// sub-stuck consumes on topic-a but doesn't ack — force expired visibility
 	for i := 0; i < 3; i++ {
-		_, err := pq.ConsumeFromTopic(ctx, "unhealthy-a", "sub-stuck", 1*time.Millisecond)
+		_, err := pq.ReceiveTopic(ctx, "unhealthy-a", "sub-stuck", pgqueue.WithVisibilityTimeout(1*time.Millisecond))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}

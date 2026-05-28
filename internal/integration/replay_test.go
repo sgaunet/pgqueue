@@ -36,11 +36,11 @@ func TestReplayFrom(t *testing.T) {
 
 	// Consume and ack all messages
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "replay-test", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "replay-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "replay-test", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -65,15 +65,8 @@ func TestReplayFrom(t *testing.T) {
 		t.Errorf("expected dry-run to report 5 messages, got %d", count)
 	}
 
-	// Replay without confirmation should fail
-	_, err = pq.ReplayFrom(ctx, "replay-test", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{})
-	if err == nil {
-		t.Error("expected error when replaying without confirmation")
-	}
-
-	// Replay with confirmation
+	// Replay for real.
 	count, err = pq.ReplayFrom(ctx, "replay-test", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
-		Confirm:     true,
 		PerformedBy: "test-user",
 	})
 	if err != nil {
@@ -127,18 +120,17 @@ func TestReplayFromWithLimit(t *testing.T) {
 		}
 	}
 	for i := 0; i < 5; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "replay-limit", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "replay-limit", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "replay-limit", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack: %v", err)
 		}
 	}
 
 	// Replay with limit=2 — only 2 of the 5 completed messages should be replayed
 	count, err := pq.ReplayFrom(ctx, "replay-limit", pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
-		Confirm: true,
 		Limit:   2,
 	})
 	if err != nil {
@@ -178,11 +170,11 @@ func TestReplayMessage(t *testing.T) {
 	}
 
 	// Consume and ack
-	msg, err := pq.ConsumeFromChannel(ctx, "replay-msg-test", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "replay-msg-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume message: %v", err)
 	}
-	if err := pq.AckChannel(ctx, "replay-msg-test", msg.Receipt()); err != nil {
+	if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack message: %v", err)
 	}
 
@@ -197,7 +189,6 @@ func TestReplayMessage(t *testing.T) {
 
 	// Replay the specific message
 	err = pq.ReplayMessage(ctx, "replay-msg-test", pgqueue.QueueTypeChannel, msg.ID, pgqueue.ReplayOptions{
-		Confirm:     true,
 		PerformedBy: "test-user",
 	})
 	if err != nil {
@@ -233,14 +224,14 @@ func TestReplayDLQ(t *testing.T) {
 
 	// Consume and nack twice to send to DLQ
 	for i := 0; i < 2; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "replay-dlq-test", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "replay-dlq-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message on attempt %d: %v", i+1, err)
 		}
 		if msg == nil {
 			t.Fatalf("consume returned nil message on attempt %d", i+1)
 		}
-		if err := pq.NackChannel(ctx, "replay-dlq-test", msg.Receipt(), "test failure"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "test failure"); err != nil {
 			t.Fatalf("failed to nack message on attempt %d: %v", i+1, err)
 		}
 	}
@@ -267,7 +258,6 @@ func TestReplayDLQ(t *testing.T) {
 
 	// Replay from DLQ
 	res, err = pq.ReplayDLQ(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
-		Confirm:     true,
 		PerformedBy: "test-user",
 	})
 	if err != nil {
@@ -319,14 +309,14 @@ func TestReplayDLQPubSub(t *testing.T) {
 
 	// Nack until message goes to DLQ
 	for i := 0; i < 2; i++ {
-		msg, err := pq.ConsumeFromTopic(ctx, "replay-dlq-pubsub", "sub1", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "replay-dlq-pubsub", "sub1", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("consume %d failed: %v", i, err)
 		}
 		if msg == nil {
 			t.Fatalf("consume %d returned nil", i)
 		}
-		err = pq.NackTopic(ctx, "replay-dlq-pubsub", "sub1", msg.Receipt(), "fail")
+		err = pq.Nack(ctx, msg.Receipt(), "fail")
 		if err != nil {
 			t.Fatalf("nack %d failed: %v", i, err)
 		}
@@ -343,7 +333,6 @@ func TestReplayDLQPubSub(t *testing.T) {
 
 	// Replay from DLQ
 	res, err := pq.ReplayDLQ(ctx, "replay-dlq-pubsub", pgqueue.QueueTypePubSub, pgqueue.ReplayOptions{
-		Confirm: true,
 	})
 	if err != nil {
 		t.Fatalf("replay DLQ failed: %v", err)
@@ -353,7 +342,7 @@ func TestReplayDLQPubSub(t *testing.T) {
 	}
 
 	// The replayed message must be consumable by the subscriber
-	msg, err := pq.ConsumeFromTopic(ctx, "replay-dlq-pubsub", "sub1", 30*time.Second)
+	msg, err := pq.ReceiveTopic(ctx, "replay-dlq-pubsub", "sub1", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("consume after replay failed: %v", err)
 	}
@@ -389,20 +378,20 @@ func TestT021_ConcurrentReplayDLQNoLossNoDuplication(t *testing.T) {
 		}
 	}
 	for range numMessages {
-		msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msg == nil {
 			t.Fatalf("consume for first nack failed: %v", err)
 		}
-		if err := pq.NackChannel(ctx, queueName, msg.Receipt(), "fail1"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "fail1"); err != nil {
 			t.Fatalf("first nack failed: %v", err)
 		}
 	}
 	for range numMessages {
-		msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msg == nil {
 			t.Fatalf("consume for second nack failed: %v", err)
 		}
-		if err := pq.NackChannel(ctx, queueName, msg.Receipt(), "fail2"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "fail2"); err != nil {
 			t.Fatalf("second nack (DLQ) failed: %v", err)
 		}
 	}
@@ -425,7 +414,6 @@ func TestT021_ConcurrentReplayDLQNoLossNoDuplication(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			res, err := pq.ReplayDLQ(ctx, queueName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
-				Confirm: true,
 			})
 			counts[idx], errs[idx] = res.Replayed, err
 		}(i)
@@ -482,18 +470,17 @@ func TestT023_NegativeReplayLimitRejected(t *testing.T) {
 	if _, err := pq.Publish(ctx, queueName, []byte("payload")); err != nil {
 		t.Fatalf("failed to publish: %v", err)
 	}
-	msg, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil || msg == nil {
 		t.Fatalf("consume failed: %v", err)
 	}
-	if err := pq.AckChannel(ctx, queueName, msg.Receipt()); err != nil {
+	if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 		t.Fatalf("ack failed: %v", err)
 	}
 
 	// Negative Limit must be rejected with ErrInvalidConfig
 	since := time.Now().Add(-time.Hour)
 	_, err = pq.ReplayFrom(ctx, queueName, pgqueue.QueueTypeChannel, since, pgqueue.ReplayOptions{
-		Confirm: true,
 		Limit:   -1,
 	})
 	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
@@ -501,7 +488,6 @@ func TestT023_NegativeReplayLimitRejected(t *testing.T) {
 	}
 
 	_, err = pq.ReplayDLQ(ctx, queueName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
-		Confirm: true,
 		Limit:   -5,
 	})
 	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
@@ -511,7 +497,6 @@ func TestT023_NegativeReplayLimitRejected(t *testing.T) {
 	// Verify the replay log entry for a SUCCESSFUL replay is written atomically:
 	// run a successful ReplayFrom and check the log was written.
 	count, err := pq.ReplayFrom(ctx, queueName, pgqueue.QueueTypeChannel, since, pgqueue.ReplayOptions{
-		Confirm:     true,
 		PerformedBy: "test-user",
 	})
 	if err != nil {
@@ -558,16 +543,16 @@ func TestReplayFromPubSubFiltersOnMessagePublishTime(t *testing.T) {
 	// pending for the subscriber.
 	const total = 6
 	for i := range total {
-		if _, err := pq.PublishTopic(ctx, topic, []byte{byte('A' + i)}); err != nil {
+		if _, err := pq.Publish(ctx, topic, []byte{byte('A' + i)}); err != nil {
 			t.Fatalf("publish %d failed: %v", i, err)
 		}
 	}
 	for range total {
-		msg, err := pq.ConsumeFromTopic(ctx, topic, "sub1", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, topic, "sub1", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msg == nil {
 			t.Fatalf("consume failed: %v", err)
 		}
-		if err := pq.AckTopic(ctx, topic, "sub1", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("ack failed: %v", err)
 		}
 	}
@@ -596,7 +581,6 @@ func TestReplayFromPubSubFiltersOnMessagePublishTime(t *testing.T) {
 	}
 
 	count, err = pq.ReplayFrom(ctx, topic, pgqueue.QueueTypePubSub, cutoff, pgqueue.ReplayOptions{
-		Confirm:     true,
 		PerformedBy: "test-user",
 	})
 	if err != nil {
@@ -662,7 +646,6 @@ func TestReplayFromLargeBacklogNoLossNoDuplication(t *testing.T) {
 
 	// Replay with NO explicit Limit: the keyset-paged loop must reinstate them all.
 	count, err := pq.ReplayFrom(ctx, channelName, pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
-		Confirm:     true,
 		PerformedBy: "test-user",
 	})
 	if err != nil {
@@ -727,20 +710,20 @@ func TestReplayDLQAllUnreplayableReturnsPromptly(t *testing.T) {
 		}
 	}
 	for range numMessages {
-		msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msg == nil {
 			t.Fatalf("consume for first nack failed: %v", err)
 		}
-		if err := pq.NackChannel(ctx, channelName, msg.Receipt(), "fail1"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "fail1"); err != nil {
 			t.Fatalf("first nack failed: %v", err)
 		}
 	}
 	for range numMessages {
-		msg, err := pq.ConsumeFromChannel(ctx, channelName, 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msg == nil {
 			t.Fatalf("consume for second nack failed: %v", err)
 		}
-		if err := pq.NackChannel(ctx, channelName, msg.Receipt(), "fail2"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "fail2"); err != nil {
 			t.Fatalf("second nack (DLQ) failed: %v", err)
 		}
 	}
@@ -766,7 +749,6 @@ func TestReplayDLQAllUnreplayableReturnsPromptly(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	res, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
-		Confirm: true,
 		Limit:   10,
 	})
 	if err != nil {
@@ -825,7 +807,6 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 	// Replay the whole DLQ with no explicit Limit: the keyset-paged loop must
 	// reinstate every message.
 	res, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{
-		Confirm:     true,
 		PerformedBy: "test-user",
 	})
 	if err != nil {
@@ -910,7 +891,7 @@ func TestReplayDLQLegacyNullSubscriberCount(t *testing.T) {
 
 	// Publish a message so the message table has a row for the DLQ entry to
 	// reference (replay re-creates subscription rows that foreign-key it).
-	msgID, err := pq.PublishTopic(ctx, topicName, []byte("legacy"))
+	msgID, err := pq.Publish(ctx, topicName, []byte("legacy"))
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
@@ -927,7 +908,7 @@ func TestReplayDLQLegacyNullSubscriberCount(t *testing.T) {
 	}
 
 	res, err := pq.ReplayDLQ(ctx, topicName, pgqueue.QueueTypePubSub,
-		pgqueue.ReplayOptions{Confirm: true})
+		pgqueue.ReplayOptions{})
 	if err != nil {
 		t.Fatalf("replay DLQ: %v", err)
 	}

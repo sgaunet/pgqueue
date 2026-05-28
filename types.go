@@ -1,9 +1,7 @@
 package pgqueue
 
 import (
-	"database/sql"
 	"encoding/json"
-	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,19 +30,6 @@ const (
 	// MessageStatusAcked indicates a pub/sub subscription has been acknowledged.
 	MessageStatusAcked MessageStatus = "acked"
 )
-
-// Config holds the configuration for Queue.
-//
-// Deprecated: Use New(ctx, db, ...Option) with functional options instead.
-// Config is retained for backward compatibility with existing callers.
-type Config struct {
-	DB                *sql.DB       // Database connection (user-managed)
-	MaxMessageSize    int           // Maximum message size in bytes (default: 1024)
-	DefaultMaxRetries int           // Default maximum retry attempts (default: 3)
-	DefaultTTL        time.Duration // Default message TTL (0 = no expiration)
-	MaxQueues         int           // Maximum number of queues (channels + topics) that may exist (0 = unlimited)
-	Logger            *slog.Logger  // Optional structured logger (nil = silent, the default)
-}
 
 // TopicOptions holds configuration for a pub/sub topic.
 type TopicOptions struct {
@@ -111,14 +96,11 @@ type Receipt struct {
 	SubscriberID string    // populated for topic subscriptions; empty for channels
 }
 
-// Receipt returns the acknowledgement credential for this message. When the
-// message was obtained via ReceiveChannel or ReceiveTopic, the returned Receipt
-// carries the queue binding and can be passed directly to the queue-agnostic
-// Ack/Nack methods.
-//
-// When using the legacy ConsumeFromChannel/ConsumeFromTopic APIs, the Receipt
-// will not carry the queue binding; pass it to AckChannel/NackChannel or
-// AckTopic/NackTopic instead.
+// Receipt returns the acknowledgement credential for this message. Messages
+// obtained via ReceiveChannel or ReceiveTopic carry the queue binding
+// (QueueName + QueueType, and SubscriberID for topics), so the returned Receipt
+// can be passed directly to the queue-agnostic Ack, Nack, AckBatch and
+// NackBatch methods.
 func (m *Message) Receipt() Receipt {
 	// If a queue-aware receipt was bound by Receive* (or SetReceipt), return it
 	// verbatim — including the case of an empty QueueName, which a test double
@@ -250,7 +232,6 @@ type PublishMessage struct {
 type ReplayOptions struct {
 	DryRun      bool   // If true, return count without performing replay
 	Limit       int    // Maximum number of messages to replay (0 = no limit)
-	Confirm     bool   // Explicit confirmation required
 	PerformedBy string // Who initiated the replay (for audit log)
 }
 

@@ -27,21 +27,6 @@ func TestApplyConfigOptionsMaxRetries(t *testing.T) {
 	}
 }
 
-// TestConfigFromLegacyMaxRetries verifies that the legacy Config keeps its
-// documented "0 = use default" semantics: a zero DefaultMaxRetries resolves to
-// the default of 3, while a positive value is carried through.
-func TestConfigFromLegacyMaxRetries(t *testing.T) {
-	legacyZero := applyConfigOptions(configFromLegacy(Config{DefaultMaxRetries: 0}))
-	if legacyZero.defaultMaxRetries != 3 {
-		t.Errorf("legacy DefaultMaxRetries=0: resolved to %d, want 3", legacyZero.defaultMaxRetries)
-	}
-
-	legacyFive := applyConfigOptions(configFromLegacy(Config{DefaultMaxRetries: 5}))
-	if legacyFive.defaultMaxRetries != 5 {
-		t.Errorf("legacy DefaultMaxRetries=5: resolved to %d, want 5", legacyFive.defaultMaxRetries)
-	}
-}
-
 // uncomparableTestListener is a Listener whose dynamic type is not comparable
 // (it has a slice field). onlySchemaOption must handle it without panicking.
 type uncomparableTestListener struct{ marker []int }
@@ -91,10 +76,9 @@ func TestApplyConfigOptionsMaxMessageSize(t *testing.T) {
 }
 
 // TestValidateMaxMessageSize covers the boundary behavior of the shared
-// guard used by New, validateConfig, and CreateChannel/CreateTopic: zero is
-// allowed (resolves to default downstream), MaxAllowedMessageSize is the
-// inclusive upper bound, and anything outside that range returns
-// ErrInvalidConfig.
+// guard used by New and CreateChannel/CreateTopic: zero is allowed (resolves to
+// default downstream), MaxAllowedMessageSize is the inclusive upper bound, and
+// anything outside that range returns ErrInvalidConfig.
 func TestValidateMaxMessageSize(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -180,17 +164,3 @@ func TestOnlySchemaOptionRejectsMaxMetadataSize(t *testing.T) {
 	}
 }
 
-// TestValidateConfigMaxMessageSize verifies the legacy Config struct enforces
-// the same ceiling as the functional-options path, so deprecated Init callers
-// see consistent rejection of out-of-range payload caps.
-func TestValidateConfigMaxMessageSize(t *testing.T) {
-	if err := validateConfig(Config{MaxMessageSize: MaxAllowedMessageSize}); err != nil {
-		t.Errorf("Config at ceiling: unexpected err %v", err)
-	}
-	if err := validateConfig(Config{MaxMessageSize: MaxAllowedMessageSize + 1}); !errors.Is(err, ErrInvalidConfig) {
-		t.Errorf("Config above ceiling: err = %v, want ErrInvalidConfig", err)
-	}
-	if err := validateConfig(Config{MaxMessageSize: -1}); !errors.Is(err, ErrInvalidConfig) {
-		t.Errorf("Config negative: err = %v, want ErrInvalidConfig", err)
-	}
-}

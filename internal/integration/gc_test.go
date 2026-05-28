@@ -31,11 +31,11 @@ func TestGarbageCollector(t *testing.T) {
 
 	// Consume and ack some messages
 	for i := 0; i < 3; i++ {
-		msg, err := pq.ConsumeFromChannel(ctx, "gc-test", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "gc-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, "gc-test", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -92,7 +92,7 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	}
 
 	// Consume but don't ack (simulating stuck processing)
-	msg, err := pq.ConsumeFromChannel(ctx, "gc-timeout-test", 100*time.Millisecond)
+	msg, err := pq.ReceiveChannel(ctx, "gc-timeout-test", pgqueue.WithVisibilityTimeout(100*time.Millisecond))
 	if err != nil {
 		t.Fatalf("failed to consume message: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	}
 
 	// Verify we can consume the message again
-	msg2, err := pq.ConsumeFromChannel(ctx, "gc-timeout-test", 30*time.Second)
+	msg2, err := pq.ReceiveChannel(ctx, "gc-timeout-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to re-consume message: %v", err)
 	}
@@ -158,12 +158,12 @@ func TestGarbageCollectorKeepForeverPreservesMessages(t *testing.T) {
 		t.Fatalf("failed to publish message: %v", err)
 	}
 
-	msg, err := pq.ConsumeFromChannel(ctx, "gc-keep-forever-test", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "gc-keep-forever-test", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume message: %v", err)
 	}
 
-	if err := pq.AckChannel(ctx, "gc-keep-forever-test", msg.Receipt()); err != nil {
+	if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack message: %v", err)
 	}
 
@@ -223,11 +223,11 @@ func TestGarbageCollectorDefaultPolicyPurgesCompleted(t *testing.T) {
 	if _, err := pq.Publish(ctx, "gc-default-policy", []byte("done")); err != nil {
 		t.Fatalf("failed to publish: %v", err)
 	}
-	msg, err := pq.ConsumeFromChannel(ctx, "gc-default-policy", 30*time.Second)
+	msg, err := pq.ReceiveChannel(ctx, "gc-default-policy", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
-	if err := pq.AckChannel(ctx, "gc-default-policy", msg.Receipt()); err != nil {
+	if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 		t.Fatalf("failed to ack: %v", err)
 	}
 
@@ -274,11 +274,11 @@ func TestGarbageCollectorParallel(t *testing.T) {
 			}
 		}
 
-		msg, err := pq.ConsumeFromChannel(ctx, name, 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, name, pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message: %v", err)
 		}
-		if err := pq.AckChannel(ctx, name, msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message: %v", err)
 		}
 	}
@@ -347,11 +347,11 @@ func TestGarbageCollectorPubSub(t *testing.T) {
 	// Ack all messages for both subscribers (fully consumed)
 	for _, sub := range []string{"sub-1", "sub-2"} {
 		for i := 0; i < 5; i++ {
-			msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-test", sub, 30*time.Second)
+			msg, err := pq.ReceiveTopic(ctx, "gc-pubsub-test", sub, pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
 				t.Fatalf("failed to consume message for %s: %v", sub, err)
 			}
-			if err := pq.AckTopic(ctx, "gc-pubsub-test", sub, msg.Receipt()); err != nil {
+			if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 				t.Fatalf("failed to ack message for %s: %v", sub, err)
 			}
 		}
@@ -421,11 +421,11 @@ func TestGarbageCollectorPubSubPartialAck(t *testing.T) {
 
 	// Only sub-1 acks all messages; sub-2 does NOT consume
 	for i := 0; i < 3; i++ {
-		msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-partial", "sub-1", 30*time.Second)
+		msg, err := pq.ReceiveTopic(ctx, "gc-pubsub-partial", "sub-1", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume message for sub-1: %v", err)
 		}
-		if err := pq.AckTopic(ctx, "gc-pubsub-partial", "sub-1", msg.Receipt()); err != nil {
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 			t.Fatalf("failed to ack message for sub-1: %v", err)
 		}
 	}
@@ -483,15 +483,9 @@ func TestPurgeQueue(t *testing.T) {
 		t.Errorf("expected 10 messages, got %d", depth)
 	}
 
-	// Purge without confirmation should fail
+	// Purge the queue.
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
-	err = gc.PurgeQueue(ctx, "purge-test", pgqueue.QueueTypeChannel, false)
-	if err == nil {
-		t.Error("expected error when purging without confirmation")
-	}
-
-	// Purge with confirmation
-	err = gc.PurgeQueue(ctx, "purge-test", pgqueue.QueueTypeChannel, true)
+	err = gc.PurgeQueue(ctx, "purge-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to purge queue: %v", err)
 	}
@@ -567,7 +561,7 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 	}
 
 	// Consume with minimum visibility timeout
-	msg, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-vt", "sub-vt", 1*time.Millisecond)
+	msg, err := pq.ReceiveTopic(ctx, "gc-pubsub-vt", "sub-vt", pgqueue.WithVisibilityTimeout(1*time.Millisecond))
 	if err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
@@ -594,7 +588,7 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 	}
 
 	// Re-consume should return the same message
-	msg2, err := pq.ConsumeFromTopic(ctx, "gc-pubsub-vt", "sub-vt", 30*time.Second)
+	msg2, err := pq.ReceiveTopic(ctx, "gc-pubsub-vt", "sub-vt", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to re-consume: %v", err)
 	}
@@ -637,7 +631,7 @@ func TestExhaustedTimedOutSubscriptionsPromotedByGC(t *testing.T) {
 	// Claim with a 1ms visibility timeout and never ack; a GC pass then resets
 	// the timed-out subscription to pending, counting the timeout (retry_count
 	// 0 -> 1).
-	if _, err := pq.ConsumeFromTopic(ctx, topicName, subID, 1*time.Millisecond); err != nil {
+	if _, err := pq.ReceiveTopic(ctx, topicName, subID, pgqueue.WithVisibilityTimeout(1*time.Millisecond)); err != nil {
 		t.Fatalf("first consume failed: %v", err)
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -648,7 +642,7 @@ func TestExhaustedTimedOutSubscriptionsPromotedByGC(t *testing.T) {
 	// Claim again and again never ack: the subscription is now at retry_count 1
 	// and times out in 'processing' state — exhausted, since a further reclaim
 	// would breach maxRetries=1.
-	if _, err := pq.ConsumeFromTopic(ctx, topicName, subID, 1*time.Millisecond); err != nil {
+	if _, err := pq.ReceiveTopic(ctx, topicName, subID, pgqueue.WithVisibilityTimeout(1*time.Millisecond)); err != nil {
 		t.Fatalf("second consume failed: %v", err)
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -796,19 +790,19 @@ func TestGarbageCollectorDLQRetention(t *testing.T) {
 	}
 	for range 3 {
 		// First consume + nack: retry
-		msg, err := pq.ConsumeFromChannel(ctx, "gc-dlq-ret", 30*time.Second)
+		msg, err := pq.ReceiveChannel(ctx, "gc-dlq-ret", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume: %v", err)
 		}
-		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.Receipt(), "fail"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "fail"); err != nil {
 			t.Fatalf("first nack failed: %v", err)
 		}
 		// Second consume + nack: exceeds max retries -> DLQ
-		msg, err = pq.ConsumeFromChannel(ctx, "gc-dlq-ret", 30*time.Second)
+		msg, err = pq.ReceiveChannel(ctx, "gc-dlq-ret", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil {
 			t.Fatalf("failed to consume for DLQ: %v", err)
 		}
-		if err := pq.NackChannel(ctx, "gc-dlq-ret", msg.Receipt(), "fail again"); err != nil {
+		if err := pq.Nack(ctx, msg.Receipt(), "fail again"); err != nil {
 			t.Fatalf("second nack failed: %v", err)
 		}
 	}
@@ -866,11 +860,11 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 			}
 		}
 		for range 3 {
-			msg, err := pq.ConsumeFromChannel(ctx, name, 30*time.Second)
+			msg, err := pq.ReceiveChannel(ctx, name, pgqueue.WithVisibilityTimeout(30*time.Second))
 			if err != nil {
 				t.Fatalf("failed to consume from %s: %v", name, err)
 			}
-			if err := pq.AckChannel(ctx, name, msg.Receipt()); err != nil {
+			if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 				t.Fatalf("failed to ack in %s: %v", name, err)
 			}
 		}
@@ -940,7 +934,7 @@ func TestT019_GCReclaimCountsVisibilityTimeoutOnce(t *testing.T) {
 	}
 
 	// Consume with a very short visibility timeout so it expires quickly.
-	if _, err := pq.ConsumeFromChannel(ctx, queueName, 1*time.Millisecond); err != nil {
+	if _, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(1*time.Millisecond)); err != nil {
 		t.Fatalf("failed to consume: %v", err)
 	}
 
@@ -967,7 +961,7 @@ func TestT019_GCReclaimCountsVisibilityTimeoutOnce(t *testing.T) {
 
 	// Re-consume: the message is pending, so the consume path must not add a
 	// second increment for the same timeout (no double-counting).
-	msg2, err := pq.ConsumeFromChannel(ctx, queueName, 30*time.Second)
+	msg2, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("failed to re-consume: %v", err)
 	}
@@ -1009,15 +1003,12 @@ func TestExhaustedTimedOutMessagesPromotedByConsume(t *testing.T) {
 	// budget. No GarbageCollector is ever created or started.
 	for attempt := 0; attempt < 4; attempt++ {
 		for {
-			msg, err := pq.ConsumeFromChannel(ctx, channelName, 1*time.Millisecond)
+			_, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(1*time.Millisecond))
 			if errors.Is(err, pgqueue.ErrQueueEmpty) {
 				break
 			}
 			if err != nil {
 				t.Fatalf("attempt %d consume: %v", attempt, err)
-			}
-			if msg == nil {
-				break
 			}
 			// Never ack: let the 1ms visibility timeout lapse.
 		}
@@ -1067,7 +1058,7 @@ func TestGCCountsVisibilityTimeoutTowardDLQ(t *testing.T) {
 	// maxRetries=2 means the message tolerates retry_count 0 and 1; a third
 	// timed-out reclaim (retry_count would reach 2) promotes it to the DLQ.
 	for attempt := range 3 {
-		msg, err := pq.ConsumeFromChannel(ctx, channelName, 1*time.Millisecond)
+		msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(1*time.Millisecond))
 		if err != nil {
 			t.Fatalf("attempt %d consume: %v", attempt, err)
 		}
@@ -1120,20 +1111,20 @@ func TestGCKeepsDLQReferencedPubSubMessage(t *testing.T) {
 	}
 
 	// sub-ok acks the message.
-	okMsg, err := pq.ConsumeFromTopic(ctx, topicName, "sub-ok", 30*time.Second)
+	okMsg, err := pq.ReceiveTopic(ctx, topicName, "sub-ok", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil || okMsg == nil {
 		t.Fatalf("sub-ok consume: msg=%v err=%v", okMsg, err)
 	}
-	if err := pq.AckTopic(ctx, topicName, "sub-ok", okMsg.Receipt()); err != nil {
+	if err := pq.Ack(ctx, okMsg.Receipt()); err != nil {
 		t.Fatalf("sub-ok ack: %v", err)
 	}
 
 	// sub-fail nacks the message; with MaxRetries=0 it goes straight to the DLQ.
-	failMsg, err := pq.ConsumeFromTopic(ctx, topicName, "sub-fail", 30*time.Second)
+	failMsg, err := pq.ReceiveTopic(ctx, topicName, "sub-fail", pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil || failMsg == nil {
 		t.Fatalf("sub-fail consume: msg=%v err=%v", failMsg, err)
 	}
-	if err := pq.NackTopic(ctx, topicName, "sub-fail", failMsg.Receipt(), "boom"); err != nil {
+	if err := pq.Nack(ctx, failMsg.Receipt(), "boom"); err != nil {
 		t.Fatalf("sub-fail nack: %v", err)
 	}
 
@@ -1150,7 +1141,7 @@ func TestGCKeepsDLQReferencedPubSubMessage(t *testing.T) {
 	// The DLQ entry must still be replayable: replay re-creates sub-fail's
 	// subscription row, which foreign-keys the message row that survived GC.
 	res, err := pq.ReplayDLQ(ctx, topicName, pgqueue.QueueTypePubSub,
-		pgqueue.ReplayOptions{Confirm: true})
+		pgqueue.ReplayOptions{})
 	if err != nil {
 		t.Fatalf("replay DLQ: %v", err)
 	}

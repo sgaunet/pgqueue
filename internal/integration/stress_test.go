@@ -80,7 +80,7 @@ func TestT024_StressWorkloadZeroLossZeroDuplication(t *testing.T) {
 					return
 				}
 
-				msg, err := pq.ConsumeFromChannel(ctx, queueName, 200*time.Millisecond)
+				msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(200*time.Millisecond))
 				if err != nil || msg == nil {
 					time.Sleep(10 * time.Millisecond)
 					continue
@@ -88,11 +88,11 @@ func TestT024_StressWorkloadZeroLossZeroDuplication(t *testing.T) {
 
 				// Occasionally nack to test retry path (every 5th message by retry count)
 				if msg.RetryCount == 0 && msg.ID[15]%5 == 0 {
-					_ = pq.NackChannel(ctx, queueName, msg.Receipt(), "stress-nack")
+					_ = pq.Nack(ctx, msg.Receipt(), "stress-nack")
 					continue
 				}
 
-				if err := pq.AckChannel(ctx, queueName, msg.Receipt()); err != nil {
+				if err := pq.Ack(ctx, msg.Receipt()); err != nil {
 					// Stale claim: another consumer got it first, skip
 					continue
 				}

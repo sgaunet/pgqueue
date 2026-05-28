@@ -25,7 +25,7 @@ func TestZeroSubscriberTopicMessageReclaimed(t *testing.T) {
 	}
 
 	// Publish with zero subscribers: this message can never be delivered.
-	if _, err := pq.PublishTopic(ctx, topicName, []byte("orphan")); err != nil {
+	if _, err := pq.Publish(ctx, topicName, []byte("orphan")); err != nil {
 		t.Fatalf("publish orphan: %v", err)
 	}
 
@@ -34,7 +34,7 @@ func TestZeroSubscriberTopicMessageReclaimed(t *testing.T) {
 	if err := pq.Subscribe(ctx, topicName, "live-sub"); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	if _, err := pq.PublishTopic(ctx, topicName, []byte("delivered")); err != nil {
+	if _, err := pq.Publish(ctx, topicName, []byte("delivered")); err != nil {
 		t.Fatalf("publish delivered: %v", err)
 	}
 

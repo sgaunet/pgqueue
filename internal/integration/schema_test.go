@@ -98,7 +98,7 @@ func TestWithSchemaPlacesAllTablesInNonDefaultSchema(t *testing.T) {
 	}
 
 	// The schema must be fully functional end-to-end: publish, consume, ack.
-	if _, err := pq.PublishChannel(ctx, "orders", []byte("hello")); err != nil {
+	if _, err := pq.Publish(ctx, "orders", []byte("hello")); err != nil {
 		t.Fatalf("PublishChannel: %v", err)
 	}
 	msg, err := pq.ReceiveChannel(ctx, "orders")
@@ -116,7 +116,7 @@ func TestWithSchemaPlacesAllTablesInNonDefaultSchema(t *testing.T) {
 	if err := pq.Subscribe(ctx, "events", "sub1"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	if _, err := pq.PublishTopic(ctx, "events", []byte("evt")); err != nil {
+	if _, err := pq.Publish(ctx, "events", []byte("evt")); err != nil {
 		t.Fatalf("PublishTopic: %v", err)
 	}
 	tmsg, err := pq.ReceiveTopic(ctx, "events", "sub1")
@@ -139,7 +139,7 @@ func TestWithSchemaDLQAndStats(t *testing.T) {
 	if err := pq.CreateChannel(ctx, "failing"); err != nil {
 		t.Fatalf("CreateChannel: %v", err)
 	}
-	if _, err := pq.PublishChannel(ctx, "failing", []byte("doomed")); err != nil {
+	if _, err := pq.Publish(ctx, "failing", []byte("doomed")); err != nil {
 		t.Fatalf("PublishChannel: %v", err)
 	}
 

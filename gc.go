@@ -125,17 +125,13 @@ func (gc *GarbageCollector) Stop() {
 	gc.wg.Wait()
 }
 
-// PurgeQueue immediately purges all messages from a queue (dangerous operation).
+// PurgeQueue immediately and irreversibly deletes every message from a queue,
+// leaving the queue and its tables in place.
 func (gc *GarbageCollector) PurgeQueue(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
-	confirm bool,
 ) error {
-	if !confirm {
-		return ErrPurgeNotConfirmed
-	}
-
 	// Get queue metadata
 	metadata, err := gc.pq.getQueueMetadata(
 		ctx, string(queueType), queueName,
@@ -454,7 +450,7 @@ func (gc *GarbageCollector) promoteExhaustedChannelMessages(
 	ctx context.Context,
 	tableName string,
 ) error {
-	defaultMax := gc.pq.config.DefaultMaxRetries
+	defaultMax := gc.pq.cfg.defaultMaxRetries
 	selectQuery := fmt.Sprintf(`
 		SELECT id, payload, retry_count, metadata
 		FROM %s

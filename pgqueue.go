@@ -67,8 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_l
 // Queue is the main struct for the message queue system.
 type Queue struct {
 	db       *sql.DB
-	config   Config         // legacy config field; kept for backward-compat accessors
-	cfg      queueConfig    // canonical config built from functional options
+	cfg      queueConfig    // resolved config built from functional options
 	logger   *slog.Logger
 	closed   atomic.Bool    // set to true after Close() is called
 	mdcache  *metadataCache // per-queue table-name cache (immutable fields only)
@@ -134,12 +133,11 @@ var readCommittedTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 //	    log.Fatal(err)
 //	}
 //
-//	// Initialize pgqueue library
-//	pq, err := pgqueue.Init(ctx, pgqueue.Config{
-//	    DB:                db,
-//	    MaxMessageSize:    1024 * 1024,
-//	    DefaultMaxRetries: 3,
-//	})
+//	// Create the Queue
+//	pq, err := pgqueue.New(ctx, db,
+//	    pgqueue.WithMaxMessageSize(1024*1024),
+//	    pgqueue.WithDefaultMaxRetries(3),
+//	)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -215,21 +213,6 @@ func onlySchemaOption(opts []Option) bool {
 // minPGVersionNum is PostgreSQL 18 in server_version_num form, the lowest
 // version pgqueue supports (uuidv7() is native from PostgreSQL 18 onward).
 const minPGVersionNum = 180000
-
-// validateConfig rejects a Config whose numeric fields are out of range: a
-// negative or oversized MaxMessageSize would make publishes fail (or exceed
-// PostgreSQL's bytea limit), and the others have no meaningful negative
-// interpretation.
-func validateConfig(cfg Config) error {
-	if err := validateMaxMessageSize(cfg.MaxMessageSize); err != nil {
-		return err
-	}
-	if cfg.DefaultMaxRetries < 0 || cfg.DefaultTTL < 0 || cfg.MaxQueues < 0 {
-		return ErrInvalidConfig
-	}
-
-	return nil
-}
 
 // validateMaxMessageSize ensures a payload-size cap is non-negative and
 // within PostgreSQL's bytea per-value limit (MaxAllowedMessageSize). Zero is
@@ -356,20 +339,9 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 		return nil, err
 	}
 
-	// Build the legacy Config for backward-compat accessor methods.
-	legacyCfg := Config{
-		DB:                db,
-		MaxMessageSize:    cfg.maxMessageSize,
-		DefaultMaxRetries: cfg.defaultMaxRetries,
-		DefaultTTL:        cfg.defaultTTL,
-		MaxQueues:         cfg.maxQueues,
-		Logger:            cfg.logger,
-	}
-
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	pq := &Queue{
 		db:       db,
-		config:   legacyCfg,
 		cfg:      cfg,
 		logger:   cfg.logger,
 		mdcache:  newMetadataCache(),
@@ -384,22 +356,6 @@ func New(ctx context.Context, db *sql.DB, opts ...Option) (*Queue, error) {
 	}
 
 	return pq, nil
-}
-
-// Init initializes the Queue system with the provided configuration.
-//
-// Deprecated: Use New(ctx, db, ...Option) with functional options instead.
-// Init is retained for backward compatibility.
-func Init(ctx context.Context, cfg Config) (*Queue, error) {
-	if cfg.DB == nil {
-		return nil, ErrDBRequired
-	}
-	if err := validateConfig(cfg); err != nil {
-		return nil, err
-	}
-
-	opts := configFromLegacy(cfg)
-	return New(ctx, cfg.DB, opts...)
 }
 
 // CreateChannel creates a new point-to-point channel.
@@ -458,24 +414,17 @@ func (pq *Queue) CreateTopic(
 	return pq.createQueue(ctx, QueueTypePubSub, name, to)
 }
 
-// DeleteTopic deletes a pub/sub topic and all associated resources.
-// Requires confirm=true as a safety measure to prevent accidental deletion.
-func (pq *Queue) DeleteTopic(
-	ctx context.Context,
-	name string,
-	confirm bool,
-) error {
-	return pq.deleteQueue(ctx, QueueTypePubSub, name, confirm)
+// DeleteTopic deletes a pub/sub topic and all associated resources. This is
+// irreversible: every message, subscription, and DLQ entry for the topic is
+// dropped.
+func (pq *Queue) DeleteTopic(ctx context.Context, name string) error {
+	return pq.deleteQueue(ctx, QueueTypePubSub, name)
 }
 
 // DeleteChannel deletes a point-to-point channel and all associated resources.
-// Requires confirm=true as a safety measure to prevent accidental deletion.
-func (pq *Queue) DeleteChannel(
-	ctx context.Context,
-	name string,
-	confirm bool,
-) error {
-	return pq.deleteQueue(ctx, QueueTypeChannel, name, confirm)
+// This is irreversible: every message and DLQ entry for the channel is dropped.
+func (pq *Queue) DeleteChannel(ctx context.Context, name string) error {
+	return pq.deleteQueue(ctx, QueueTypeChannel, name)
 }
 
 // ListTopics returns the names of all pub/sub topics.
@@ -814,11 +763,7 @@ const createQueueAdvisoryLockKey int64 = 0x70677175_65_6371
 // enforceMaxQueues serializes queue creation and checks the MaxQueues cap
 // within the given transaction. It is a no-op when no cap is configured.
 func (pq *Queue) enforceMaxQueues(ctx context.Context, tx *sql.Tx) error {
-	// Use the functional-options config if available, else fall back to legacy.
 	maxQueues := pq.cfg.maxQueues
-	if maxQueues == 0 {
-		maxQueues = pq.config.MaxQueues
-	}
 	if maxQueues <= 0 {
 		return nil
 	}
@@ -864,12 +809,7 @@ func (pq *Queue) deleteQueue(
 	ctx context.Context,
 	queueType QueueType,
 	name string,
-	confirm bool,
 ) error {
-	if !confirm {
-		return ErrDeleteNotConfirmed
-	}
-
 	if err := pq.validateQueueName(name); err != nil {
 		return fmt.Errorf("failed to validate queue name: %w", err)
 	}
@@ -1103,7 +1043,7 @@ func (pq *Queue) createPubSubIndexes(
 			tableName, subTbl, MessageStatusPending,
 		),
 		// Reclaim-optimized index: covers timed-out 'processing' subscriptions
-		// that ConsumeFromTopic redelivers once their visibility timeout expires.
+		// that consumeFromTopic redelivers once their visibility timeout expires.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
 			 ON %s(subscriber_id, visibility_timeout, message_id)
@@ -1193,7 +1133,7 @@ func (pq *Queue) createChannelIndexes(
 			tableName, msgTbl, MessageStatusPending,
 		),
 		// Reclaim-optimized index: covers timed-out 'processing' messages that
-		// ConsumeFromChannel redelivers once their visibility timeout expires.
+		// consumeFromChannel redelivers once their visibility timeout expires.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_timeout
 			 ON %s(visibility_timeout, id)

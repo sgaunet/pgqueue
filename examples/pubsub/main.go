@@ -117,7 +117,7 @@ func publishEvents(ctx context.Context, pq *pgqueue.Queue, topicName string) {
 
 	fmt.Println("\nPublishing user events...")
 	for _, event := range events {
-		msgID, err := pq.PublishTopic(ctx, topicName, []byte(event))
+		msgID, err := pq.Publish(ctx, topicName, []byte(event))
 		if err != nil {
 			log.Printf("failed to publish event: %v", err)
 			continue

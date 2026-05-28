@@ -85,7 +85,7 @@ func main() {
     if err := q.CreateChannel(ctx, "orders"); err != nil {
         log.Fatal(err)
     }
-    id, err := q.PublishChannel(ctx, "orders", []byte("order-123"))
+    id, err := q.Publish(ctx, "orders", []byte("order-123"))
     if err != nil {
         log.Fatal(err)
     }
