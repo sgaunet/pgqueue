@@ -14,7 +14,7 @@ The library is in good shape. The hardest correctness paths (retry/DLQ boundary,
 
 | Tier | Theme | Items |
 |------|-------|-------|
-| 1 | Breaking API — lock in before 1.0 | #A1 DB interface, ~~#A2 batch results~~ ✅, ~~#A3 Listener contract~~ ✅ |
+| 1 | Breaking API — lock in before 1.0 | ~~#A1 DB interface~~ ✅, ~~#A2 batch results~~ ✅, ~~#A3 Listener contract~~ ✅ |
 | 2 | Robustness — non-breaking | #B4 BIGINT counters, #B5 invalid-index handling, #B6 unlock logging |
 | 3 | Operability / docs | #C7 queue ceiling, #C8 polling cost, #C9 DLQ/TTL FK hazard |
 
@@ -26,11 +26,12 @@ User-flagged priorities for the eventual remediation pass: **#A2 (batch results)
 
 ### Tier 1 — API shape (cheap now, breaking later)
 
-#### A1. `*sql.DB` is hard-wired into the public constructors
+#### A1. `*sql.DB` is hard-wired into the public constructors — ✅ RESOLVED (#132)
 - **Where:** `InitSchema(ctx, db *sql.DB, ...)` (pgqueue.go:144); `New(ctx, db *sql.DB, ...)` (pgqueue.go:324).
 - **Problem:** Concrete `*sql.DB` in the public signature locks consumers in forever. Any future need to accept a pool wrapper, a transaction-scoped handle, or a test double becomes a breaking change post-1.0.
 - **Recommendation:** Accept a minimal interface that `*sql.DB` already satisfies (the context-aware `ExecContext`/`QueryContext`/`QueryRowContext`/`BeginTx` set). `*sql.DB` passes unchanged, so it is a no-op for existing callers but unblocks future flexibility.
 - **Cost to defer:** High. This is the single most expensive-to-change API decision.
+- **Resolution:** Added an exported `DB` interface (`ExecContext`/`QueryContext`/`QueryRowContext`/`BeginTx`/`PingContext`/`Conn`) used by `InitSchema`, `New`, `checkDBReady`, the `Queue.db` field, and `runMigrations`. `*sql.DB` satisfies it unchanged (asserted with `var _ DB = (*sql.DB)(nil)`), so existing callers compile as-is. `PingContext`/`Conn` are included because the readiness check and the session-level advisory-lock migration runner require them; `Conn`/`BeginTx` still yield concrete `*sql.Conn`/`*sql.Tx`.
 
 #### A2. Batch ack/nack collapse partial success into a single error *(user priority)* — ✅ RESOLVED (#133)
 - **Where:** `AckBatch` / `NackBatch` and their `ackChannelBatch`/`ackTopicBatch` helpers (`batch.go`). The multi-row `UPDATE ... FROM unnest($1::text::uuid[], $2::text::uuid[])` returns one aggregate error; `rows == 0` is used as total-failure signal.
@@ -91,7 +92,7 @@ User-flagged priorities for the eventual remediation pass: **#A2 (batch results)
 
 ## 3. Suggested remediation order (for a later pass)
 
-1. **Tier 1 (breaking, before 1.0):** A2 batch results → A3 Listener contract → A1 DB interface. *(A2/A3 first per user.)*
+1. **Tier 1 (breaking, before 1.0):** ✅ DONE — A2 batch results (#133) → A3 Listener contract (#134) → A1 DB interface (#132). *(A2/A3 first per user.)*
 2. **Tier 2 (non-breaking):** B4 BIGINT counters → B5 invalid-index handling → B6 unlock logging.
 3. **Tier 3 (docs/validation):** C7 → C8 → C9.
 
