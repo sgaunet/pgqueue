@@ -601,6 +601,25 @@ func (pq *Queue) IsQueuePaused(ctx context.Context, queueName string, queueType 
 	return meta.Paused, nil
 }
 
+// withTx begins a READ COMMITTED transaction on pq.db, calls fn, and commits.
+// A deferred Rollback is always attempted; after a successful Commit it is a
+// no-op. Callers that need to return a value from fn should close over a
+// variable and read it after withTx returns nil.
+func (pq *Queue) withTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
 // checkClosed returns ErrQueueClosed if Close has been called.
 func (pq *Queue) checkClosed() error {
 	if pq.closed.Load() {
@@ -734,25 +753,9 @@ func (pq *Queue) createQueue(
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if err := pq.createQueueInTx(
-		ctx, tx, queueType, name, tableName, configJSON,
-	); err != nil {
-		return err
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		return pq.createQueueInTx(ctx, tx, queueType, name, tableName, configJSON)
+	})
 }
 
 // createQueueInTx performs the transactional part of queue creation: it takes
@@ -862,32 +865,27 @@ func (pq *Queue) deleteQueue(
 		return fmt.Errorf("failed to get queue metadata: %w", err)
 	}
 
-	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	if err := pq.withTx(ctx, func(tx *sql.Tx) error {
+		// Drop queue-specific tables and clean up global tables
+		if err := pq.executeDelete(ctx, tx, queueType, name, metadata.TableName); err != nil {
+			return fmt.Errorf("failed to execute queue deletion: %w", err)
+		}
 
-	// Drop queue-specific tables and clean up global tables
-	if err := pq.executeDelete(ctx, tx, queueType, name, metadata.TableName); err != nil {
-		return fmt.Errorf("failed to execute queue deletion: %w", err)
-	}
+		// Invalidate the metadata cache and drop the push-delivery waker BEFORE
+		// commit so a panic or crash between commit and these cleanups cannot
+		// leave a stale cache entry or a leaked LISTEN behind. If commit then
+		// fails the queue still exists; both side effects are recoverable: the
+		// cache cold-fetches on the next access, and a consumer's wakeChan call
+		// re-registers the waker and LISTEN lazily. The post-commit invalidate
+		// remains as the in-process race guard: another goroutine that started a
+		// metadata lookup while the delete was in flight may have repopulated
+		// the cache between this pre-commit invalidate and Commit returning
+		// (#63).
+		pq.invalidateQueueCaches(ctx, queueType, name, metadata.TableName)
 
-	// Invalidate the metadata cache and drop the push-delivery waker BEFORE
-	// commit so a panic or crash between commit and these cleanups cannot
-	// leave a stale cache entry or a leaked LISTEN behind. If commit then
-	// fails the queue still exists; both side effects are recoverable: the
-	// cache cold-fetches on the next access, and a consumer's wakeChan call
-	// re-registers the waker and LISTEN lazily. The post-commit invalidate
-	// remains as the in-process race guard: another goroutine that started a
-	// metadata lookup while the delete was in flight may have repopulated
-	// the cache between this pre-commit invalidate and Commit returning
-	// (#63).
-	pq.invalidateQueueCaches(ctx, queueType, name, metadata.TableName)
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	if pq.mdcache != nil {
@@ -1004,7 +1002,7 @@ func (pq *Queue) createPubSubTables(
 			id UUID PRIMARY KEY,
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+			metadata JSONB DEFAULT '{}'::jsonb
 		)`, pq.msgTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
@@ -1161,7 +1159,7 @@ func (pq *Queue) createChannelTables(
 			claim_id UUID,
 			processed_at TIMESTAMPTZ,
 			error_message TEXT,
-			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+			metadata JSONB DEFAULT '{}'::jsonb
 		)`, pq.msgTable(tableName), MessageStatusPending)
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
@@ -1248,7 +1246,7 @@ func (pq *Queue) createDLQTable(
 			failure_reason TEXT NOT NULL,
 			retry_count BIGINT NOT NULL CHECK (retry_count >= 0),
 			moved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+			metadata JSONB DEFAULT '{}'::jsonb
 		)`, pq.dlqTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, dlqTable); err != nil {

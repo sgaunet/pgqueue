@@ -108,29 +108,27 @@ func (pq *Queue) consumeFromTopic(
 		return nil, ErrQueuePaused
 	}
 
-	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	ttl := pq.getQueueTTL(queueMeta.Config)
 	maxRetries := pq.resolveMaxRetries(queueMeta)
 
-	msg, visTimeout, err := pq.fetchPendingTopicMessage(
-		ctx, tx, queueMeta.TableName, topicName, subscriberID, visibilityTimeout, ttl, maxRetries,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch pending topic message: %w", err)
-	}
+	var msg *Message
+	var visTimeout *time.Time
 	// Commit unconditionally — even with no message to deliver. The scan may
 	// have deferred timed-out subscriptions with a backoff delay (R-05), and
 	// those UPDATEs must persist rather than be discarded by the deferred
 	// Rollback. With no message and no deferral the transaction is read-only,
 	// so the commit is harmless.
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	if err := pq.withTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		msg, visTimeout, txErr = pq.fetchPendingTopicMessage(
+			ctx, tx, queueMeta.TableName, topicName, subscriberID, visibilityTimeout, ttl, maxRetries,
+		)
+		if txErr != nil {
+			return fmt.Errorf("failed to fetch pending topic message: %w", txErr)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	if msg == nil {
@@ -180,30 +178,22 @@ func (pq *Queue) ackTopic(
 	// Run the UPDATE and, on a miss, the classifying SELECT in one transaction
 	// so the classification observes the same snapshot as the failed UPDATE — a
 	// concurrent reclaim cannot slip in between and flip the error type (R-09).
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, query, r.MessageID, subscriberID, r.ClaimID)
+		if err != nil {
+			return fmt.Errorf("failed to acknowledge message: %w", err)
+		}
 
-	result, err := tx.ExecContext(ctx, query, r.MessageID, subscriberID, r.ClaimID)
-	if err != nil {
-		return fmt.Errorf("failed to acknowledge message: %w", err)
-	}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+		if rows == 0 {
+			return classifyTopicAckMiss(ctx, tx, pq.subTable(queueMeta.TableName), subscriberID, r)
+		}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	if rows == 0 {
-		return classifyTopicAckMiss(ctx, tx, pq.subTable(queueMeta.TableName), subscriberID, r)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // nackTopicWithOpts is the option-aware topic nack used by the queue-agnostic
@@ -247,43 +237,35 @@ func (pq *Queue) nackTopicImpl(
 		return fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	state, err := pq.getProcessingSubState(
-		ctx, tx, queueMeta.TableName, r, subscriberID,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to get subscription state: %w", err)
-	}
-
-	maxRetry := pq.resolveMaxRetries(queueMeta)
-
-	if state.retryCount+1 > maxRetry {
-		if err := pq.moveSubToDLQ(
-			ctx, tx, queueMeta.TableName,
-			r.MessageID, subscriberID, errorMsg, state,
-		); err != nil {
-			return fmt.Errorf("failed to move to DLQ: %w", err)
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		state, err := pq.getProcessingSubState(
+			ctx, tx, queueMeta.TableName, r, subscriberID,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to get subscription state: %w", err)
 		}
-	} else {
-		delay := pq.computeRetryDelay(state.retryCount+1, retryDelay)
-		if err := pq.retrySubscription(
-			ctx, tx, queueMeta.TableName,
-			r.MessageID, subscriberID, errorMsg, delay,
-		); err != nil {
-			return fmt.Errorf("failed to retry subscription: %w", err)
+
+		maxRetry := pq.resolveMaxRetries(queueMeta)
+
+		if state.retryCount+1 > maxRetry {
+			if err := pq.moveSubToDLQ(
+				ctx, tx, queueMeta.TableName,
+				r.MessageID, subscriberID, errorMsg, state,
+			); err != nil {
+				return fmt.Errorf("failed to move to DLQ: %w", err)
+			}
+		} else {
+			delay := pq.computeRetryDelay(state.retryCount+1, retryDelay)
+			if err := pq.retrySubscription(
+				ctx, tx, queueMeta.TableName,
+				r.MessageID, subscriberID, errorMsg, delay,
+			); err != nil {
+				return fmt.Errorf("failed to retry subscription: %w", err)
+			}
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 type subState struct {

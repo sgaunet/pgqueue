@@ -360,38 +360,30 @@ func (gc *GarbageCollector) executePurge(
 	tableName string,
 	queueType QueueType,
 ) error {
-	tx, err := gc.pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// For pub/sub, delete subscriptions first (before messages, to avoid FK issues
-	// if CASCADE is not relied upon). For channels, this table does not exist.
-	if queueType == QueueTypePubSub {
-		deleteSub := "DELETE FROM " + gc.pq.subTable(tableName) //nolint:gosec // G201: table name validated
-		if _, err := tx.ExecContext(ctx, deleteSub); err != nil {
-			return fmt.Errorf("failed to delete subscriptions: %w", err)
+	return gc.pq.withTx(ctx, func(tx *sql.Tx) error {
+		// For pub/sub, delete subscriptions first (before messages, to avoid FK issues
+		// if CASCADE is not relied upon). For channels, this table does not exist.
+		if queueType == QueueTypePubSub {
+			deleteSub := "DELETE FROM " + gc.pq.subTable(tableName) //nolint:gosec // G201: table name validated
+			if _, err := tx.ExecContext(ctx, deleteSub); err != nil {
+				return fmt.Errorf("failed to delete subscriptions: %w", err)
+			}
 		}
-	}
 
-	// Delete all messages
-	deleteMsg := "DELETE FROM " + gc.pq.msgTable(tableName) //nolint:gosec // G201: table name validated
-	if _, err := tx.ExecContext(ctx, deleteMsg); err != nil {
-		return fmt.Errorf("failed to delete messages: %w", err)
-	}
+		// Delete all messages
+		deleteMsg := "DELETE FROM " + gc.pq.msgTable(tableName) //nolint:gosec // G201: table name validated
+		if _, err := tx.ExecContext(ctx, deleteMsg); err != nil {
+			return fmt.Errorf("failed to delete messages: %w", err)
+		}
 
-	// Delete all DLQ messages
-	deleteDLQ := "DELETE FROM " + gc.pq.dlqTable(tableName) //nolint:gosec // G201: table name validated
-	if _, err := tx.ExecContext(ctx, deleteDLQ); err != nil {
-		return fmt.Errorf("failed to delete DLQ messages: %w", err)
-	}
+		// Delete all DLQ messages
+		deleteDLQ := "DELETE FROM " + gc.pq.dlqTable(tableName) //nolint:gosec // G201: table name validated
+		if _, err := tx.ExecContext(ctx, deleteDLQ); err != nil {
+			return fmt.Errorf("failed to delete DLQ messages: %w", err)
+		}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit purge: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // collectQueue performs garbage collection for a single queue and emits a
@@ -511,28 +503,26 @@ func (gc *GarbageCollector) promoteExhaustedChannelPage(
 	tableName, selectQuery string,
 	defaultMax int,
 ) (int, error) {
-	tx, err := gc.pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	batch, err := scanExhaustedChannelMessages(ctx, tx, selectQuery, defaultMax)
-	if err != nil {
-		return 0, err
-	}
-
-	for _, e := range batch {
-		if err := gc.pq.moveToDLQ(
-			ctx, tx, tableName, e.id, errReasonVisibilityTimeout,
-			e.payload, e.retryCount+1, e.metadataJSON,
-		); err != nil {
-			return 0, fmt.Errorf("failed to move exhausted message to DLQ: %w", err)
+	var batch []exhaustedChannelMessage
+	if err := gc.pq.withTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		batch, err = scanExhaustedChannelMessages(ctx, tx, selectQuery, defaultMax)
+		if err != nil {
+			return err
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit exhausted-message promotion: %w", err)
+		for _, e := range batch {
+			if err := gc.pq.moveToDLQ(
+				ctx, tx, tableName, e.id, errReasonVisibilityTimeout,
+				e.payload, e.retryCount+1, e.metadataJSON,
+			); err != nil {
+				return fmt.Errorf("failed to move exhausted message to DLQ: %w", err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 
 	if len(batch) > 0 {
@@ -635,31 +625,29 @@ func (gc *GarbageCollector) promoteExhaustedTopicPage(
 	tableName, selectQuery string,
 	maxRetries int,
 ) (int, error) {
-	tx, err := gc.pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	batch, err := scanExhaustedTopicSubscriptions(ctx, tx, selectQuery, maxRetries)
-	if err != nil {
-		return 0, err
-	}
-
-	for _, e := range batch {
-		// moveSubToDLQ counts the timeout reclaim itself (state.retryCount+1),
-		// so the raw stored retry_count is passed — the same contract
-		// reclaimTopicAttempt relies on.
-		if err := gc.pq.moveSubToDLQ(
-			ctx, tx, tableName, e.messageID, e.subscriberID, errReasonVisibilityTimeout,
-			&subState{retryCount: e.retryCount, payload: e.payload, metadataJSON: e.metadataJSON},
-		); err != nil {
-			return 0, fmt.Errorf("failed to move exhausted subscription to DLQ: %w", err)
+	var batch []exhaustedTopicSubscription
+	if err := gc.pq.withTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		batch, err = scanExhaustedTopicSubscriptions(ctx, tx, selectQuery, maxRetries)
+		if err != nil {
+			return err
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit exhausted-subscription promotion: %w", err)
+		for _, e := range batch {
+			// moveSubToDLQ counts the timeout reclaim itself (state.retryCount+1),
+			// so the raw stored retry_count is passed — the same contract
+			// reclaimTopicAttempt relies on.
+			if err := gc.pq.moveSubToDLQ(
+				ctx, tx, tableName, e.messageID, e.subscriberID, errReasonVisibilityTimeout,
+				&subState{retryCount: e.retryCount, payload: e.payload, metadataJSON: e.metadataJSON},
+			); err != nil {
+				return fmt.Errorf("failed to move exhausted subscription to DLQ: %w", err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 
 	if len(batch) > 0 {

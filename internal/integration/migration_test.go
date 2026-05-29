@@ -247,9 +247,9 @@ func TestRetryCounterColumnsAreBigint(t *testing.T) {
 
 // TestMigrateBigintRetryCounts verifies the v4 migration widens the retry
 // counters of pre-existing per-queue tables. It simulates a database created
-// before v4 by reverting the columns to INT and deleting the v4 row from
-// pgqueue_schema_version, then re-runs InitSchema and asserts every counter is
-// BIGINT again.
+// before v4 by reverting the columns to INT and deleting the v4-and-later rows
+// from pgqueue_schema_version, then re-runs InitSchema and asserts every counter
+// is BIGINT again.
 func TestMigrateBigintRetryCounts(t *testing.T) {
 	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -283,10 +283,13 @@ func TestMigrateBigintRetryCounts(t *testing.T) {
 		}
 	}
 
-	// Drop the recorded v4 version so the migration runner re-applies it.
+	// Drop v4 and every later recorded version so the forward-only runner (which
+	// keys off MAX(version)) treats the database as pre-v4 and re-applies v4
+	// onward. Deleting only the v4 row would leave MAX(version) at the latest
+	// schema, and the runner would skip v4 as already applied.
 	if _, err := db.ExecContext(ctx,
-		`DELETE FROM pgqueue_schema_version WHERE version = 4`); err != nil {
-		t.Fatalf("delete v4 schema_version row: %v", err)
+		`DELETE FROM pgqueue_schema_version WHERE version >= 4`); err != nil {
+		t.Fatalf("delete v4+ schema_version rows: %v", err)
 	}
 
 	// Re-run the migration runner; it must re-apply v4 and widen the columns.

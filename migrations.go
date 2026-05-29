@@ -795,18 +795,15 @@ func migrateMaxRetriesNotNull(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// migrateMetadataDefault is the v6 migration. Tables that have a metadata JSONB
-// column previously declared it without a DEFAULT, leaving rows inserted by
-// older code (which omitted the column) with a NULL value. New tables emit
-// metadata JSONB NOT NULL DEFAULT '{}'::jsonb. This migration:
-//  1. Backfills NULL metadata to '{}' on every table that carries the column
-//     (pubsub message, channel message, and DLQ tables).
-//  2. Sets NOT NULL on the column.
-//  3. Adds the DEFAULT so future rows get '{}' automatically.
-//
-// The migration is safe on populated tables: the UPDATE uses a cheap indexed
-// IS NULL predicate, and the NOT NULL constraint is validated in the same
-// transaction after backfilling, so it cannot fail on a previously NULL row.
+// migrateMetadataDefault is the v6 migration. Older per-queue and DLQ tables
+// declared metadata JSONB with no DEFAULT, whereas new tables emit
+// metadata JSONB DEFAULT '{}'::jsonb. This migration standardizes that default
+// on every existing table that carries the column (pubsub message, channel
+// message, and DLQ tables) so a raw insert omitting the column gets the
+// canonical empty object. The column is left NULLABLE (#125): the library's own
+// inserts pass an explicit value, and parseMetadataJSON treats NULL and '{}'
+// identically, so making it NOT NULL would break inserts that pass NULL.
+// Setting an already-present default is a no-op, so the migration is idempotent.
 func migrateMetadataDefault(ctx context.Context, tx *sql.Tx) error {
 	tableNames, err := listQueueTableNames(ctx, tx)
 	if err != nil {
@@ -816,14 +813,14 @@ func migrateMetadataDefault(ctx context.Context, tx *sql.Tx) error {
 	for _, tableName := range tableNames {
 		// Both queue types (channel and pubsub) have pgqueue_msg_* and
 		// pgqueue_dlq_* tables with a metadata column.
-		// setMetadataNotNullWithDefault probes information_schema first and
-		// skips tables where the column does not exist, so it is safe to call
-		// unconditionally for every table pattern.
+		// setMetadataDefault probes information_schema first and skips tables
+		// where the column does not exist, so it is safe to call unconditionally
+		// for every table pattern.
 		for _, tbl := range []string{
 			"pgqueue_msg_" + tableName,
 			"pgqueue_dlq_" + tableName,
 		} {
-			if err := setMetadataNotNullWithDefault(ctx, tx, tbl); err != nil {
+			if err := setMetadataDefault(ctx, tx, tbl); err != nil {
 				return err
 			}
 		}
@@ -832,13 +829,16 @@ func migrateMetadataDefault(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// setMetadataNotNullWithDefault backfills NULL metadata rows to '{}', sets
-// NOT NULL, and adds DEFAULT '{}'::jsonb on a single table. It is idempotent:
-// if the column is already NOT NULL the UPDATE is a no-op and ALTER TABLE is
-// a no-op too. table must be a sanitized pgqueue table name (safe to interpolate).
-func setMetadataNotNullWithDefault(ctx context.Context, tx *sql.Tx, table string) error {
-	// Check whether the column exists on this table — sub tables have no
-	// metadata column so we skip them silently.
+// setMetadataDefault adds DEFAULT '{}'::jsonb to the metadata column of a single
+// table so a raw insert that omits the column receives the canonical empty
+// object (#125). The column is left NULLABLE on purpose: the library's own
+// inserts always supply an explicit value (NULL when there is no metadata, via
+// jsonbParam), and parseMetadataJSON treats NULL and '{}' identically — making
+// the column NOT NULL would reject those NULL inserts. It is idempotent (setting
+// an already-present default is a no-op). table must be a sanitized pgqueue
+// table name (safe to interpolate).
+func setMetadataDefault(ctx context.Context, tx *sql.Tx, table string) error {
+	// Sub tables have no metadata column, so skip them silently.
 	var colExists bool
 	err := tx.QueryRowContext(ctx,
 		`SELECT EXISTS (
@@ -856,26 +856,6 @@ func setMetadataNotNullWithDefault(ctx context.Context, tx *sql.Tx, table string
 		return nil
 	}
 
-	// Step 1: backfill NULLs.
-	//nolint:gosec // G201: table is a pgqueue_metadata table name validated by queueNameRegex, not user input.
-	backfill := fmt.Sprintf(
-		`UPDATE %s SET metadata = '{}'::jsonb WHERE metadata IS NULL`,
-		table,
-	)
-	if _, err := tx.ExecContext(ctx, backfill); err != nil {
-		return fmt.Errorf("backfill metadata on %s: %w", table, err)
-	}
-
-	// Step 2: set NOT NULL.
-	setNotNull := fmt.Sprintf(
-		`ALTER TABLE %s ALTER COLUMN metadata SET NOT NULL`,
-		table,
-	)
-	if _, err := tx.ExecContext(ctx, setNotNull); err != nil {
-		return fmt.Errorf("set metadata NOT NULL on %s: %w", table, err)
-	}
-
-	// Step 3: set DEFAULT.
 	setDefault := fmt.Sprintf(
 		`ALTER TABLE %s ALTER COLUMN metadata SET DEFAULT '{}'::jsonb`,
 		table,

@@ -546,54 +546,46 @@ func (pq *Queue) publishBatchToChannel(
 	metadataJSONs [][]byte,
 	maxRetries int,
 ) error {
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		var sb strings.Builder
+		fmt.Fprintf(&sb,
+			"INSERT INTO %s (id, payload, status, metadata, max_retries) VALUES ",
+			pq.msgTable(tableName),
+		)
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb,
-		"INSERT INTO %s (id, payload, status, metadata, max_retries) VALUES ",
-		pq.msgTable(tableName),
-	)
-
-	args := make([]any, 0, len(messages)*channelInsertParams)
-	for i := range messages {
-		if i > 0 {
-			sb.WriteString(", ")
+		args := make([]any, 0, len(messages)*channelInsertParams)
+		for i := range messages {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			base := i * channelInsertParams
+			fmt.Fprintf(&sb, "($%d, $%d, '%s', $%d, $%d)",
+				base+1, base+2, MessageStatusPending, base+3, base+4, //nolint:mnd // SQL placeholder arithmetic
+			)
+			args = append(args, ids[i], messages[i].Payload, jsonbParam(metadataJSONs[i]), maxRetries)
 		}
-		base := i * channelInsertParams
-		fmt.Fprintf(&sb, "($%d, $%d, '%s', $%d, $%d)",
-			base+1, base+2, MessageStatusPending, base+3, base+4, //nolint:mnd // SQL placeholder arithmetic
-		)
-		args = append(args, ids[i], messages[i].Payload, jsonbParam(metadataJSONs[i]), maxRetries)
-	}
-	sb.WriteString(" ON CONFLICT (id) DO NOTHING")
+		sb.WriteString(" ON CONFLICT (id) DO NOTHING")
 
-	result, err := tx.ExecContext(ctx, sb.String(), args...)
-	if err != nil {
-		return fmt.Errorf("failed to insert messages: %w", err)
-	}
+		result, err := tx.ExecContext(ctx, sb.String(), args...)
+		if err != nil {
+			return fmt.Errorf("failed to insert messages: %w", err)
+		}
 
-	rowsAffected, err := rowsAffectedOrErr(result)
-	if err != nil {
-		return err
-	}
-	if rowsAffected < int64(len(messages)) {
-		return fmt.Errorf(
-			"some messages had duplicate IDs: %w", ErrDuplicateMessageID,
-		)
-	}
+		rowsAffected, err := rowsAffectedOrErr(result)
+		if err != nil {
+			return err
+		}
+		if rowsAffected < int64(len(messages)) {
+			return fmt.Errorf(
+				"some messages had duplicate IDs: %w", ErrDuplicateMessageID,
+			)
+		}
 
-	// Wake any blocked consumer the instant this batch publish commits (FR-014).
-	pq.emitNotify(ctx, tx, tableName)
+		// Wake any blocked consumer the instant this batch publish commits (FR-014).
+		pq.emitNotify(ctx, tx, tableName)
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // publishBatchToPubSub inserts multiple messages and subscription records in a transaction.
@@ -604,37 +596,29 @@ func (pq *Queue) publishBatchToPubSub(
 	messages []PublishMessage,
 	metadataJSONs [][]byte,
 ) error {
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if err := pq.insertBatchPubSubMessages(ctx, tx, tableName, ids, messages, metadataJSONs); err != nil {
-		return err
-	}
-
-	subscribers, err := pq.getActiveSubscribers(ctx, tx, topicName)
-	if err != nil {
-		return fmt.Errorf("failed to get active subscribers: %w", err)
-	}
-
-	if len(subscribers) > 0 {
-		if err := pq.batchCreateSubscriptionRecords(
-			ctx, tx, tableName, ids, subscribers,
-		); err != nil {
-			return fmt.Errorf("failed to create subscription records: %w", err)
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		if err := pq.insertBatchPubSubMessages(ctx, tx, tableName, ids, messages, metadataJSONs); err != nil {
+			return err
 		}
-	}
 
-	// Wake any blocked consumer the instant this batch publish commits (FR-014).
-	pq.emitNotify(ctx, tx, tableName)
+		subscribers, err := pq.getActiveSubscribers(ctx, tx, topicName)
+		if err != nil {
+			return fmt.Errorf("failed to get active subscribers: %w", err)
+		}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
+		if len(subscribers) > 0 {
+			if err := pq.batchCreateSubscriptionRecords(
+				ctx, tx, tableName, ids, subscribers,
+			); err != nil {
+				return fmt.Errorf("failed to create subscription records: %w", err)
+			}
+		}
 
-	return nil
+		// Wake any blocked consumer the instant this batch publish commits (FR-014).
+		pq.emitNotify(ctx, tx, tableName)
+
+		return nil
+	})
 }
 
 func (pq *Queue) insertBatchPubSubMessages(

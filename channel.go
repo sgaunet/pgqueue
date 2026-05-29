@@ -65,28 +65,26 @@ func (pq *Queue) consumeFromChannel(
 		return nil, ErrQueuePaused
 	}
 
-	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	ttl := pq.getQueueTTL(queueMeta.Config)
 
-	msg, visTimeout, err := pq.fetchPendingChannelMessage(
-		ctx, tx, queueMeta.TableName, channelName, visibilityTimeout, ttl,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch pending channel message: %w", err)
-	}
+	var msg *Message
+	var visTimeout *time.Time
 	// Commit unconditionally — even with no message to deliver. The scan may
 	// have deferred timed-out messages with a backoff delay (R-05), and those
 	// UPDATEs must persist rather than be discarded by the deferred Rollback.
 	// With no message and no deferral the transaction is read-only, so the
 	// commit is harmless.
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	if err := pq.withTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		msg, visTimeout, txErr = pq.fetchPendingChannelMessage(
+			ctx, tx, queueMeta.TableName, channelName, visibilityTimeout, ttl,
+		)
+		if txErr != nil {
+			return fmt.Errorf("failed to fetch pending channel message: %w", txErr)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	if msg == nil {
@@ -129,30 +127,22 @@ func (pq *Queue) ackChannel(
 	// Run the UPDATE and, on a miss, the classifying SELECT in one transaction
 	// so the classification observes the same snapshot as the failed UPDATE —
 	// a concurrent reclaim cannot slip in between and flip the error type (R-09).
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, query, r.MessageID, r.ClaimID)
+		if err != nil {
+			return fmt.Errorf("failed to acknowledge message: %w", err)
+		}
 
-	result, err := tx.ExecContext(ctx, query, r.MessageID, r.ClaimID)
-	if err != nil {
-		return fmt.Errorf("failed to acknowledge message: %w", err)
-	}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+		if rows == 0 {
+			return classifyChannelAckMiss(ctx, tx, pq.msgTable(tableName), r)
+		}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	if rows == 0 {
-		return classifyChannelAckMiss(ctx, tx, pq.msgTable(tableName), r)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 // nackChannelWithOpts is the option-aware nack used by the queue-agnostic Nack.
@@ -191,33 +181,23 @@ func (pq *Queue) nackChannelImpl(
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
 
-	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		// Get current message state
+		msgState, err := pq.getProcessingMessageState(
+			ctx, tx, queueMeta.TableName, r,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to get message state: %w", err)
+		}
 
-	// Get current message state
-	msgState, err := pq.getProcessingMessageState(
-		ctx, tx, queueMeta.TableName, r,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to get message state: %w", err)
-	}
+		if err := pq.handleNack(
+			ctx, tx, queueMeta.TableName, r.MessageID, errorMsg, msgState, retryDelay,
+		); err != nil {
+			return fmt.Errorf("failed to handle nack: %w", err)
+		}
 
-	if err := pq.handleNack(
-		ctx, tx, queueMeta.TableName, r.MessageID, errorMsg, msgState, retryDelay,
-	); err != nil {
-		return fmt.Errorf("failed to handle nack: %w", err)
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 type messageState struct {

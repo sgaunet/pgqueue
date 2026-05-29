@@ -225,49 +225,39 @@ func (pq *Queue) publishToPubSub(
 	payload []byte,
 	metadata []byte,
 ) error {
-	// Begin transaction
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Insert message atomically with conflict detection
-	//nolint:gosec // G201: table name validated by queueNameRegex
-	insertMsg := fmt.Sprintf(`
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		// Insert message atomically with conflict detection
+		//nolint:gosec // G201: table name validated by queueNameRegex
+		insertMsg := fmt.Sprintf(`
 		INSERT INTO %s (id, payload, metadata)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (id) DO NOTHING
 	`, pq.msgTable(tableName))
 
-	result, err := tx.ExecContext(ctx, insertMsg, messageID, payload, jsonbParam(metadata))
-	if err != nil {
-		return fmt.Errorf("failed to insert message: %w", err)
-	}
+		result, err := tx.ExecContext(ctx, insertMsg, messageID, payload, jsonbParam(metadata))
+		if err != nil {
+			return fmt.Errorf("failed to insert message: %w", err)
+		}
 
-	rowsAffected, err := rowsAffectedOrErr(result)
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
-	}
+		rowsAffected, err := rowsAffectedOrErr(result)
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
+		}
 
-	if err := pq.createSubscriptionRecords(
-		ctx, tx, topicName, tableName, messageID,
-	); err != nil {
-		return fmt.Errorf("failed to create subscription records: %w", err)
-	}
+		if err := pq.createSubscriptionRecords(
+			ctx, tx, topicName, tableName, messageID,
+		); err != nil {
+			return fmt.Errorf("failed to create subscription records: %w", err)
+		}
 
-	// Wake any blocked consumer the instant this publish commits (FR-014).
-	pq.emitNotify(ctx, tx, tableName)
+		// Wake any blocked consumer the instant this publish commits (FR-014).
+		pq.emitNotify(ctx, tx, tableName)
 
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
 
 func (pq *Queue) createSubscriptionRecords(
@@ -311,41 +301,33 @@ func (pq *Queue) publishToChannel(
 	metadata []byte,
 	maxRetries int,
 ) error {
-	tx, err := pq.db.BeginTx(ctx, readCommittedTxOptions)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Insert message atomically with conflict detection
-	//nolint:gosec // G201: table name validated by queueNameRegex
-	insertMsg := fmt.Sprintf(`
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		// Insert message atomically with conflict detection
+		//nolint:gosec // G201: table name validated by queueNameRegex
+		insertMsg := fmt.Sprintf(`
 		INSERT INTO %s (id, payload, status, metadata, max_retries)
 		VALUES ($1, $2, '%s', $3, $4)
 		ON CONFLICT (id) DO NOTHING
 	`, pq.msgTable(tableName), MessageStatusPending)
 
-	result, err := tx.ExecContext(
-		ctx, insertMsg, messageID, payload, jsonbParam(metadata), maxRetries,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to insert message: %w", err)
-	}
+		result, err := tx.ExecContext(
+			ctx, insertMsg, messageID, payload, jsonbParam(metadata), maxRetries,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert message: %w", err)
+		}
 
-	rowsAffected, err := rowsAffectedOrErr(result)
-	if err != nil {
-		return err
-	}
-	if rowsAffected == 0 {
-		return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
-	}
+		rowsAffected, err := rowsAffectedOrErr(result)
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return fmt.Errorf("%s: %w", messageID, ErrDuplicateMessageID)
+		}
 
-	// Wake any blocked consumer the instant this publish commits (FR-014).
-	pq.emitNotify(ctx, tx, tableName)
+		// Wake any blocked consumer the instant this publish commits (FR-014).
+		pq.emitNotify(ctx, tx, tableName)
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+		return nil
+	})
 }
