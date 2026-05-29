@@ -5,9 +5,9 @@ on:
     # paths-ignore:
     #   - '**.md'
     #   - 'docs/**'
-  # Optionally run on pull requests
-  # pull_request:
-  #   branches: [main]
+  # Run on pull requests targeting main so PRs (incl. from forks) get lint signal
+  pull_request:
+    branches: [main]
 
 jobs:
   lint:
