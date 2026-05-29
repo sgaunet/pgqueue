@@ -77,7 +77,7 @@ func (pq *Queue) ListDLQMessages(
 
 	messages := make([]DLQMessage, 0, limit)
 	for rows.Next() {
-		msg, scanErr := pq.scanDLQMessage(rows)
+		msg, scanErr := pq.scanDLQMessage(name, rows)
 		if scanErr != nil {
 			return nil, DLQPage{}, scanErr
 		}
@@ -94,8 +94,9 @@ func (pq *Queue) ListDLQMessages(
 	return messages, next, nil
 }
 
-// scanDLQMessage scans one DLQ row into a DLQMessage.
-func (pq *Queue) scanDLQMessage(rows rowScanner) (DLQMessage, error) {
+// scanDLQMessage scans one DLQ row into a DLQMessage. queue is the logical
+// queue/topic name used to label any RecordMetadataParseError observation.
+func (pq *Queue) scanDLQMessage(queue string, rows rowScanner) (DLQMessage, error) {
 	var (
 		msg          DLQMessage
 		metadataJSON sql.NullString
@@ -106,7 +107,7 @@ func (pq *Queue) scanDLQMessage(rows rowScanner) (DLQMessage, error) {
 	); err != nil {
 		return DLQMessage{}, fmt.Errorf("failed to scan DLQ message: %w", err)
 	}
-	msg.Metadata = pq.parseMetadataJSON(metadataJSON)
+	msg.Metadata = pq.parseMetadataJSON(queue, metadataJSON)
 	return msg, nil
 }
 

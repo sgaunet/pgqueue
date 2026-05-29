@@ -113,6 +113,11 @@ const listenEscalateThreshold = 10
 type notifier struct {
 	listener Listener
 	logger   *slog.Logger
+	// onMissedNotification is called when a LISTEN confirmation fails, meaning
+	// at least one notification was or will be missed on notifyChannel until
+	// LISTEN is re-confirmed. It is set from Queue.cfg.metrics via newNotifier
+	// and may be nil when no MetricsRecorder is registered.
+	onMissedNotification func(notifyChannel string)
 
 	// ctx scopes the confirmListen goroutines' Listen calls; cancel fires on
 	// close so a goroutine blocked confirming a LISTEN during an outage exits
@@ -224,6 +229,12 @@ func (n *notifier) confirmListen(notifyChannel string) {
 	}
 	n.listenFailures[notifyChannel]++
 	n.logListenFailure(notifyChannel, err, n.listenFailures[notifyChannel])
+	// LISTEN failed — any NOTIFYs sent while this channel is not confirmed are
+	// silently dropped. Emit one missed-notification event per failure so
+	// operators can quantify how often push delivery degrades to polling.
+	if n.onMissedNotification != nil {
+		n.onMissedNotification(notifyChannel)
+	}
 }
 
 // logListenFailure reports a Listen call failure. It always logs at WARN with

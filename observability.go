@@ -84,22 +84,41 @@ type MetricsRecorder interface {
 	ObserveQueueDepth(queue string, depth int64)
 	// ObserveDLQSize reports the current dead-letter queue size.
 	ObserveDLQSize(queue string, size int64)
+	// RecordMetadataParseError reports that the JSON metadata column for a
+	// message in queue could not be parsed. The message is delivered with no
+	// metadata rather than being dropped; operators wire this counter to detect
+	// sustained corruption.
+	RecordMetadataParseError(queue string)
+	// RecordGCRun reports the outcome of a single per-queue garbage-collection
+	// pass: how long it took, how many expired/timed-out messages were
+	// reclaimed (reset to pending or dead-lettered), how many rows were purged
+	// by the retention policy, and whether the pass encountered an error.
+	// duration is the wall-clock time of the collectQueue call; reclaimed is
+	// the count of timed-out messages reset to pending or moved to the DLQ;
+	// purged is the total rows deleted by the retention policy; err is non-nil
+	// when collectQueue returned an error (the GC logs and continues).
+	RecordGCRun(queue string, duration time.Duration, reclaimed, purged int64, err error)
+	// RecordMissedNotification reports that the LISTEN/NOTIFY channel for
+	// queue lost at least one notification — typically during a reconnect.
+	// The safety-net poll recovers correctness; this counter lets operators
+	// quantify how often push delivery degrades to polling.
+	RecordMissedNotification(queue string)
 }
 
 // noopSpan is the Span returned when no Tracer is registered, so instrumented
 // code can call span methods unconditionally without a nil check.
 type noopSpan struct{}
 
-func (noopSpan) End()             {}
-func (noopSpan) SetError(error)   {}
-func (noopSpan) SetAttr(...Attr)  {}
+func (noopSpan) End()            {}
+func (noopSpan) SetError(error)  {}
+func (noopSpan) SetAttr(...Attr) {}
 
 // startSpan begins a tracing span when a Tracer is registered (WithTracer);
 // otherwise it returns ctx unchanged and a no-op span. The returned span must
-// always be ended by the caller.
+// always be ended by the caller. Returning Span (real or no-op) is the
+// intended polymorphism.
 //
-//nolint:ireturn // Span is the public observability hook interface; returning
-// it (a real span or the no-op) is the intended polymorphism.
+//nolint:ireturn // Span is the public observability hook interface.
 func (pq *Queue) startSpan(
 	ctx context.Context,
 	name string,
@@ -162,6 +181,27 @@ func (pq *Queue) observeQueueDepth(queue string, depth int64) {
 func (pq *Queue) observeDLQSize(queue string, size int64) {
 	if pq.cfg.metrics != nil {
 		pq.cfg.metrics.ObserveDLQSize(queue, size)
+	}
+}
+
+// recordMetadataParseError reports one corrupt-metadata event for queue, if on.
+func (pq *Queue) recordMetadataParseError(queue string) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.RecordMetadataParseError(queue)
+	}
+}
+
+// recordGCRun reports the outcome of a single per-queue GC pass, if metrics on.
+func (pq *Queue) recordGCRun(queue string, duration time.Duration, reclaimed, purged int64, err error) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.RecordGCRun(queue, duration, reclaimed, purged, err)
+	}
+}
+
+// recordMissedNotification reports one lost LISTEN/NOTIFY notification, if on.
+func (pq *Queue) recordMissedNotification(queue string) {
+	if pq.cfg.metrics != nil {
+		pq.cfg.metrics.RecordMissedNotification(queue)
 	}
 }
 

@@ -394,31 +394,48 @@ func (gc *GarbageCollector) executePurge(
 	return nil
 }
 
-// collectQueue performs garbage collection for a single queue.
+// collectQueue performs garbage collection for a single queue and emits a
+// RecordGCRun metric with the duration, reclaimed row count, purged row count,
+// and any error.
 func (gc *GarbageCollector) collectQueue(
 	ctx context.Context,
 	queue QueueMetadata,
 ) error {
+	start := time.Now()
+	purged, reclaimed, err := gc.doCollectQueue(ctx, queue)
+	gc.pq.recordGCRun(queue.QueueName, time.Since(start), reclaimed, purged, err)
+	return err
+}
+
+// doCollectQueue is the body of collectQueue. It returns the total rows
+// deleted by the retention policy (purged) and the total timed-out messages
+// reset to pending (reclaimed), plus any error. Factored out so collectQueue
+// can record the metric unconditionally, even on error.
+func (gc *GarbageCollector) doCollectQueue(
+	ctx context.Context,
+	queue QueueMetadata,
+) (int64, int64, error) {
 	policy := gc.getPolicy(queue.QueueName)
 
-	if err := gc.applyRetentionPolicy(ctx, queue, policy); err != nil {
-		return fmt.Errorf("failed to apply retention policy: %w", err)
+	purged, retErr := gc.applyRetentionPolicy(ctx, queue, policy)
+	if retErr != nil {
+		return purged, 0, fmt.Errorf("failed to apply retention policy: %w", retErr)
 	}
 
 	if queue.QueueType == QueueTypePubSub {
 		if err := gc.purgeInactiveSubscriptions(
 			ctx, queue.QueueName, queue.TableName,
 		); err != nil {
-			return fmt.Errorf("failed to purge inactive subscriptions: %w", err)
+			return purged, 0, fmt.Errorf("failed to purge inactive subscriptions: %w", err)
 		}
 		if err := gc.reclaimOrphanTopicMessages(ctx, queue.TableName); err != nil {
-			return fmt.Errorf("failed to reclaim orphan topic messages: %w", err)
+			return purged, 0, fmt.Errorf("failed to reclaim orphan topic messages: %w", err)
 		}
 		// Promote timed-out-and-exhausted subscriptions to the DLQ before
 		// resetTimedOutEntries runs, so a still-exhausted subscription is
 		// dead-lettered rather than reset back to pending.
 		if err := gc.promoteExhaustedTopicSubscriptions(ctx, queue); err != nil {
-			return fmt.Errorf("failed to promote exhausted subscriptions: %w", err)
+			return purged, 0, fmt.Errorf("failed to promote exhausted subscriptions: %w", err)
 		}
 	}
 
@@ -428,11 +445,15 @@ func (gc *GarbageCollector) collectQueue(
 	// than reset back to pending.
 	if queue.QueueType == QueueTypeChannel {
 		if err := gc.promoteExhaustedChannelMessages(ctx, queue.TableName); err != nil {
-			return fmt.Errorf("failed to promote exhausted messages: %w", err)
+			return purged, 0, fmt.Errorf("failed to promote exhausted messages: %w", err)
 		}
 	}
 
-	return gc.resetTimedOutEntries(ctx, queue)
+	reclaimed, resetErr := gc.resetTimedOutEntries(ctx, queue)
+	if resetErr != nil {
+		return purged, reclaimed, resetErr
+	}
+	return purged, reclaimed, nil
 }
 
 // promoteExhaustedChannelMessagesPageSize bounds the rows promoted to the DLQ
@@ -774,59 +795,74 @@ func (gc *GarbageCollector) reclaimOrphanTopicMessages(
 	return nil
 }
 
+// applyRetentionPolicy runs the TTL/age/DLQ purges for one queue and returns
+// the total number of rows deleted across all three purge phases.
 func (gc *GarbageCollector) applyRetentionPolicy(
 	ctx context.Context,
 	queue QueueMetadata,
 	policy RetentionPolicy,
-) error {
+) (int64, error) {
 	queueType := queue.QueueType
+	var total int64
 
 	if policy.CompletedMessageTTL > 0 {
-		if err := gc.purgeCompletedMessages(
+		n, err := gc.purgeCompletedMessages(
 			ctx, queue.TableName, queueType, policy.CompletedMessageTTL,
-		); err != nil {
-			return fmt.Errorf("failed to purge completed messages: %w", err)
+		)
+		total += n
+		if err != nil {
+			return total, fmt.Errorf("failed to purge completed messages: %w", err)
 		}
 	}
 
 	if policy.MaxPendingAge > 0 {
-		if err := gc.purgeOldPendingMessages(
+		n, err := gc.purgeOldPendingMessages(
 			ctx, queue.TableName, queueType, policy.MaxPendingAge,
-		); err != nil {
-			return fmt.Errorf("failed to purge old pending messages: %w", err)
+		)
+		total += n
+		if err != nil {
+			return total, fmt.Errorf("failed to purge old pending messages: %w", err)
 		}
 	}
 
 	if policy.DLQRetention > 0 {
-		if err := gc.purgeDLQMessages(
+		n, err := gc.purgeDLQMessages(
 			ctx, queue.TableName, policy.DLQRetention,
-		); err != nil {
-			return fmt.Errorf("failed to purge DLQ messages: %w", err)
+		)
+		total += n
+		if err != nil {
+			return total, fmt.Errorf("failed to purge DLQ messages: %w", err)
 		}
 	}
 
-	return nil
+	return total, nil
 }
 
+// resetTimedOutEntries resets timed-out messages/subscriptions for the queue
+// and returns the total number of rows reset (the "reclaimed" count).
 func (gc *GarbageCollector) resetTimedOutEntries(
 	ctx context.Context,
 	queue QueueMetadata,
-) error {
+) (int64, error) {
 	if queue.QueueType == QueueTypeChannel {
-		if err := gc.resetTimedOutMessages(ctx, queue.TableName); err != nil {
-			return fmt.Errorf("failed to reset timed-out messages: %w", err)
+		n, err := gc.resetTimedOutMessages(ctx, queue.TableName)
+		if err != nil {
+			return n, fmt.Errorf("failed to reset timed-out messages: %w", err)
 		}
+		return n, nil
 	}
 
 	if queue.QueueType == QueueTypePubSub {
-		if err := gc.resetTimedOutSubscriptions(ctx, queue.TableName); err != nil {
-			return fmt.Errorf(
+		n, err := gc.resetTimedOutSubscriptions(ctx, queue.TableName)
+		if err != nil {
+			return n, fmt.Errorf(
 				"failed to reset timed-out subscriptions: %w", err,
 			)
 		}
+		return n, nil
 	}
 
-	return nil
+	return 0, nil
 }
 
 // getPolicy returns the retention policy for a queue.
@@ -837,7 +873,8 @@ func (gc *GarbageCollector) getPolicy(queueName string) RetentionPolicy {
 	return gc.config.DefaultPolicy
 }
 
-// purgeCompletedMessages deletes messages older than ttl whose work is finished.
+// purgeCompletedMessages deletes messages older than ttl whose work is finished
+// and returns the total number of rows deleted.
 //
 // Work is paginated (issue #50): each iteration deletes at most
 // retentionPurgePageSize rows by id, using FOR UPDATE SKIP LOCKED in the
@@ -847,7 +884,7 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 	tableName string,
 	queueType QueueType,
 	ttl time.Duration,
-) error {
+) (int64, error) {
 	var query string
 	if queueType == QueueTypePubSub {
 		// A message still referenced by a DLQ row is kept so the DLQ entry stays
@@ -891,12 +928,12 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 
 	total, err := gc.runPagedPurge(ctx, query, ttl.Seconds())
 	if err != nil {
-		return fmt.Errorf("failed to purge completed messages: %w", err)
+		return total, fmt.Errorf("failed to purge completed messages: %w", err)
 	}
 	if total > 0 {
 		gc.pq.logInfo("purged completed messages", "count", total, "table", tableName)
 	}
-	return nil
+	return total, nil
 }
 
 // purgeOldPendingMessages drops deliveries that have been pending longer than
@@ -922,7 +959,7 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 	tableName string,
 	queueType QueueType,
 	maxAge time.Duration,
-) error {
+) (int64, error) {
 	var query string
 	if queueType == QueueTypePubSub {
 		// Delete only the stale pending subscription rows, joined to the message
@@ -959,12 +996,12 @@ func (gc *GarbageCollector) purgeOldPendingMessages(
 
 	total, err := gc.runPagedPurge(ctx, query, maxAge.Seconds())
 	if err != nil {
-		return fmt.Errorf("failed to purge old pending messages: %w", err)
+		return total, fmt.Errorf("failed to purge old pending messages: %w", err)
 	}
 	if total > 0 {
 		gc.pq.logInfo("purged old pending messages", "count", total, "table", tableName)
 	}
-	return nil
+	return total, nil
 }
 
 // purgeDLQMessages deletes DLQ messages older than retention period.
@@ -976,7 +1013,7 @@ func (gc *GarbageCollector) purgeDLQMessages(
 	ctx context.Context,
 	tableName string,
 	retention time.Duration,
-) error {
+) (int64, error) {
 	query := fmt.Sprintf(`
 		DELETE FROM %s
 		WHERE id IN (
@@ -991,12 +1028,12 @@ func (gc *GarbageCollector) purgeDLQMessages(
 
 	total, err := gc.runPagedPurge(ctx, query, retention.Seconds())
 	if err != nil {
-		return fmt.Errorf("failed to purge DLQ messages: %w", err)
+		return total, fmt.Errorf("failed to purge DLQ messages: %w", err)
 	}
 	if total > 0 {
 		gc.pq.logInfo("purged DLQ messages", "count", total, "table", tableName)
 	}
-	return nil
+	return total, nil
 }
 
 // resetTimedOutMessages resets messages with expired visibility timeouts back to
@@ -1007,10 +1044,11 @@ func (gc *GarbageCollector) purgeDLQMessages(
 // two (FOR UPDATE SKIP LOCKED plus the status transition), so the increment is
 // applied exactly once. A row reset here becomes immediately available rather
 // than backoff-delayed; that window is bounded by the multi-minute GC interval.
+// Returns the number of rows updated.
 func (gc *GarbageCollector) resetTimedOutMessages(
 	ctx context.Context,
 	tableName string,
-) error {
+) (int64, error) {
 	msgTbl := gc.pq.msgTable(tableName)
 	// The table name comes from a queueNameRegex-validated queue name, so this
 	// interpolation is injection-safe.
@@ -1031,7 +1069,7 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 
 	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("failed to reset timed-out messages: %w", err)
+		return 0, fmt.Errorf("failed to reset timed-out messages: %w", err)
 	}
 
 	rows, raErr := rowsAffectedOrErr(result)
@@ -1042,17 +1080,19 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 		gc.pq.logInfo("reset timed-out messages", "count", rows, "table", tableName)
 	}
 
-	return nil
+	return rows, nil
 }
 
 // resetTimedOutSubscriptions resets subscriptions with expired visibility
 // timeouts back to pending and counts the timeout as one delivery attempt
 // (retry_count + 1) — see resetTimedOutMessages for why the increment is applied
 // exactly once. FOR UPDATE SKIP LOCKED prevents racing with a concurrent consumer.
+// resetTimedOutSubscriptions resets timed-out pub/sub subscriptions back to
+// pending and returns the number of rows updated.
 func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	ctx context.Context,
 	tableName string,
-) error {
+) (int64, error) {
 	subTbl := gc.pq.subTable(tableName)
 	// The table name comes from a queueNameRegex-validated queue name, so this
 	// interpolation is injection-safe.
@@ -1073,7 +1113,7 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 
 	result, err := gc.pq.db.ExecContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf(
+		return 0, fmt.Errorf(
 			"failed to reset timed-out subscriptions: %w", err,
 		)
 	}
@@ -1086,7 +1126,7 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 		gc.pq.logInfo("reset timed-out subscriptions", "count", rows, "table", tableName)
 	}
 
-	return nil
+	return rows, nil
 }
 
 // purgeInactiveSubscriptions deletes leftover subscription rows belonging to

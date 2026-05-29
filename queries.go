@@ -31,9 +31,11 @@ func (pq *Queue) getQueueTTL(configJSON []byte) time.Duration {
 }
 
 // parseMetadataJSON parses a nullable JSON string into a metadata map. Corrupt
-// metadata is logged and treated as absent rather than failing the surrounding
-// consume, so a single bad row cannot wedge a consumer.
-func (pq *Queue) parseMetadataJSON(s sql.NullString) map[string]any {
+// metadata is logged, counted via RecordMetadataParseError, and treated as
+// absent rather than failing the surrounding consume, so a single bad row
+// cannot wedge a consumer. queue is the queue or topic name used to label the
+// metric; pass the logical queue name (not the physical table name).
+func (pq *Queue) parseMetadataJSON(queue string, s sql.NullString) map[string]any {
 	if !s.Valid || s.String == "" {
 		return nil
 	}
@@ -41,6 +43,7 @@ func (pq *Queue) parseMetadataJSON(s sql.NullString) map[string]any {
 	var m map[string]any
 	if err := json.Unmarshal([]byte(s.String), &m); err != nil {
 		pq.logError("failed to parse message metadata; dropping it", "error", err)
+		pq.recordMetadataParseError(queue)
 		return nil
 	}
 

@@ -121,6 +121,25 @@ func WithKeepaliveInterval(d time.Duration) Option {
 	return func(l *Listener) { l.keepaliveInterval = normalizeKeepaliveInterval(d) }
 }
 
+// WithOnReconnect registers a callback invoked each time the Listener
+// successfully re-establishes its PostgreSQL connection after a failure.
+// attempt is the 1-based attempt number (1 = first successful reconnect after
+// a drop, 2 = second, etc.). The callback runs in the Listener's internal
+// goroutine and must not block for long; any heavy work should be dispatched
+// to another goroutine. Registering a Prometheus counter increment here is a
+// common use case:
+//
+//	reconnects := promauto.NewCounter(prometheus.CounterOpts{
+//	    Name: "pglisten_reconnects_total",
+//	    Help: "PostgreSQL LISTEN/NOTIFY reconnections.",
+//	})
+//	l, _ := pglisten.New(ctx, dsn,
+//	    pglisten.WithOnReconnect(func(attempt int) { reconnects.Inc() }),
+//	)
+func WithOnReconnect(fn func(attempt int)) Option {
+	return func(l *Listener) { l.onReconnect = fn }
+}
+
 // errListenerClosed is returned by Listen after the Listener has been closed.
 var errListenerClosed = errors.New("pglisten: listener is closed")
 
@@ -154,6 +173,7 @@ type Listener struct {
 	reconnectPolicy   ReconnectPolicy
 	logger            *slog.Logger
 	keepaliveInterval time.Duration
+	onReconnect       func(attempt int) // optional hook; see WithOnReconnect
 
 	mu        sync.Mutex
 	conn      *pgx.Conn
@@ -202,6 +222,9 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 	}
 	for _, o := range opts {
 		o(l)
+	}
+	if l.onReconnect == nil {
+		l.onReconnect = func(int) {} // default no-op so the reconnect path needs no nil check
 	}
 	// run outlives this call; New's ctx scopes only the initial connect, so the
 	// detached goroutine intentionally uses fresh contexts for its DB calls.
@@ -482,7 +505,8 @@ func quoteListenIdent(ch string) string {
 
 // reconnect re-establishes the connection and re-issues every known LISTEN. It
 // returns false when the listener is closed while reconnecting. Failed attempts
-// back off exponentially with full jitter (R-07).
+// back off exponentially with full jitter (R-07). On success the onReconnect
+// hook (if set) is invoked with the 1-based success count.
 func (l *Listener) reconnect() bool {
 	l.closeConn()
 	attempt := 0
@@ -532,6 +556,10 @@ func (l *Listener) reconnect() bool {
 			done <- nil
 		}
 		l.mu.Unlock()
+		// Notify the hook after releasing the lock so the callback never
+		// blocks while holding l.mu. onReconnect is never nil (New defaults it
+		// to a no-op).
+		l.onReconnect(attempt + 1)
 		return true
 	}
 }

@@ -31,14 +31,59 @@ import (
 // queueLabel is the Prometheus label carrying the queue name.
 const queueLabel = "queue"
 
+// DefaultConsumeBuckets are the recommended histogram bucket boundaries for
+// pgqueue's consume-latency metric. Queue processing latency spans a much
+// wider range than typical HTTP latency: sub-millisecond fast paths, the
+// common 10ms–1s band, and multi-minute outliers during DLQ replay or
+// large-fan-out delivery. These buckets cover that range while keeping
+// cardinality reasonable.
+//
+// Operators who need different resolution (for example, a high-throughput
+// queue where most jobs complete in under 10ms) can supply custom buckets
+// via WithConsumeBuckets.
+var DefaultConsumeBuckets = []float64{
+	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+}
+
+// options holds optional configuration for NewMetrics.
+type options struct {
+	consumeBuckets []float64
+}
+
+// Option configures a Metrics adapter at construction time.
+type Option func(*options)
+
+// WithConsumeBuckets overrides the histogram bucket boundaries used for the
+// consume-latency metric (pgqueue_consume_duration_seconds). The supplied
+// slice must be sorted in strictly ascending order; prometheus.NewHistogram
+// will panic if it is not. When nil or empty the adapter falls back to
+// DefaultConsumeBuckets. Example:
+//
+//	m, err := prompgqueue.NewMetrics(reg,
+//	    prompgqueue.WithConsumeBuckets([]float64{0.001, 0.01, 0.1, 1, 10, 60}),
+//	)
+func WithConsumeBuckets(buckets []float64) Option {
+	return func(o *options) {
+		if len(buckets) > 0 {
+			o.consumeBuckets = buckets
+		}
+	}
+}
+
 // Metrics is a Prometheus-backed pgqueue.MetricsRecorder.
 type Metrics struct {
-	publishes        *prometheus.CounterVec
-	consumeDur       *prometheus.HistogramVec
-	acks             *prometheus.CounterVec
-	ackAfterExpired  *prometheus.CounterVec
-	queueDepth       *prometheus.GaugeVec
-	dlqSize          *prometheus.GaugeVec
+	publishes           *prometheus.CounterVec
+	consumeDur          *prometheus.HistogramVec
+	acks                *prometheus.CounterVec
+	ackAfterExpired     *prometheus.CounterVec
+	queueDepth          *prometheus.GaugeVec
+	dlqSize             *prometheus.GaugeVec
+	metadataParseErrors *prometheus.CounterVec
+	gcRuns              *prometheus.CounterVec
+	gcDuration          *prometheus.HistogramVec
+	gcReclaimed         *prometheus.CounterVec
+	gcPurged            *prometheus.CounterVec
+	missedNotifications *prometheus.CounterVec
 }
 
 // compile-time check.
@@ -52,9 +97,15 @@ var _ pgqueue.MetricsRecorder = (*Metrics)(nil)
 // an error. Any other registration failure is returned: the previous behavior
 // of silently returning an unregistered collector meant the affected metric
 // never scraped (R-17).
-func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
+//
+//nolint:cyclop,funlen // flat list of collector registrations; both counts track the number of metrics, not logic.
+func NewMetrics(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 	if reg == nil {
 		reg = prometheus.DefaultRegisterer
+	}
+	cfg := &options{consumeBuckets: DefaultConsumeBuckets}
+	for _, o := range opts {
+		o(cfg)
 	}
 	m := &Metrics{}
 	var err error
@@ -67,8 +118,8 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 	}
 	if m.consumeDur, err = registerCollector(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "pgqueue_consume_duration_seconds",
-		Help:    "Message processing latency in seconds.",
-		Buckets: prometheus.DefBuckets,
+		Help:    "Message processing latency in seconds; see DefaultConsumeBuckets for the bucket layout.",
+		Buckets: cfg.consumeBuckets,
 	}, []string{queueLabel})); err != nil {
 		return nil, fmt.Errorf("prompgqueue: register consume histogram: %w", err)
 	}
@@ -96,6 +147,43 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 	}, []string{queueLabel})); err != nil {
 		return nil, fmt.Errorf("prompgqueue: register dlq-size gauge: %w", err)
 	}
+	if m.metadataParseErrors, err = registerCollector(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pgqueue_metadata_parse_errors_total",
+		Help: "Messages whose JSON metadata column could not be parsed; metadata is dropped, delivery continues.",
+	}, []string{queueLabel})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register metadata-parse-error counter: %w", err)
+	}
+	if m.gcRuns, err = registerCollector(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pgqueue_gc_runs_total",
+		Help: "Garbage-collector passes by queue and outcome (ok/error).",
+	}, []string{queueLabel, "result"})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register gc-runs counter: %w", err)
+	}
+	if m.gcDuration, err = registerCollector(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "pgqueue_gc_duration_seconds",
+		Help:    "Wall-clock duration of a per-queue garbage-collector pass.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30},
+	}, []string{queueLabel})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register gc-duration histogram: %w", err)
+	}
+	if m.gcReclaimed, err = registerCollector(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pgqueue_gc_reclaimed_total",
+		Help: "Timed-out messages reset to pending (re-deliverable) by the garbage collector.",
+	}, []string{queueLabel})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register gc-reclaimed counter: %w", err)
+	}
+	if m.gcPurged, err = registerCollector(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pgqueue_gc_purged_total",
+		Help: "Messages deleted by the retention policy during a garbage-collector pass.",
+	}, []string{queueLabel})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register gc-purged counter: %w", err)
+	}
+	if m.missedNotifications, err = registerCollector(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "pgqueue_missed_notifications_total",
+		Help: "LISTEN/NOTIFY confirmations that failed; notifications on this channel were dropped until re-confirmed.",
+	}, []string{queueLabel})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register missed-notifications counter: %w", err)
+	}
 	return m, nil
 }
 
@@ -112,8 +200,9 @@ func NewMetrics(reg prometheus.Registerer) (*Metrics, error) {
 // Callers in that situation must either drop the conflicting registration or
 // hand pgqueue its own dedicated prometheus.Registerer.
 //
-//nolint:ireturn // T is a concrete collector type at every call site; the
 // generic constraint is only how the helper stays type-safe across them.
+//
+//nolint:ireturn // T is a concrete collector type at every call site; the
 func registerCollector[T prometheus.Collector](reg prometheus.Registerer, c T) (T, error) {
 	err := reg.Register(c)
 	if err == nil {
@@ -166,4 +255,35 @@ func (m *Metrics) ObserveQueueDepth(queue string, depth int64) {
 // ObserveDLQSize records the current dead-letter queue size for a queue.
 func (m *Metrics) ObserveDLQSize(queue string, size int64) {
 	m.dlqSize.WithLabelValues(queue).Set(float64(size))
+}
+
+// RecordMetadataParseError counts one corrupt-metadata event for queue.
+func (m *Metrics) RecordMetadataParseError(queue string) {
+	m.metadataParseErrors.WithLabelValues(queue).Inc()
+}
+
+// RecordGCRun records the outcome of a single per-queue GC pass. It
+// increments the gc-runs counter (labelled "ok" or "error"), observes the
+// duration histogram, and adds reclaimed and purged rows to their respective
+// counters.
+func (m *Metrics) RecordGCRun(queue string, duration time.Duration, reclaimed, purged int64, err error) {
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	m.gcRuns.WithLabelValues(queue, result).Inc()
+	m.gcDuration.WithLabelValues(queue).Observe(duration.Seconds())
+	if reclaimed > 0 {
+		m.gcReclaimed.WithLabelValues(queue).Add(float64(reclaimed))
+	}
+	if purged > 0 {
+		m.gcPurged.WithLabelValues(queue).Add(float64(purged))
+	}
+}
+
+// RecordMissedNotification counts one LISTEN confirmation failure for queue,
+// indicating that notifications on this channel were dropped until LISTEN was
+// re-confirmed.
+func (m *Metrics) RecordMissedNotification(queue string) {
+	m.missedNotifications.WithLabelValues(queue).Inc()
 }

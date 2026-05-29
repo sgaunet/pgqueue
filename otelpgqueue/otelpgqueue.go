@@ -95,9 +95,9 @@ func NewTracer(tp trace.TracerProvider, opts ...TracerOption) *Tracer {
 }
 
 // StartSpan begins an OpenTelemetry span and wraps it as a pgqueue.Span.
+// Returning pgqueue.Span is intentional — the caller (pgqueue core) ends it.
 //
-//nolint:ireturn // pgqueue.Span is the hook interface this adapter implements;
-// the span is intentionally returned for the caller (pgqueue) to End.
+//nolint:ireturn // pgqueue.Span is the hook interface this adapter implements.
 func (t *Tracer) StartSpan(
 	ctx context.Context,
 	name string,
@@ -213,13 +213,19 @@ func toKeyValue(a pgqueue.Attr, logger *slog.Logger) attribute.KeyValue {
 
 // Metrics adapts OpenTelemetry instruments to the pgqueue.MetricsRecorder hook.
 type Metrics struct {
-	logger          *slog.Logger
-	publishes       metric.Int64Counter
-	consumeDur      metric.Float64Histogram
-	acks            metric.Int64Counter
-	ackAfterExpired metric.Int64Counter
-	queueDepth      metric.Int64Gauge
-	dlqSize         metric.Int64Gauge
+	logger              *slog.Logger
+	publishes           metric.Int64Counter
+	consumeDur          metric.Float64Histogram
+	acks                metric.Int64Counter
+	ackAfterExpired     metric.Int64Counter
+	queueDepth          metric.Int64Gauge
+	dlqSize             metric.Int64Gauge
+	metadataParseErrors metric.Int64Counter
+	gcRuns              metric.Int64Counter
+	gcDuration          metric.Float64Histogram
+	gcReclaimed         metric.Int64Counter
+	gcPurged            metric.Int64Counter
+	missedNotifications metric.Int64Counter
 }
 
 // compile-time check.
@@ -295,10 +301,56 @@ func (m *Metrics) ObserveDLQSize(queue string, size int64) {
 	}
 }
 
+// RecordMetadataParseError counts one corrupt-metadata event for queue.
+func (m *Metrics) RecordMetadataParseError(queue string) {
+	if m.metadataParseErrors != nil {
+		m.metadataParseErrors.Add(context.Background(), 1, queueAttr(queue))
+	}
+}
+
+// RecordGCRun records the outcome of a single per-queue GC pass. It
+// increments the gc-runs counter (with an "ok"/"error" result attribute),
+// observes the duration histogram, and adds reclaimed and purged row counts
+// to their respective counters.
+func (m *Metrics) RecordGCRun(queue string, duration time.Duration, reclaimed, purged int64, err error) {
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	attrs := metric.WithAttributes(
+		attribute.String("queue", queue),
+		attribute.String("result", result),
+	)
+	if m.gcRuns != nil {
+		m.gcRuns.Add(context.Background(), 1, attrs)
+	}
+	if m.gcDuration != nil {
+		m.gcDuration.Record(context.Background(), duration.Seconds(), queueAttr(queue))
+	}
+	if m.gcReclaimed != nil && reclaimed > 0 {
+		m.gcReclaimed.Add(context.Background(), reclaimed, queueAttr(queue))
+	}
+	if m.gcPurged != nil && purged > 0 {
+		m.gcPurged.Add(context.Background(), purged, queueAttr(queue))
+	}
+}
+
+// RecordMissedNotification counts one LISTEN confirmation failure for queue,
+// indicating that notifications on this channel were dropped until LISTEN was
+// re-confirmed.
+func (m *Metrics) RecordMissedNotification(queue string) {
+	if m.missedNotifications != nil {
+		m.missedNotifications.Add(context.Background(), 1, queueAttr(queue))
+	}
+}
+
 // buildInstruments creates every metric instrument on m, returning the errors
 // from any individual instrument that failed. Split out of NewMetrics to keep
 // each function's cyclomatic complexity in check (a single new instrument
 // otherwise pushes NewMetrics past the lint threshold).
+//
+//nolint:cyclop // Linear list of instrument constructions; the cyclomatic count
+// tracks the number of instruments, not branching logic.
 func (m *Metrics) buildInstruments(meter metric.Meter) []error {
 	var errs []error
 	var err error
@@ -329,13 +381,43 @@ func (m *Metrics) buildInstruments(meter metric.Meter) []error {
 		metric.WithDescription("Dead-letter queue size")); err != nil {
 		errs = append(errs, err)
 	}
+	if m.metadataParseErrors, err = meter.Int64Counter("pgqueue.metadata.parse_errors",
+		metric.WithDescription(
+			"Messages whose JSON metadata column could not be parsed; metadata is dropped, delivery continues",
+		)); err != nil {
+		errs = append(errs, err)
+	}
+	if m.gcRuns, err = meter.Int64Counter("pgqueue.gc.runs",
+		metric.WithDescription("Garbage-collector passes by queue and outcome")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.gcDuration, err = meter.Float64Histogram("pgqueue.gc.duration",
+		metric.WithDescription("Wall-clock duration of a per-queue garbage-collector pass"),
+		metric.WithUnit("s")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.gcReclaimed, err = meter.Int64Counter("pgqueue.gc.reclaimed",
+		metric.WithDescription("Timed-out messages reset to pending by the garbage collector")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.gcPurged, err = meter.Int64Counter("pgqueue.gc.purged",
+		metric.WithDescription("Messages deleted by the retention policy during a GC pass")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.missedNotifications, err = meter.Int64Counter("pgqueue.missed_notifications",
+		metric.WithDescription(
+			"LISTEN/NOTIFY confirmations that failed; notifications dropped until re-confirmed",
+		)); err != nil {
+		errs = append(errs, err)
+	}
 	return errs
 }
 
 // queueAttr is the common single-attribute option keyed by queue name.
 //
-//nolint:ireturn // metric.MeasurementOption is the option type the OTel metric
 // API requires; returning it is the only possible shape.
+//
+//nolint:ireturn // metric.MeasurementOption is the option type the OTel metric
 func queueAttr(queue string) metric.MeasurementOption {
 	return metric.WithAttributes(attribute.String("queue", queue))
 }

@@ -75,7 +75,7 @@ func (pq *Queue) consumeFromChannel(
 	ttl := pq.getQueueTTL(queueMeta.Config)
 
 	msg, visTimeout, err := pq.fetchPendingChannelMessage(
-		ctx, tx, queueMeta.TableName, visibilityTimeout, ttl,
+		ctx, tx, queueMeta.TableName, channelName, visibilityTimeout, ttl,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending channel message: %w", err)
@@ -259,7 +259,7 @@ type channelCandidate struct {
 func (pq *Queue) fetchPendingChannelMessage(
 	ctx context.Context,
 	tx *sql.Tx,
-	tableName string,
+	tableName, channelName string,
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
 ) (*Message, *time.Time, error) {
@@ -301,7 +301,7 @@ func (pq *Queue) fetchPendingChannelMessage(
 		}
 
 		return pq.claimChannelMessage(
-			ctx, tx, tableName, visibilityTimeout, row, retryCount,
+			ctx, tx, tableName, channelName, visibilityTimeout, row, retryCount,
 		)
 	}
 }
@@ -448,6 +448,7 @@ func (pq *Queue) claimChannelMessage(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
+	channelName string,
 	visibilityTimeout time.Duration,
 	row channelCandidate,
 	retryCount int,
@@ -483,7 +484,7 @@ func (pq *Queue) claimChannelMessage(
 		CreatedAt:  row.createdAt,
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
-		Metadata:   pq.parseMetadataJSON(row.metadataJSON),
+		Metadata:   pq.parseMetadataJSON(channelName, row.metadataJSON),
 	}
 
 	// Report the effective retry limit, not the raw column: a NULL max_retries

@@ -119,7 +119,7 @@ func (pq *Queue) consumeFromTopic(
 	maxRetries := pq.resolveMaxRetries(queueMeta)
 
 	msg, visTimeout, err := pq.fetchPendingTopicMessage(
-		ctx, tx, queueMeta.TableName, subscriberID, visibilityTimeout, ttl, maxRetries,
+		ctx, tx, queueMeta.TableName, topicName, subscriberID, visibilityTimeout, ttl, maxRetries,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch pending topic message: %w", err)
@@ -416,7 +416,7 @@ type topicCandidate struct {
 func (pq *Queue) fetchPendingTopicMessage(
 	ctx context.Context,
 	tx *sql.Tx,
-	tableName, subscriberID string,
+	tableName, topicName, subscriberID string,
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
 	maxRetries int,
@@ -458,7 +458,7 @@ func (pq *Queue) fetchPendingTopicMessage(
 		}
 
 		return pq.claimTopicSubscription(
-			ctx, tx, tableName, visibilityTimeout, row, retryCount, maxRetries,
+			ctx, tx, tableName, topicName, visibilityTimeout, row, retryCount, maxRetries,
 		)
 	}
 }
@@ -588,6 +588,7 @@ func (pq *Queue) claimTopicSubscription(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
+	topicName string,
 	visibilityTimeout time.Duration,
 	row topicCandidate,
 	retryCount int,
@@ -623,7 +624,7 @@ func (pq *Queue) claimTopicSubscription(
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
 		MaxRetries: maxRetries,
-		Metadata:   pq.parseMetadataJSON(row.metadataJSON),
+		Metadata:   pq.parseMetadataJSON(topicName, row.metadataJSON),
 	}
 
 	if row.errorMessage.Valid {
