@@ -286,14 +286,35 @@ func (pq *Queue) getChannelStats(
 		return fmt.Errorf("failed to get channel stats: %w", err)
 	}
 
-	if avgSeconds.Valid {
-		duration := time.Duration(avgSeconds.Float64 * float64(time.Second))
-		stats.AvgProcessingTime = &duration
-	}
-
+	stats.AvgProcessingTime = secondsToProcessingTime(avgSeconds)
 	stats.OldestPendingAge = secondsToAge(oldestPendingAge)
 
 	return nil
+}
+
+// maxProcessingTimeSeconds is the upper bound (in seconds) used by
+// secondsToProcessingTime to clamp pathologically large AVG values before
+// converting to time.Duration. 100 years is far above any real processing
+// time while still fitting comfortably in int64 nanoseconds (~292 years max).
+const maxProcessingTimeSeconds = 100 * 365.25 * 24 * 3600 // ≈ 3.156e9 s
+
+// secondsToProcessingTime converts an average processing time in seconds from
+// SQL into a *time.Duration, clamping the value to [0, maxProcessingTimeSeconds]
+// so that NaN, ±Inf, or absurdly large floats cannot overflow int64 nanoseconds
+// and produce a negative or nonsensical duration (issue #116).
+func secondsToProcessingTime(secs sql.NullFloat64) *time.Duration {
+	if !secs.Valid {
+		return nil
+	}
+	v := secs.Float64
+	if v < 0 || v != v { // v != v catches NaN
+		v = 0
+	}
+	if v > maxProcessingTimeSeconds {
+		v = maxProcessingTimeSeconds
+	}
+	d := time.Duration(v * float64(time.Second))
+	return &d
 }
 
 // secondsToAge converts an age in seconds from a SQL EXTRACT(EPOCH …) result
@@ -349,11 +370,7 @@ func (pq *Queue) getPubSubStats(
 		return fmt.Errorf("failed to get pub/sub stats: %w", err)
 	}
 
-	if avgSeconds.Valid {
-		duration := time.Duration(avgSeconds.Float64 * float64(time.Second))
-		stats.AvgProcessingTime = &duration
-	}
-
+	stats.AvgProcessingTime = secondsToProcessingTime(avgSeconds)
 	stats.OldestPendingAge = secondsToAge(oldestPendingAge)
 
 	return nil
