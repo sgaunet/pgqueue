@@ -12,6 +12,13 @@ import (
 // that staleness window, so an operation on a remotely-deleted queue soon
 // re-reads pgqueue_metadata and surfaces ErrQueueNotFound rather than an opaque
 // "relation does not exist" against a dropped table.
+//
+// Cross-process staleness limitation: a TTL expiry is the only cross-process
+// protection this cache has. A fuller fix would require either (a) a DB
+// round-trip on every cache hit (re-querying pgqueue_metadata), or (b) storing
+// a schema-level generation/version column in pgqueue_metadata and comparing it
+// on each lookup — both require a new DB round-trip or a schema change
+// respectively and are left as future work (issue #84).
 const metadataCacheTTL = 1 * time.Minute
 
 // metadataCache caches the immutable per-queue identity: the table name
