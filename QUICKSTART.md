@@ -253,6 +253,63 @@ default:
 message was already redelivered to another consumer — discard your result in
 that case.
 
+### At-least-once delivery: make handlers idempotent
+
+pgqueue guarantees **at-least-once** delivery, not exactly-once. The same
+message can be handed to a consumer more than once, so **handlers must be
+idempotent** — processing a message twice must produce the same end state as
+processing it once.
+
+A message is redelivered when:
+
+- **The visibility timeout expires.** Consuming a channel message sets
+  `status='processing'` and a `visibility_timeout` (default 30s). If the
+  message is not acked before that deadline — a slow handler, a long GC pause,
+  a lost database connection — the `GarbageCollector` resets it to `pending`
+  and another consumer can pick it up. A late `Ack`/`Nack` then returns
+  `ErrClaimExpired`.
+- **The consumer crashes mid-handler.** A process that dies after fetching a
+  message but before acking never commits the ack, so the message is reclaimed
+  the same way once its timeout lapses.
+- **A handler returns an error (nack).** The message is retried — with backoff —
+  until `max_retries` is exhausted, after which it moves to the DLQ.
+
+The handler may also have run partway and produced side effects (an email sent,
+a row written) before the redelivery, so "exactly-once side effects" is your
+responsibility, not the queue's. The standard technique is to key your work on
+the immutable message ID (`msg.ID`) and make the write idempotent — for
+example an UPSERT that no-ops on a duplicate:
+
+```go
+err := q.ConsumeChannel(ctx, "orders",
+    func(ctx context.Context, msg *pgqueue.Message) error {
+        // Idempotent side effect: a second delivery of the same msg.ID is a
+        // no-op because the primary key already exists. ON CONFLICT DO NOTHING
+        // makes the INSERT safe to replay.
+        _, err := appDB.ExecContext(ctx,
+            `INSERT INTO processed_orders (message_id, order_id, processed_at)
+             VALUES ($1, $2, now())
+             ON CONFLICT (message_id) DO NOTHING`,
+            msg.ID, orderIDFrom(msg.Payload),
+        )
+        return err // nil -> ack; err -> nack + retry
+    },
+    pgqueue.WithConcurrency(8),
+)
+```
+
+For work that cannot be expressed as a single idempotent statement (calling a
+non-idempotent external API, say), record the message ID in a "seen" table
+inside the same transaction as your side effect, and skip messages whose ID is
+already present.
+
+> **Testing the redelivery contract.** The in-memory `fake.Queue`
+> (`github.com/sgaunet/pgqueue/fake`) deliberately does **not** model
+> visibility-timeout reclamation: a claimed message stays claimed until it is
+> acked or nacked, so it cannot exercise timeout-driven redelivery. Tests that
+> must verify idempotency under redelivery should run against a real Queue on
+> PostgreSQL — see the `internal/integration` suite for the redelivery tests.
+
 ### Deduplication
 
 Publish with an explicit message ID; a second publish of the same ID returns
@@ -296,6 +353,81 @@ gc.Start(ctx) // background loop; q.Close() stops it
 > table growth. A `DefaultPolicy` with any field set, and every per-queue
 > `Policies` entry, is used verbatim. Use `pgqueue.KeepForever` to keep a
 > field's rows forever.
+
+## Delivery model: polling vs push
+
+By default, consume loops **poll**. An idle `ConsumeChannel` / `ReceiveChannel`
+worker issues one query every poll interval (default 30s) to check for ready
+work, even when the queue is empty. The aggregate query load is therefore
+roughly:
+
+```
+empty-poll QPS ≈ (consumers × queues consumed) ÷ poll interval
+```
+
+That is fine for a handful of queues and consumers, but the cost scales with
+**consumers × queues × poll frequency** — many consumers each watching many
+queues at a short interval can keep the database busy with empty polls and add
+up to a full poll interval of latency before a freshly published message is
+picked up.
+
+For high fan-in or low-latency workloads, register the optional
+`LISTEN/NOTIFY` push adapter. A `NOTIFY` fired inside each publishing
+transaction wakes the relevant idle consumer in milliseconds, and the poll
+drops to a bounded **safety net** rather than the primary delivery path:
+
+```go
+import "github.com/sgaunet/pgqueue/pglisten"
+
+l, err := pglisten.New(ctx, connString) // its own dedicated connection
+if err != nil {
+    log.Fatal(err)
+}
+q, err := pgqueue.New(ctx, db, pgqueue.WithListener(l))
+```
+
+You can also widen the poll interval with `WithPollInterval` (longer interval =
+fewer empty polls, higher worst-case latency without a listener).
+
+## Connection pool sizing
+
+pgqueue runs all of its queries on the `*sql.DB` you pass to `New`, so size that
+pool to the connections pgqueue actually holds concurrently:
+
+- **Consume loops** — each `ConsumeChannel` / `ConsumeTopic` worker briefly
+  holds **one** connection while it fetches-and-claims a message (a short
+  `BEGIN … FOR UPDATE SKIP LOCKED … COMMIT`). A loop started with
+  `WithConcurrency(n)` can hold up to `n` at once. An *idle* (polling) worker
+  holds none between polls. Sum the concurrency across every consume loop.
+- **The garbage collector** — a `Collect` pass fans queues out to a bounded
+  worker pool, so it can hold up to `GarbageCollectorConfig.MaxWorkers`
+  connections (default **10**) during a pass, and none between passes.
+- **Publish / ack / admin calls** — each `Publish*`, `Ack`/`Nack`,
+  `Create*`/`Delete*`, stats, and replay call uses one connection for its
+  duration. Budget for your peak concurrent publishers/callers.
+- **The optional `pglisten` listener** does **not** draw from this pool — it
+  opens its own dedicated connection. (Don't forget it still counts against the
+  server's `max_connections`.)
+
+A practical starting formula:
+
+```go
+// Σ(consume-loop concurrency) + GC MaxWorkers + peak concurrent publishers + headroom
+db.SetMaxOpenConns(maxOpen)
+db.SetMaxIdleConns(maxOpen / 4) // keep ~25% warm to avoid reconnection churn
+```
+
+Concrete example — two consume loops at `WithConcurrency(8)` each, a GC at the
+default `MaxWorkers` (10), and up to ~10 concurrent publishers:
+
+```
+8 + 8 + 10 + 10 = 36 → round up for headroom
+db.SetMaxOpenConns(48)
+db.SetMaxIdleConns(12)
+```
+
+Watch `db.Stats().WaitCount`: if it grows steadily, callers are blocking on the
+pool — raise `MaxOpenConns` (and `max_connections` / PgBouncer accordingly).
 
 ## Configuration Options
 

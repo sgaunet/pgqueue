@@ -5,11 +5,21 @@
 //
 // fake.Queue reproduces the documented queue semantics — publish, single-shot
 // and handler-based consume, ack/nack, retry with DLQ promotion at exactly
-// max-retries, fan-out per subscriber, and pause/resume. It deliberately does
-// not model visibility-timeout reclamation on a wall clock: a claimed message
-// stays claimed until it is acked or nacked. Tests that need to exercise
-// timeout-driven redelivery should use the real Queue against PostgreSQL —
-// see internal/integration for the redelivery test suite.
+// max-retries, fan-out per subscriber, and pause/resume.
+//
+// It deliberately does NOT model visibility-timeout reclamation on a wall
+// clock: a claimed message stays claimed until it is explicitly acked or
+// nacked, and never reappears on its own. The fake therefore cannot reproduce
+// pgqueue's at-least-once redelivery contract — the timeout-driven and
+// crash-driven redeliveries that make duplicate delivery possible. This is a
+// deliberate design choice (deterministic, no background timers), not a bug.
+//
+// Consequently the fake is unsuitable for testing handler idempotency under
+// redelivery. Tests that must verify that contract should drive the real Queue
+// against PostgreSQL: consume a message with a short visibility timeout, let it
+// lapse without acking (or simulate a crashed consumer), and assert the message
+// is redelivered. See the internal/integration suite (testcontainers-backed)
+// for the canonical redelivery tests.
 //
 //	q := fake.New()
 //	q.CreateChannel(ctx, "orders")

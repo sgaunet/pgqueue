@@ -29,6 +29,55 @@ GRANT SELECT, UPDATE ON TABLE pgqueue_msg_sensitive_orders TO pgqueue_consumer;
 GRANT INSERT ON TABLE pgqueue_msg_sensitive_orders TO pgqueue_publisher;
 ```
 
+## Required PostgreSQL Privileges
+
+pgqueue runs its own DDL — it creates and drops tables and indexes on the fly —
+so the connection it is given needs more than plain DML rights. The privileges
+break down by operation:
+
+| Operation | SQL the library issues | Required privilege |
+|-----------|------------------------|--------------------|
+| `InitSchema` | `CREATE TABLE` / `CREATE INDEX` for the four global tables; `CREATE SCHEMA IF NOT EXISTS` when a non-`public` schema is configured via `WithSchema` | `CREATE` on the target schema (plus `CREATE` on the database if pgqueue must create the schema) |
+| `CreateChannel` / `CreateTopic` | `CREATE TABLE` / `CREATE INDEX` for the per-queue tables (`pgqueue_msg_*`, `pgqueue_dlq_*`, and `pgqueue_sub_*` for topics) | `CREATE` on the schema |
+| `DeleteChannel` / `DeleteTopic` | `DROP TABLE IF EXISTS` on the per-queue tables; `DELETE` on the global metadata/subscriber tables | Ownership of the per-queue tables (PostgreSQL only lets the owner `DROP`), plus `DELETE` on the global tables |
+| `PurgeQueue` | `DELETE` / `TRUNCATE` on the per-queue tables | `DELETE` (and `TRUNCATE` if used) on those tables |
+| Publish | `INSERT` (and `SELECT` on metadata) | `INSERT` / `SELECT` on the per-queue and metadata tables |
+| Consume, ack/nack, GC, replay, stats | `SELECT` / `UPDATE` / `INSERT` / `DELETE`; `SELECT … FOR UPDATE SKIP LOCKED`; transaction-scoped advisory locks (`pg_advisory_xact_lock`) | `SELECT` / `INSERT` / `UPDATE` / `DELETE` on the per-queue and global tables; **advisory locks need no privilege** |
+| Push delivery (`pglisten`) | `LISTEN` on the consumer connection; `NOTIFY` (via `pg_notify`) inside the publishing transaction | **none** — `LISTEN`/`NOTIFY` require no special privilege |
+| Schema migrations (inside `InitSchema`) | session-level advisory lock (`pg_advisory_lock` / `pg_advisory_unlock`) to serialize concurrent upgrades | **none** |
+
+The simplest deployment gives one role both DDL and DML rights (it then owns
+everything it creates, so `DROP` "just works"):
+
+```sql
+CREATE ROLE pgqueue_app LOGIN PASSWORD 'strong-password';
+GRANT CREATE ON SCHEMA public TO pgqueue_app;        -- DDL: InitSchema + Create*/Delete*
+-- pgqueue_app owns the tables it creates, so DELETE/DROP need no extra grant.
+```
+
+To **separate** DDL from runtime — let an operator/migration role create and
+drop queues while applications only publish and consume — split the roles. Note
+that `DeleteChannel`/`DeleteTopic` issue `DROP TABLE`, which in PostgreSQL only
+the table owner (or a superuser) may run, so deletion stays with the role that
+created the queues:
+
+```sql
+-- Admin/migration role: creates and drops queues.
+CREATE ROLE pgqueue_admin LOGIN PASSWORD '...';
+GRANT CREATE ON SCHEMA public TO pgqueue_admin;
+
+-- Runtime role: publishes and consumes, but cannot create or drop queues.
+CREATE ROLE pgqueue_app LOGIN PASSWORD '...';
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgqueue_app;
+-- Re-grant after each CreateChannel/CreateTopic (or use DEFAULT PRIVILEGES):
+ALTER DEFAULT PRIVILEGES FOR ROLE pgqueue_admin IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pgqueue_app;
+```
+
+`ALTER DEFAULT PRIVILEGES` makes future tables created by `pgqueue_admin`
+automatically grantable to `pgqueue_app`, sparing you a manual `GRANT` after
+every `CreateChannel`/`CreateTopic`.
+
 ## Payload Encryption
 
 pgqueue does **not** encrypt message payloads. Data is stored as `BYTEA` in PostgreSQL. If your messages contain sensitive data, encrypt before publishing:

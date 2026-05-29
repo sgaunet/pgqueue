@@ -109,6 +109,14 @@ Two lower-level styles are also available: the `ChannelMessages` range-over-func
 iterator (manual ack/nack) and single-shot `ReceiveChannel` (returns
 `ErrQueueEmpty` when nothing is available).
 
+> **Polling is the default delivery path.** Each idle consumer issues one query
+> per poll interval (default 30s) even when its queue is empty, so the load
+> scales with **consumers × queues × poll frequency**. For high fan-in or
+> low-latency workloads, register the optional `pglisten` `LISTEN/NOTIFY`
+> adapter (see below): a `NOTIFY` on publish wakes the idle consumer in
+> milliseconds and the poll becomes a bounded safety net. See
+> [QUICKSTART](QUICKSTART.md#delivery-model-polling-vs-push) for the trade-off.
+
 ### Push delivery, observability, and testing
 
 ```go
