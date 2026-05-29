@@ -74,6 +74,15 @@ func receiptsToIDClaimLiterals(receipts []Receipt) (string, string) {
 	return "{" + strings.Join(idParts, ",") + "}", "{" + strings.Join(claimParts, ",") + "}"
 }
 
+// Supported array element types are fixed at compile time by the dedicated
+// helpers above — uuidArrayLiteral ([]uuid.UUID), float64ArrayLiteral
+// ([]float64), and receiptsToIDClaimLiterals ([]Receipt). There is deliberately
+// no generic, any-typed array builder: routing every array through a typed
+// helper makes an unsupported element type (for example []int64) a compile
+// error at the call site rather than a runtime malformed-SQL surprise (#86).
+// When a genuinely new element type is needed, add a typed helper here and give
+// it the same {a,b} rendering and $n::text::<type>[] cast contract.
+
 // jsonbParam adapts a JSON byte slice for use as a jsonb query parameter. It is
 // sent as text (which every driver marshals verbatim) rather than as a []byte
 // (which lib/pq would encode as bytea, breaking the jsonb input). Empty input —
