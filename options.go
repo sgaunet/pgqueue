@@ -79,7 +79,6 @@ func applyQueueOptions(opts []QueueOption) queueCreateOpts {
 	return o
 }
 
-
 // PublishOption is a per-publish option applied to a single publish call.
 type PublishOption func(*publishOpts)
 
@@ -176,11 +175,16 @@ type nackOpts struct {
 }
 
 // WithRetryDelay overrides the computed backoff delay before the nacked message
-// becomes eligible for redelivery (FR-023). Zero means use the default backoff
-// policy.
+// becomes eligible for redelivery (FR-023).
+//
+// Only a strictly positive d takes effect: d > 0 pins the redelivery delay to
+// exactly that duration, bypassing the queue's BackoffPolicy. A non-positive
+// value (0 or negative) is silently ignored and the queue's BackoffPolicy is
+// used instead, as if WithRetryDelay had not been called. A caller passing a
+// negative value almost certainly has a bug; pgqueue treats it identically to
+// zero rather than returning an error because Nack is already in a failure path.
 func WithRetryDelay(d time.Duration) NackOption {
 	return func(o *nackOpts) {
 		o.retryDelay = d
 	}
 }
-

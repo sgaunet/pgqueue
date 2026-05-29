@@ -54,6 +54,39 @@ reclamation — are written against READ COMMITTED. Operators must not change
 the pool's default_transaction_isolation to a higher level expecting pgqueue
 to inherit it; that setting is ignored by design (#64).
 
+Close shutdown order: Close marks the Queue closed, then cancels the
+background context that signals handler-based consume loops
+(ConsumeChannel/ConsumeTopic) to wind down, then stops each GarbageCollector
+created via NewGarbageCollector (Close calls gc.Stop(), which itself blocks
+until the GC goroutine exits), then waits for all consume-loop workers to
+drain (workerWG.Wait), and finally closes the LISTEN/NOTIFY listener. An
+in-progress GC purge yields at its next checkpoint, not immediately, so
+callers should allow a grace period before treating a slow Close as stuck.
+After Close returns, no Queue-owned goroutine issues a database query and the
+underlying DB handle can be safely closed.
+
+Pub/Sub subscribe-before-publish ordering: messages are fanned out to the
+set of active subscribers recorded at publish time. A subscriber registered
+after a message is published does not receive that message. For guaranteed
+delivery, Subscribe (or its underlying RegisterSubscriber commit) must
+complete and become visible before the first Publish or PublishBatch call.
+Concurrent registration and publish are a race under READ COMMITTED: whether
+the newly registered subscriber is included in the fan-out depends on
+transaction commit order. This same race applies to PublishBatch: the batch
+transaction snapshots active subscribers before it commits, so a subscriber
+that registers concurrently may or may not be included. Batched publishes are
+not atomic with subscriber registration.
+
+Advisory-lock key design: pgqueue uses two PostgreSQL advisory-lock keys.
+Both are encoded from the ASCII bytes of short human-readable tags
+("pgqueue" and "pgquecq") so that pg_locks rows are identifiable from psql
+without a code lookup. The tags were chosen to avoid collisions with the
+advisory-lock ranges used by common PostgreSQL extensions (pg_partman,
+pglogical, citus). The keys are not registered with any PostgreSQL extension
+registry; operators sharing the advisory-lock space with other software that
+uses keys in the same numeric range should review migrations.go for the
+exact values and the encoding scheme.
+
 Scalability ceiling: each queue creates 2-3 tables plus 6-7 indexes, and
 admin operations (GarbageCollector.Collect, ListChannels, ListTopics,
 GetUnhealthySubscribers) scale linearly with queue count. The table-per-queue

@@ -55,6 +55,19 @@ var uuidV7State struct {
 // pinned millisecond — the generator resyncs to real time. Monotonicity, and
 // therefore "ORDER BY id" chronological ordering, is preserved throughout
 // (R-20).
+//
+// Counter-overflow behavior: the 12-bit "rand_a" monotonic counter can hold at
+// most 4096 values per millisecond. When the counter overflows (sustained
+// generation exceeding ~4 million UUIDs per second), the generator re-reads the
+// wall clock. If real time has moved on to a new millisecond it resyncs to that
+// millisecond and reseeds the counter from random bits, so no drift occurs. Only
+// when the clock has not yet advanced does the generator increment the pinned
+// millisecond by one, borrowing a future millisecond to maintain strict
+// monotonicity. Under a sustained burst, each overflow borrows one more
+// millisecond ahead of real time. The embedded timestamp therefore loses
+// high-fidelity wall-clock accuracy under extreme load; UUIDs remain strictly
+// monotonic and globally unique throughout. Once the burst subsides and real
+// time catches up, the generator resyncs automatically.
 func NewUUIDv7() (uuid.UUID, error) {
 	return newUUIDv7At(nowMillisecond)
 }
