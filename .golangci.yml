@@ -19,3 +19,10 @@ linters:
     - exhaustruct
     - tagliatelle
     - noinlineerr
+
+  settings:
+    gomoddirectives:
+      # The optional adapter modules (pglisten/otel/prom), examples, and the
+      # integration suite use local `replace github.com/sgaunet/pgqueue => ..`
+      # directives so each module builds standalone in CI. These are by design.
+      replace-local: true

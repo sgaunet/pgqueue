@@ -148,9 +148,13 @@ func toKeyValues(attrs []pgqueue.Attr, logger *slog.Logger) []attribute.KeyValue
 	return out
 }
 
-// toKeyValue converts a single pgqueue.Attr to an attribute.KeyValue. Split
-// out of toKeyValues because the type switch otherwise exceeds the cyclomatic
-// complexity threshold.
+// toKeyValue converts a single pgqueue.Attr to an attribute.KeyValue. It is a
+// flat type-switch dispatch: the complexity is inherent to the number of
+// supported scalar types and carries no nested branching beyond the two uint
+// overflow checks, so it is suppressed rather than fragmented into artificial
+// per-type-family helpers that would only obscure the dispatch.
+//
+//nolint:cyclop,funlen // exhaustive type-switch dispatch; width is case count, not nesting
 func toKeyValue(a pgqueue.Attr, logger *slog.Logger) attribute.KeyValue {
 	switch v := a.Value.(type) {
 	case string:

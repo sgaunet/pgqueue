@@ -62,7 +62,6 @@ func NewUUIDv7() (uuid.UUID, error) {
 // nowMillisecond returns the current Unix timestamp in milliseconds. Extracted
 // so newUUIDv7At can be driven by a synthetic clock in tests.
 func nowMillisecond() uint64 {
-	//nolint:gosec // G115: UnixMilli is positive for any realistic wall clock.
 	return uint64(time.Now().UnixMilli())
 }
 
@@ -119,7 +118,7 @@ func newUUIDv7At(nowFn func() uint64) (uuid.UUID, error) {
 
 	// Bytes 6-7 carry the 12-bit counter (the "rand_a" field).
 	u[6] = byte(counter >> uuidV7CounterShift)
-	u[7] = byte(counter)
+	u[7] = byte(counter) //nolint:gosec // G115: low 8 bits of the 12-bit counter; truncation intended
 
 	// Set version (7) and variant bits.
 	u[6] = (u[6] & uuidV7VersionMask) | uuidV7Version

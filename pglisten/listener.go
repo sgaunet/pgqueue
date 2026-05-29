@@ -218,9 +218,10 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 //
 // The LISTEN itself is issued by the run loop (which owns the connection); this
 // method queues the request, nudges the loop, and waits for the outcome. ctx
-// bounds that wait — on cancellation it returns ctx.Err() while the request
-// stays queued, so the LISTEN may still take effect and a later call observes
-// it as already confirmed.
+// bounds that wait — on cancellation it returns an error wrapping ctx.Err()
+// (still errors.Is-matchable against context.Canceled/DeadlineExceeded) while
+// the request stays queued, so the LISTEN may still take effect and a later
+// call observes it as already confirmed.
 //
 // The channel name is splice-quoted into LISTEN — PostgreSQL does not accept
 // parameter binding there — with PG-correct identifier escaping (#70). It is
@@ -250,7 +251,7 @@ func (l *Listener) Listen(ctx context.Context, channel string) error {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("pglisten: LISTEN %q canceled: %w", channel, ctx.Err())
 	case <-l.done:
 		return errListenerClosed
 	}
@@ -292,21 +293,6 @@ func (l *Listener) Unlisten(_ context.Context, channel string) error {
 	return nil
 }
 
-// requestInterrupt breaks the in-progress WaitForNotification, if any, so the
-// run loop re-checks its state and drains pending work. When no wait is in
-// progress the request is remembered (interruptPending) so the next
-// receiveOne honors it instead of blocking — this preserves the buffered
-// "pending nudge" semantics the previous channel-based design relied on. It is
-// invoked both when a LISTEN is registered and when the Listener is closed.
-func (l *Listener) requestInterrupt() {
-	l.waitMu.Lock()
-	l.interruptPending = true
-	if l.waitCancel != nil {
-		l.waitCancel()
-	}
-	l.waitMu.Unlock()
-}
-
 // Notifications returns the stream of notification channel names. It is closed
 // when the Listener is closed.
 func (l *Listener) Notifications() <-chan string {
@@ -326,6 +312,21 @@ func (l *Listener) Close() error {
 		l.requestInterrupt()
 	})
 	return nil
+}
+
+// requestInterrupt breaks the in-progress WaitForNotification, if any, so the
+// run loop re-checks its state and drains pending work. When no wait is in
+// progress the request is remembered (interruptPending) so the next
+// receiveOne honors it instead of blocking — this preserves the buffered
+// "pending nudge" semantics the previous channel-based design relied on. It is
+// invoked both when a LISTEN is registered and when the Listener is closed.
+func (l *Listener) requestInterrupt() {
+	l.waitMu.Lock()
+	l.interruptPending = true
+	if l.waitCancel != nil {
+		l.waitCancel()
+	}
+	l.waitMu.Unlock()
 }
 
 // run owns the connection: it issues pending LISTEN statements, waits for

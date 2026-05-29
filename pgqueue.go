@@ -914,6 +914,7 @@ func (pq *Queue) executeDelete(
 ) error {
 	// For pub/sub, drop subscription table first (has FK to msg table)
 	if queueType == QueueTypePubSub {
+		//nolint:gosec // G202: table name validated by queueNameRegex
 		dropSub := "DROP TABLE IF EXISTS " + pq.subTable(tableName)
 		if _, err := tx.ExecContext(ctx, dropSub); err != nil {
 			return fmt.Errorf("failed to drop subscription table: %w", err)
@@ -921,12 +922,14 @@ func (pq *Queue) executeDelete(
 	}
 
 	// Drop DLQ table
+	//nolint:gosec // G202: table name validated by queueNameRegex
 	dropDLQ := "DROP TABLE IF EXISTS " + pq.dlqTable(tableName)
 	if _, err := tx.ExecContext(ctx, dropDLQ); err != nil {
 		return fmt.Errorf("failed to drop DLQ table: %w", err)
 	}
 
 	// Drop message table
+	//nolint:gosec // G202: table name validated by queueNameRegex
 	dropMsg := "DROP TABLE IF EXISTS " + pq.msgTable(tableName)
 	if _, err := tx.ExecContext(ctx, dropMsg); err != nil {
 		return fmt.Errorf("failed to drop message table: %w", err)
