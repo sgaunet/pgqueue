@@ -56,7 +56,7 @@ func (pq *Queue) consumeFromChannel(
 	)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return nil, fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+			return nil, fmt.Errorf("channel/%s: %w", channelName, ErrQueueNotFound)
 		}
 		return nil, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
@@ -114,7 +114,7 @@ func (pq *Queue) ackChannel(
 	tableName, err := pq.cachedTableName(ctx, string(QueueTypeChannel), channelName)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+			return fmt.Errorf("channel/%s: %w", channelName, ErrQueueNotFound)
 		}
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}
@@ -186,7 +186,7 @@ func (pq *Queue) nackChannelImpl(
 	)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return fmt.Errorf("%s: %w", channelName, ErrQueueNotFound)
+			return fmt.Errorf("channel/%s: %w", channelName, ErrQueueNotFound)
 		}
 		return fmt.Errorf("failed to get channel metadata: %w", err)
 	}

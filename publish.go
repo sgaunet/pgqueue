@@ -96,6 +96,11 @@ func (pq *Queue) resolveQueueMetadata(
 	ctx context.Context,
 	queueName string,
 ) (*QueueMetadata, error) {
+	// Type-agnostic lookup: Publish/PublishBatch does not know up-front whether
+	// queueName is a channel or a topic — the returned QueueMetadata carries the
+	// resolved type and the caller dispatches on it. No queue_type filter is
+	// added here because the caller has no expected type to filter on.
+	//
 	// The UNIQUE(table_name) constraint on pgqueue_metadata (see baseSchemaSQL)
 	// guarantees at most one row matches: a channel and a topic with the same
 	// queue_name would sanitize to the same physical table name and the second
@@ -114,6 +119,8 @@ func (pq *Queue) resolveQueueMetadata(
 		&meta.CreatedAt, &meta.UpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
+		// No queue_type prefix: this path is type-agnostic so the type is unknown
+		// at the time of the not-found return.
 		return nil, fmt.Errorf("%s: %w", queueName, ErrQueueNotFound)
 	}
 	if err != nil {
