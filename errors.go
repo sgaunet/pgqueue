@@ -5,6 +5,14 @@ import (
 	"fmt"
 )
 
+// errInvalidSubscriberID is the package-internal sentinel built from the actual
+// length constant so the message stays in sync with validation (issue #128).
+// The exported ErrInvalidSubscriberID alias below preserves errors.Is semantics.
+var errInvalidSubscriberID = fmt.Errorf(
+	"invalid subscriber ID: must be 1-%d characters, alphanumeric, underscores, and dashes only",
+	maxSubscriberIDLength,
+)
+
 // Sentinel errors returned by pgqueue operations.
 var (
 	// ErrDBRequired is returned when a nil database connection is provided.
@@ -78,10 +86,9 @@ var (
 	ErrSubscriberNotFound = errors.New("subscriber not found or already inactive")
 
 	// ErrInvalidSubscriberID is returned when a subscriber ID is empty, too long,
-	// or contains invalid characters.
-	ErrInvalidSubscriberID = errors.New(
-		"invalid subscriber ID: must be 1-128 characters, alphanumeric, underscores, and dashes only",
-	)
+	// or contains invalid characters. The message is built from
+	// maxSubscriberIDLength so it cannot drift from the validation (issue #128).
+	ErrInvalidSubscriberID = errInvalidSubscriberID
 
 	// ErrUnsupportedPGVersion is returned when the PostgreSQL server version is below 18.
 	ErrUnsupportedPGVersion = errors.New("pgqueue requires PostgreSQL 18+")
