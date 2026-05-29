@@ -243,6 +243,14 @@ log.Printf("Open: %d, InUse: %d, Idle: %d, WaitCount: %d",
 
 If `WaitCount` is consistently growing, increase `MaxOpenConns`. If `Idle` stays near `MaxIdleConns`, you can raise it to reduce reconnection churn.
 
+## Upgrading
+
+pgqueue uses an in-process, **forward-only** schema migration runner. `InitSchema()` automatically migrates the database up to the `SchemaVersion` this binary knows about. Each migration runs in its own transaction and is serialized across processes by a PostgreSQL advisory lock, so it is safe for many application instances to call `InitSchema()` against the same database concurrently — exactly one runs the DDL.
+
+- **No rollback.** Migrations are forward-only; there are no down migrations. Recover from a bad migration by rolling forward with a fix, or by restoring from a backup — not by reverting the schema.
+- **Upgrade binaries before (or with) the schema.** If a binary starts against a database whose schema is *newer* than its own `SchemaVersion`, `InitSchema()` aborts with `ErrSchemaTooNew` instead of risking corruption. In a rolling deploy, roll the new binary out everywhere; never point an old binary at an already-migrated database.
+- **Test upgrades in staging first**, against a copy of production data, and measure each migration's runtime before applying it to production. Some migrations patch every per-queue table, so their duration grows with the number of queues and the rows in them.
+
 ## Development
 
 ### Running Tests
