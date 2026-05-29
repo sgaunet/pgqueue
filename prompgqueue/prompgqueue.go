@@ -31,41 +31,41 @@ import (
 // queueLabel is the Prometheus label carrying the queue name.
 const queueLabel = "queue"
 
-// DefaultConsumeBuckets are the recommended histogram bucket boundaries for
-// pgqueue's consume-latency metric. Queue processing latency spans a much
-// wider range than typical HTTP latency: sub-millisecond fast paths, the
-// common 10ms–1s band, and multi-minute outliers during DLQ replay or
-// large-fan-out delivery. These buckets cover that range while keeping
-// cardinality reasonable.
+// DefaultLatencyBuckets are the recommended histogram bucket boundaries for
+// pgqueue's latency metrics (pgqueue_handle_duration_seconds and
+// pgqueue_delivery_latency_seconds). Queue latency spans a much wider range
+// than typical HTTP latency: sub-millisecond fast paths, the common 10ms–1s
+// band, and multi-minute outliers during DLQ replay or large-fan-out delivery.
+// These buckets cover that range while keeping cardinality reasonable.
 //
 // Operators who need different resolution (for example, a high-throughput
 // queue where most jobs complete in under 10ms) can supply custom buckets
-// via WithConsumeBuckets.
-var DefaultConsumeBuckets = []float64{
+// via WithLatencyBuckets.
+var DefaultLatencyBuckets = []float64{
 	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
 }
 
 // options holds optional configuration for NewMetrics.
 type options struct {
-	consumeBuckets []float64
+	latencyBuckets []float64
 }
 
 // Option configures a Metrics adapter at construction time.
 type Option func(*options)
 
-// WithConsumeBuckets overrides the histogram bucket boundaries used for the
-// consume-latency metric (pgqueue_consume_duration_seconds). The supplied
-// slice must be sorted in strictly ascending order; prometheus.NewHistogram
-// will panic if it is not. When nil or empty the adapter falls back to
-// DefaultConsumeBuckets. Example:
+// WithLatencyBuckets overrides the histogram bucket boundaries used for both
+// latency metrics (pgqueue_handle_duration_seconds and
+// pgqueue_delivery_latency_seconds). The supplied slice must be sorted in
+// strictly ascending order; prometheus.NewHistogram will panic if it is not.
+// When nil or empty the adapter falls back to DefaultLatencyBuckets. Example:
 //
 //	m, err := prompgqueue.NewMetrics(reg,
-//	    prompgqueue.WithConsumeBuckets([]float64{0.001, 0.01, 0.1, 1, 10, 60}),
+//	    prompgqueue.WithLatencyBuckets([]float64{0.001, 0.01, 0.1, 1, 10, 60}),
 //	)
-func WithConsumeBuckets(buckets []float64) Option {
+func WithLatencyBuckets(buckets []float64) Option {
 	return func(o *options) {
 		if len(buckets) > 0 {
-			o.consumeBuckets = buckets
+			o.latencyBuckets = buckets
 		}
 	}
 }
@@ -73,7 +73,8 @@ func WithConsumeBuckets(buckets []float64) Option {
 // Metrics is a Prometheus-backed pgqueue.MetricsRecorder.
 type Metrics struct {
 	publishes           *prometheus.CounterVec
-	consumeDur          *prometheus.HistogramVec
+	handleDur           *prometheus.HistogramVec
+	deliveryLatency     *prometheus.HistogramVec
 	acks                *prometheus.CounterVec
 	ackAfterExpired     *prometheus.CounterVec
 	queueDepth          *prometheus.GaugeVec
@@ -103,7 +104,7 @@ func NewMetrics(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 	if reg == nil {
 		reg = prometheus.DefaultRegisterer
 	}
-	cfg := &options{consumeBuckets: DefaultConsumeBuckets}
+	cfg := &options{latencyBuckets: DefaultLatencyBuckets}
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -116,12 +117,19 @@ func NewMetrics(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 	}, []string{queueLabel})); err != nil {
 		return nil, fmt.Errorf("prompgqueue: register publish counter: %w", err)
 	}
-	if m.consumeDur, err = registerCollector(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "pgqueue_consume_duration_seconds",
-		Help:    "Message processing latency in seconds; see DefaultConsumeBuckets for the bucket layout.",
-		Buckets: cfg.consumeBuckets,
+	if m.handleDur, err = registerCollector(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "pgqueue_handle_duration_seconds",
+		Help:    "Handler-only execution latency in seconds (excludes queue wait, fetch, and ack); see DefaultLatencyBuckets for the bucket layout.",
+		Buckets: cfg.latencyBuckets,
 	}, []string{queueLabel})); err != nil {
-		return nil, fmt.Errorf("prompgqueue: register consume histogram: %w", err)
+		return nil, fmt.Errorf("prompgqueue: register handle histogram: %w", err)
+	}
+	if m.deliveryLatency, err = registerCollector(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "pgqueue_delivery_latency_seconds",
+		Help:    "Publish-to-delivery latency in seconds: time from message creation to handler start; see DefaultLatencyBuckets for the bucket layout.",
+		Buckets: cfg.latencyBuckets,
+	}, []string{queueLabel})); err != nil {
+		return nil, fmt.Errorf("prompgqueue: register delivery-latency histogram: %w", err)
 	}
 	if m.acks, err = registerCollector(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "pgqueue_ack_total",
@@ -227,9 +235,14 @@ func (m *Metrics) RecordPublish(queue string, count int) {
 	m.publishes.WithLabelValues(queue).Add(float64(count))
 }
 
-// RecordConsume observes one message's processing latency.
-func (m *Metrics) RecordConsume(queue string, latency time.Duration) {
-	m.consumeDur.WithLabelValues(queue).Observe(latency.Seconds())
+// RecordHandle observes one message's handler-only execution latency.
+func (m *Metrics) RecordHandle(queue string, latency time.Duration) {
+	m.handleDur.WithLabelValues(queue).Observe(latency.Seconds())
+}
+
+// RecordDeliveryLatency observes one message's publish-to-delivery latency.
+func (m *Metrics) RecordDeliveryLatency(queue string, latency time.Duration) {
+	m.deliveryLatency.WithLabelValues(queue).Observe(latency.Seconds())
 }
 
 // RecordAck counts an acknowledgement outcome (ack or nack) for a queue.

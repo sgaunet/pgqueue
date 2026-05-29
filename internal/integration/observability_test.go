@@ -44,7 +44,8 @@ func (recordingSpan) SetAttr(...pgqueue.Attr) {}
 type recordingMetrics struct {
 	mu                  sync.Mutex
 	publishes           int
-	consumes            int
+	handles             int
+	deliveries          int
 	acks                int
 	nacks               int
 	ackAfterExpired     int
@@ -59,9 +60,15 @@ func (rm *recordingMetrics) RecordPublish(_ string, count int) {
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordConsume(_ string, _ time.Duration) {
+func (rm *recordingMetrics) RecordHandle(_ string, _ time.Duration) {
 	rm.mu.Lock()
-	rm.consumes++
+	rm.handles++
+	rm.mu.Unlock()
+}
+
+func (rm *recordingMetrics) RecordDeliveryLatency(_ string, _ time.Duration) {
+	rm.mu.Lock()
+	rm.deliveries++
 	rm.mu.Unlock()
 }
 
@@ -102,16 +109,22 @@ func (rm *recordingMetrics) RecordMissedNotification(_ string) {
 func (rm *recordingMetrics) ObserveQueueDepth(string, int64) {}
 func (rm *recordingMetrics) ObserveDLQSize(string, int64)    {}
 
-func (rm *recordingMetrics) snapshot() (publishes, consumes, acks, nacks int) {
+func (rm *recordingMetrics) snapshot() (publishes, handles, acks, nacks int) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	return rm.publishes, rm.consumes, rm.acks, rm.nacks
+	return rm.publishes, rm.handles, rm.acks, rm.nacks
 }
 
 func (rm *recordingMetrics) ackAfterExpiredCount() int {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	return rm.ackAfterExpired
+}
+
+func (rm *recordingMetrics) deliveryCount() int {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	return rm.deliveries
 }
 
 // TestObservabilityHooksReceiveSpansAndMetrics verifies that a registered
@@ -197,12 +210,15 @@ func TestObservabilityHooksReceiveSpansAndMetrics(t *testing.T) {
 		}
 	}
 
-	publishes, consumes, acks, nacks := metrics.snapshot()
+	publishes, handles, acks, nacks := metrics.snapshot()
 	if publishes < 2 {
 		t.Errorf("expected >=2 publish metrics, got %d", publishes)
 	}
-	if consumes < 2 {
-		t.Errorf("expected >=2 consume metrics, got %d", consumes)
+	if handles < 2 {
+		t.Errorf("expected >=2 handle metrics, got %d", handles)
+	}
+	if deliveries := metrics.deliveryCount(); deliveries < 2 {
+		t.Errorf("expected >=2 delivery-latency metrics, got %d", deliveries)
 	}
 	if acks < 1 {
 		t.Errorf("expected >=1 ack metric, got %d", acks)

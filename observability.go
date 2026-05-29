@@ -69,8 +69,20 @@ type Tracer interface {
 type MetricsRecorder interface {
 	// RecordPublish reports that count messages were published to queue.
 	RecordPublish(queue string, count int)
-	// RecordConsume reports the end-to-end processing latency of one message.
-	RecordConsume(queue string, latency time.Duration)
+	// RecordHandle reports the handler-only execution latency of one message:
+	// the time the registered Handler spent processing it. This deliberately
+	// EXCLUDES queue wait, the receive (SELECT ... FOR UPDATE) round-trip, and
+	// the ack round-trip. For the publish-to-delivery interval, see
+	// RecordDeliveryLatency.
+	RecordHandle(queue string, latency time.Duration)
+	// RecordDeliveryLatency reports the publish-to-delivery latency of one
+	// message: the interval from when its row was created on publish to when
+	// the handler began executing. It captures the queue wait plus fetch
+	// latency that RecordHandle excludes, so wiring both lets operators
+	// separate time-waiting-in-queue from time-in-handler. The value is clamped
+	// to zero when consumer/database clock skew would otherwise make it
+	// negative.
+	RecordDeliveryLatency(queue string, latency time.Duration)
 	// RecordAck reports an acknowledgement outcome; ok is false for a nack.
 	RecordAck(queue string, ok bool)
 	// RecordAckAfterExpired reports a receipt whose claim was no longer valid
@@ -143,11 +155,26 @@ func (pq *Queue) recordPublish(queue string, count int) {
 	}
 }
 
-// recordConsume reports one message's processing latency, if metrics are on.
-func (pq *Queue) recordConsume(queue string, latency time.Duration) {
+// recordHandle reports one message's handler-only execution latency, if
+// metrics are on.
+func (pq *Queue) recordHandle(queue string, latency time.Duration) {
 	if pq.cfg.metrics != nil {
-		pq.cfg.metrics.RecordConsume(queue, latency)
+		pq.cfg.metrics.RecordHandle(queue, latency)
 	}
+}
+
+// recordDeliveryLatency reports publish-to-delivery latency, if metrics are on:
+// the wall-clock interval from createdAt (the message row's creation time, set
+// by the database on publish) to handlerStart (when this process began running
+// the handler). createdAt is database time while handlerStart is this process's
+// clock, so a consumer whose clock lags the database can yield a negative
+// interval; such values are clamped to zero. A zero createdAt is skipped.
+func (pq *Queue) recordDeliveryLatency(queue string, createdAt, handlerStart time.Time) {
+	if pq.cfg.metrics == nil || createdAt.IsZero() {
+		return
+	}
+	latency := max(handlerStart.Sub(createdAt), 0)
+	pq.cfg.metrics.RecordDeliveryLatency(queue, latency)
 }
 
 // recordAck reports an acknowledgement outcome (ok=false for a nack), if on.

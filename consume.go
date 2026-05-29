@@ -687,7 +687,8 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 
 	start := time.Now()
 	herr := pq.callHandler(ctx, h, msg)
-	pq.recordConsume(receipt.QueueName, time.Since(start))
+	pq.recordHandle(receipt.QueueName, time.Since(start))
+	pq.recordDeliveryLatency(receipt.QueueName, msg.CreatedAt, start)
 	endSpan(span, herr)
 
 	// Detach from cancellation so a handler that finished as shutdown began

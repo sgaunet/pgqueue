@@ -215,7 +215,8 @@ func toKeyValue(a pgqueue.Attr, logger *slog.Logger) attribute.KeyValue {
 type Metrics struct {
 	logger              *slog.Logger
 	publishes           metric.Int64Counter
-	consumeDur          metric.Float64Histogram
+	handleDur           metric.Float64Histogram
+	deliveryLatency     metric.Float64Histogram
 	acks                metric.Int64Counter
 	ackAfterExpired     metric.Int64Counter
 	queueDepth          metric.Int64Gauge
@@ -261,10 +262,17 @@ func (m *Metrics) RecordPublish(queue string, count int) {
 	}
 }
 
-// RecordConsume records one message's processing latency.
-func (m *Metrics) RecordConsume(queue string, latency time.Duration) {
-	if m.consumeDur != nil {
-		m.consumeDur.Record(context.Background(), latency.Seconds(), queueAttr(queue))
+// RecordHandle records one message's handler-only execution latency.
+func (m *Metrics) RecordHandle(queue string, latency time.Duration) {
+	if m.handleDur != nil {
+		m.handleDur.Record(context.Background(), latency.Seconds(), queueAttr(queue))
+	}
+}
+
+// RecordDeliveryLatency records one message's publish-to-delivery latency.
+func (m *Metrics) RecordDeliveryLatency(queue string, latency time.Duration) {
+	if m.deliveryLatency != nil {
+		m.deliveryLatency.Record(context.Background(), latency.Seconds(), queueAttr(queue))
 	}
 }
 
@@ -358,8 +366,13 @@ func (m *Metrics) buildInstruments(meter metric.Meter) []error {
 		metric.WithDescription("Messages published to pgqueue queues")); err != nil {
 		errs = append(errs, err)
 	}
-	if m.consumeDur, err = meter.Float64Histogram("pgqueue.consume.duration",
-		metric.WithDescription("Message processing latency"),
+	if m.handleDur, err = meter.Float64Histogram("pgqueue.handle.duration",
+		metric.WithDescription("Handler-only execution latency (excludes queue wait, fetch, and ack)"),
+		metric.WithUnit("s")); err != nil {
+		errs = append(errs, err)
+	}
+	if m.deliveryLatency, err = meter.Float64Histogram("pgqueue.delivery.latency",
+		metric.WithDescription("Publish-to-delivery latency: time from message creation to handler start"),
 		metric.WithUnit("s")); err != nil {
 		errs = append(errs, err)
 	}
