@@ -48,6 +48,11 @@ func (p BackoffPolicy) Delay(prev time.Duration) time.Duration {
 
 	low := float64(pn.BaseDelay)
 	high := float64(prev) * pn.Multiplier
+	// When prev*Multiplier hasn't grown past BaseDelay yet, hold the floor so
+	// high-low is never negative and the jitter term is always non-negative.
+	if high < low {
+		high = low
+	}
 	//nolint:gosec // G404: backoff jitter is not security-sensitive.
 	d := time.Duration(low + rand.Float64()*(high-low))
 
