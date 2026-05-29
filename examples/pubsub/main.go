@@ -157,7 +157,7 @@ func printSubscriberStats(
 ) {
 	fmt.Println("\nSubscriber Statistics:")
 	for _, subscriberID := range subscribers {
-		lag, err := pq.GetSubscriberLag(ctx, topicName, subscriberID)
+		lag, err := pq.SubscriberLag(ctx, topicName, subscriberID)
 		if err != nil {
 			log.Printf("failed to get lag for %s: %v", subscriberID, err)
 			continue

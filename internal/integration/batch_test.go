@@ -40,9 +40,9 @@ func TestPublishBatchChannel(t *testing.T) {
 	}
 
 	// Verify queue depth
-	stats, err := pq.GetStats(ctx, "batch-chan", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "batch-chan", pgqueue.QueueTypeChannel)
 	if err != nil {
-		t.Fatalf("GetStats failed: %v", err)
+		t.Fatalf("Stats failed: %v", err)
 	}
 	if stats.PendingCount != 5 {
 		t.Errorf("expected 5 pending messages, got %d", stats.PendingCount)
@@ -177,9 +177,9 @@ func TestPublishBatchPayloadValidation(t *testing.T) {
 	}
 
 	// Verify no messages were inserted (all-or-nothing validation)
-	stats, err := pq.GetStats(ctx, "small-chan", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "small-chan", pgqueue.QueueTypeChannel)
 	if err != nil {
-		t.Fatalf("GetStats failed: %v", err)
+		t.Fatalf("Stats failed: %v", err)
 	}
 	if stats.PendingCount != 0 {
 		t.Errorf("expected 0 pending, got %d", stats.PendingCount)
@@ -353,9 +353,9 @@ func TestAckChannelBatch(t *testing.T) {
 		t.Fatalf("AckBatch result = %d succeeded, %d failed; want 5, 0", len(res.Succeeded), len(res.Failed))
 	}
 
-	stats, err := pq.GetStats(ctx, "ack-batch", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "ack-batch", pgqueue.QueueTypeChannel)
 	if err != nil {
-		t.Fatalf("GetStats failed: %v", err)
+		t.Fatalf("Stats failed: %v", err)
 	}
 	if stats.CompletedCount != 5 {
 		t.Errorf("expected 5 completed, got %d", stats.CompletedCount)
@@ -585,9 +585,9 @@ func TestNackChannelBatch(t *testing.T) {
 	}
 
 	// All messages should be back to pending
-	stats, err := pq.GetStats(ctx, "nack-batch", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "nack-batch", pgqueue.QueueTypeChannel)
 	if err != nil {
-		t.Fatalf("GetStats failed: %v", err)
+		t.Fatalf("Stats failed: %v", err)
 	}
 	if stats.PendingCount != 5 {
 		t.Errorf("expected 5 pending after nack, got %d", stats.PendingCount)
@@ -659,9 +659,9 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 	}
 
 	// All 3 should be in DLQ
-	stats, err := pq.GetStats(ctx, "nack-mixed", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "nack-mixed", pgqueue.QueueTypeChannel)
 	if err != nil {
-		t.Fatalf("GetStats failed: %v", err)
+		t.Fatalf("Stats failed: %v", err)
 	}
 	if stats.DLQCount != 3 {
 		t.Errorf("expected 3 in DLQ, got %d", stats.DLQCount)

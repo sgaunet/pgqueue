@@ -178,8 +178,8 @@ func (pq *Queue) ReplayDLQ(
 	return result, nil
 }
 
-// GetReplayHistory returns the replay history for a queue.
-func (pq *Queue) GetReplayHistory(
+// ReplayHistory returns the replay history for a queue.
+func (pq *Queue) ReplayHistory(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,

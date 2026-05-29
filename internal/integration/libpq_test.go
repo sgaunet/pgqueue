@@ -116,9 +116,9 @@ func TestLibPQDriver(t *testing.T) {
 			t.Fatalf("AckBatch failed under lib/pq: %v", err)
 		}
 
-		stats, err := pq.GetStats(ctx, "libpq-ack-chan", pgqueue.QueueTypeChannel)
+		stats, err := pq.Stats(ctx, "libpq-ack-chan", pgqueue.QueueTypeChannel)
 		if err != nil {
-			t.Fatalf("GetStats failed: %v", err)
+			t.Fatalf("Stats failed: %v", err)
 		}
 		if stats.CompletedCount != libPQBatchSize {
 			t.Errorf("expected %d completed, got %d", libPQBatchSize, stats.CompletedCount)
@@ -151,9 +151,9 @@ func TestLibPQDriver(t *testing.T) {
 		if _, err := pq.NackBatch(ctx, consume(), "retry"); err != nil {
 			t.Fatalf("NackBatch retry failed under lib/pq: %v", err)
 		}
-		stats, err := pq.GetStats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
+		stats, err := pq.Stats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
 		if err != nil {
-			t.Fatalf("GetStats failed: %v", err)
+			t.Fatalf("Stats failed: %v", err)
 		}
 		if stats.PendingCount != libPQBatchSize {
 			t.Errorf("expected %d pending after retry nack, got %d", libPQBatchSize, stats.PendingCount)
@@ -163,9 +163,9 @@ func TestLibPQDriver(t *testing.T) {
 		if _, err := pq.NackBatch(ctx, consume(), "dlq"); err != nil {
 			t.Fatalf("NackBatch DLQ failed under lib/pq: %v", err)
 		}
-		stats, err = pq.GetStats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
+		stats, err = pq.Stats(ctx, "libpq-nack-chan", pgqueue.QueueTypeChannel)
 		if err != nil {
-			t.Fatalf("GetStats failed: %v", err)
+			t.Fatalf("Stats failed: %v", err)
 		}
 		if stats.DLQCount != libPQBatchSize {
 			t.Errorf("expected %d in DLQ, got %d", libPQBatchSize, stats.DLQCount)
@@ -231,9 +231,9 @@ func TestLibPQDriver(t *testing.T) {
 			t.Fatalf("NackBatch DLQ failed under lib/pq: %v", err)
 		}
 
-		dlqStats, err := pq.GetDLQStats(ctx, "libpq-nack-topic", pgqueue.QueueTypePubSub)
+		dlqStats, err := pq.DLQStats(ctx, "libpq-nack-topic", pgqueue.QueueTypePubSub)
 		if err != nil {
-			t.Fatalf("GetDLQStats failed: %v", err)
+			t.Fatalf("DLQStats failed: %v", err)
 		}
 		if dlqStats.TotalCount != libPQBatchSize {
 			t.Fatalf("expected %d in topic DLQ, got %d", libPQBatchSize, dlqStats.TotalCount)

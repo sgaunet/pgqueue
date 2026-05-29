@@ -175,7 +175,7 @@ func TestQueueMaxRetriesZeroChannel(t *testing.T) {
 		t.Fatalf("nack: %v", err)
 	}
 
-	dlq, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	dlq, err := pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("DLQ stats: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestQueueMaxRetriesZeroTopic(t *testing.T) {
 		t.Fatalf("nack: %v", err)
 	}
 
-	dlq, err := pq.GetDLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
+	dlq, err := pq.DLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("DLQ stats: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestDefaultMaxRetriesZero(t *testing.T) {
 		t.Fatalf("nack: %v", err)
 	}
 
-	dlq, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	dlq, err := pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("DLQ stats: %v", err)
 	}

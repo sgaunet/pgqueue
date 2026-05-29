@@ -895,7 +895,7 @@ func TestNackTopicMovesToDLQ(t *testing.T) {
 	}
 
 	// Verify DLQ has the message
-	dlqStats, err := pq.GetDLQStats(ctx, "nack-dlq-topic", pgqueue.QueueTypePubSub)
+	dlqStats, err := pq.DLQStats(ctx, "nack-dlq-topic", pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}

@@ -46,7 +46,7 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Verify all completed
-	stats, err := pq.GetStats(ctx, "replay-test", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "replay-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Verify messages are pending again
-	stats, err = pq.GetStats(ctx, "replay-test", pgqueue.QueueTypeChannel)
+	stats, err = pq.Stats(ctx, "replay-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestReplayFrom(t *testing.T) {
 	}
 
 	// Verify replay history
-	history, err := pq.GetReplayHistory(ctx, "replay-test", pgqueue.QueueTypeChannel, 10)
+	history, err := pq.ReplayHistory(ctx, "replay-test", pgqueue.QueueTypeChannel, 10)
 	if err != nil {
 		t.Fatalf("failed to get replay history: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestReplayFromWithLimit(t *testing.T) {
 		t.Errorf("expected 2 replayed messages, got %d", count)
 	}
 
-	stats, err := pq.GetStats(ctx, "replay-limit", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "replay-limit", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestReplayMessage(t *testing.T) {
 	}
 
 	// Verify completed
-	stats, err := pq.GetStats(ctx, "replay-msg-test", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "replay-msg-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestReplayMessage(t *testing.T) {
 	}
 
 	// Verify message is pending again
-	stats, err = pq.GetStats(ctx, "replay-msg-test", pgqueue.QueueTypeChannel)
+	stats, err = pq.Stats(ctx, "replay-msg-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Verify message in DLQ
-	dlqStats, err := pq.GetDLQStats(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
+	dlqStats, err := pq.DLQStats(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Verify message is back in main queue
-	depth, err := pq.GetQueueDepth(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestReplayDLQ(t *testing.T) {
 	}
 
 	// Verify DLQ is empty
-	dlqStats, err = pq.GetDLQStats(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
+	dlqStats, err = pq.DLQStats(ctx, "replay-dlq-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestReplayDLQPubSub(t *testing.T) {
 	}
 
 	// Verify message in DLQ
-	dlqStats, err := pq.GetDLQStats(ctx, "replay-dlq-pubsub", pgqueue.QueueTypePubSub)
+	dlqStats, err := pq.DLQStats(ctx, "replay-dlq-pubsub", pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestT021_ConcurrentReplayDLQNoLossNoDuplication(t *testing.T) {
 	}
 
 	// Verify all in DLQ
-	dlqStats, err := pq.GetDLQStats(ctx, queueName, pgqueue.QueueTypeChannel)
+	dlqStats, err := pq.DLQStats(ctx, queueName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -433,7 +433,7 @@ func TestT021_ConcurrentReplayDLQNoLossNoDuplication(t *testing.T) {
 	}
 
 	// DLQ must be empty now
-	dlqStats, err = pq.GetDLQStats(ctx, queueName, pgqueue.QueueTypeChannel)
+	dlqStats, err = pq.DLQStats(ctx, queueName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats after replay: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestReplayFromPubSubFiltersOnMessagePublishTime(t *testing.T) {
 	}
 
 	// The subscriber must now have exactly 2 pending messages again.
-	lag, err := pq.GetSubscriberLag(ctx, topic, "sub1")
+	lag, err := pq.SubscriberLag(ctx, topic, "sub1")
 	if err != nil {
 		t.Fatalf("failed to get subscriber lag: %v", err)
 	}
@@ -728,7 +728,7 @@ func TestReplayDLQAllUnreplayableReturnsPromptly(t *testing.T) {
 		}
 	}
 
-	dlqStats, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	dlqStats, err := pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -796,7 +796,7 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 		t.Fatalf("failed to seed DLQ backlog: %v", err)
 	}
 
-	dlqStats, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	dlqStats, err := pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -817,7 +817,7 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 	}
 
 	// The DLQ must be empty after the replay.
-	dlqStats, err = pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	dlqStats, err = pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats after replay: %v", err)
 	}
@@ -828,7 +828,7 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 	// The audit log must hold one row per replayed page — more than one row,
 	// since the backlog (250) spans 3 pages of 100. The page size is an
 	// internal constant, so we assert ">1" rather than an exact count.
-	history, err := pq.GetReplayHistory(ctx, channelName, pgqueue.QueueTypeChannel, 100)
+	history, err := pq.ReplayHistory(ctx, channelName, pgqueue.QueueTypeChannel, 100)
 	if err != nil {
 		t.Fatalf("failed to get replay history: %v", err)
 	}
@@ -862,7 +862,7 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 		t.Fatalf("failed to query replay log: %v", err)
 	}
 	if rowCount != len(history) {
-		t.Errorf("replay log row count = %d, GetReplayHistory returned %d", rowCount, len(history))
+		t.Errorf("replay log row count = %d, ReplayHistory returned %d", rowCount, len(history))
 	}
 	if dbSum != res.Replayed {
 		t.Errorf("replay log message_count sum = %d, want %d", dbSum, res.Replayed)

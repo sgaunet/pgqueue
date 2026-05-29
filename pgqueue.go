@@ -135,7 +135,7 @@ var readCommittedTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 // InitSchema is also the upgrade path: when a newer build of pgqueue introduces
 // schema changes, InitSchema transparently applies the pending migrations to
 // bring the database up to SchemaVersion. Callers do not need to do anything
-// beyond continuing to call InitSchema at startup. See GetSchemaVersion to
+// beyond continuing to call InitSchema at startup. See SchemaVersion to
 // inspect the applied version.
 //
 // The function is idempotent and safe to run concurrently from multiple
@@ -686,7 +686,7 @@ func (pq *Queue) setQueuePaused(ctx context.Context, queueName string, queueType
 // is at the version this build of pgqueue requires, and is not newer than this
 // binary knows how to handle.
 func (pq *Queue) checkSchemaReady(ctx context.Context) error {
-	schemaVer, err := pq.GetSchemaVersion(ctx)
+	schemaVer, err := pq.SchemaVersion(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to check schema version: %w", err)
 	}

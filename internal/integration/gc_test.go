@@ -42,7 +42,7 @@ func TestGarbageCollector(t *testing.T) {
 
 	// Wait for processed_at to be set by polling the completed count.
 	eventually(t, 2*time.Second, 10*time.Millisecond, func() bool {
-		stats, err := pq.GetStats(ctx, "gc-test", pgqueue.QueueTypeChannel)
+		stats, err := pq.Stats(ctx, "gc-test", pgqueue.QueueTypeChannel)
 		return err == nil && stats.CompletedCount == 3
 	}, "timed out waiting for 3 completed messages before GC run")
 
@@ -63,7 +63,7 @@ func TestGarbageCollector(t *testing.T) {
 	}
 
 	// Check stats
-	stats, err := pq.GetStats(ctx, "gc-test", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "gc-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	}
 
 	// Verify message is in processing state
-	stats, err := pq.GetStats(ctx, "gc-timeout-test", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "gc-timeout-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	}
 
 	// Check that message is back to pending
-	stats, err = pq.GetStats(ctx, "gc-timeout-test", pgqueue.QueueTypeChannel)
+	stats, err = pq.Stats(ctx, "gc-timeout-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -176,12 +176,12 @@ func TestGarbageCollectorKeepForeverPreservesMessages(t *testing.T) {
 
 	// Wait for the acked message to appear in the completed count.
 	eventually(t, 2*time.Second, 10*time.Millisecond, func() bool {
-		stats, err := pq.GetStats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
+		stats, err := pq.Stats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
 		return err == nil && stats.CompletedCount == 1
 	}, "timed out waiting for message to reach completed state before GC run")
 
 	// Verify message is completed
-	stats, err := pq.GetStats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestGarbageCollectorKeepForeverPreservesMessages(t *testing.T) {
 	}
 
 	// Verify completed message is still present
-	stats, err = pq.GetStats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
+	stats, err = pq.Stats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestGarbageCollectorDefaultPolicyPurgesCompleted(t *testing.T) {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
 
-	stats, err := pq.GetStats(ctx, "gc-default-policy", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "gc-default-policy", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestGarbageCollectorParallel(t *testing.T) {
 	eventually(t, 2*time.Second, 10*time.Millisecond, func() bool {
 		for i := 0; i < numQueues; i++ {
 			name := "gc-parallel-" + string(rune('a'+i))
-			stats, err := pq.GetStats(ctx, name, pgqueue.QueueTypeChannel)
+			stats, err := pq.Stats(ctx, name, pgqueue.QueueTypeChannel)
 			if err != nil || stats.CompletedCount != 1 {
 				return false
 			}
@@ -326,7 +326,7 @@ func TestGarbageCollectorParallel(t *testing.T) {
 	// Verify all queues were processed
 	for i := 0; i < numQueues; i++ {
 		name := "gc-parallel-" + string(rune('a'+i))
-		stats, err := pq.GetStats(ctx, name, pgqueue.QueueTypeChannel)
+		stats, err := pq.Stats(ctx, name, pgqueue.QueueTypeChannel)
 		if err != nil {
 			t.Fatalf("failed to get stats for %s: %v", name, err)
 		}
@@ -500,7 +500,7 @@ func TestPurgeQueue(t *testing.T) {
 	}
 
 	// Verify messages exist
-	depth, err := pq.GetQueueDepth(ctx, "purge-test", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "purge-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -516,7 +516,7 @@ func TestPurgeQueue(t *testing.T) {
 	}
 
 	// Verify all messages are gone
-	depth, err = pq.GetQueueDepth(ctx, "purge-test", pgqueue.QueueTypeChannel)
+	depth, err = pq.QueueDepth(ctx, "purge-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -607,7 +607,7 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 	}
 
 	// Verify message is consumable again via subscriber lag
-	lag, err := pq.GetSubscriberLag(ctx, "gc-pubsub-vt", "sub-vt")
+	lag, err := pq.SubscriberLag(ctx, "gc-pubsub-vt", "sub-vt")
 	if err != nil {
 		t.Fatalf("failed to get subscriber lag: %v", err)
 	}
@@ -685,7 +685,7 @@ func TestExhaustedTimedOutSubscriptionsPromotedByGC(t *testing.T) {
 		t.Fatalf("second GC collect failed: %v", err)
 	}
 
-	dlq, err := pq.GetDLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
+	dlq, err := pq.DLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -694,7 +694,7 @@ func TestExhaustedTimedOutSubscriptionsPromotedByGC(t *testing.T) {
 	}
 
 	// The live subscription row must be gone (moved to the DLQ).
-	lag, err := pq.GetSubscriberLag(ctx, topicName, subID)
+	lag, err := pq.SubscriberLag(ctx, topicName, subID)
 	if err != nil {
 		t.Fatalf("failed to get subscriber lag: %v", err)
 	}
@@ -746,7 +746,7 @@ func TestGarbageCollectorMaxPendingAge(t *testing.T) {
 			t.Fatalf("garbage collection failed: %v", err)
 		}
 
-		depth, err := pq.GetQueueDepth(ctx, "gc-maxage-ch", pgqueue.QueueTypeChannel)
+		depth, err := pq.QueueDepth(ctx, "gc-maxage-ch", pgqueue.QueueTypeChannel)
 		if err != nil {
 			t.Fatalf("failed to get queue depth: %v", err)
 		}
@@ -839,7 +839,7 @@ func TestGarbageCollectorDLQRetention(t *testing.T) {
 		}
 	}
 
-	dlqStats, err := pq.GetDLQStats(ctx, "gc-dlq-ret", pgqueue.QueueTypeChannel)
+	dlqStats, err := pq.DLQStats(ctx, "gc-dlq-ret", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -863,7 +863,7 @@ func TestGarbageCollectorDLQRetention(t *testing.T) {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
 
-	dlqStats, err = pq.GetDLQStats(ctx, "gc-dlq-ret", pgqueue.QueueTypeChannel)
+	dlqStats, err = pq.DLQStats(ctx, "gc-dlq-ret", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats after GC: %v", err)
 	}
@@ -924,7 +924,7 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 	}
 
 	// gc-policy-a should have 0 completed (override policy purged them)
-	statsA, err := pq.GetStats(ctx, "gc-policy-a", pgqueue.QueueTypeChannel)
+	statsA, err := pq.Stats(ctx, "gc-policy-a", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats for gc-policy-a: %v", err)
 	}
@@ -933,7 +933,7 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 	}
 
 	// gc-policy-b should still have 3 completed (default 24h policy retains them)
-	statsB, err := pq.GetStats(ctx, "gc-policy-b", pgqueue.QueueTypeChannel)
+	statsB, err := pq.Stats(ctx, "gc-policy-b", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats for gc-policy-b: %v", err)
 	}
@@ -1060,7 +1060,7 @@ func TestExhaustedTimedOutMessagesPromotedByConsume(t *testing.T) {
 
 	// The consume path itself must have moved every exhausted message to the
 	// DLQ — verified with no GarbageCollector run.
-	dlq, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	dlq, err := pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -1111,7 +1111,7 @@ func TestGCCountsVisibilityTimeoutTowardDLQ(t *testing.T) {
 		}
 	}
 
-	dlq, err := pq.GetDLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	dlq, err := pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("DLQ stats: %v", err)
 	}
@@ -1267,7 +1267,7 @@ func TestGCPubSubDLQRetentionExceedsCompletedTTL(t *testing.T) {
 		t.Fatalf("expected message row to survive GC (pinned by DLQ entry), got %d rows", msgCount)
 	}
 
-	dlqStats, err := pq.GetDLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
+	dlqStats, err := pq.DLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("DLQ stats: %v", err)
 	}

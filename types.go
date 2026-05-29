@@ -190,7 +190,7 @@ type ReplayLog struct {
 // PendingCount is a raw status breakdown: it counts every row in the pending
 // state, including any whose TTL has elapsed and which are therefore no longer
 // consumable. For the consumable depth (TTL-expired rows excluded) use
-// GetQueueDepth instead.
+// QueueDepth instead.
 type QueueStats struct {
 	QueueName         string
 	PendingCount      int64

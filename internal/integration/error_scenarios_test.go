@@ -291,7 +291,7 @@ func TestPublishWithDuplicateMessageID(t *testing.T) {
 	}
 
 	// Verify only one message exists
-	depth, err := pq.GetQueueDepth(ctx, "dedup-test", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "dedup-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestNackExceedsMaxRetries(t *testing.T) {
 	}
 
 	// Message should now be in DLQ
-	dlqStats, err := pq.GetDLQStats(ctx, "max-retry-test", pgqueue.QueueTypeChannel)
+	dlqStats, err := pq.DLQStats(ctx, "max-retry-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestNackExceedsMaxRetries(t *testing.T) {
 	}
 
 	// Queue should be empty
-	depth, err := pq.GetQueueDepth(ctx, "max-retry-test", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "max-retry-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -497,21 +497,21 @@ func TestSubscribeToNonExistentTopic(t *testing.T) {
 	}
 }
 
-// TestGetStatsForNonExistentQueue tests getting stats for a queue that doesn't exist
-func TestGetStatsForNonExistentQueue(t *testing.T) {
+// TestStatsForNonExistentQueue tests getting stats for a queue that doesn't exist
+func TestStatsForNonExistentQueue(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	// Try to get stats for non-existent channel
-	_, err := pq.GetStats(ctx, "non-existent", pgqueue.QueueTypeChannel)
+	_, err := pq.Stats(ctx, "non-existent", pgqueue.QueueTypeChannel)
 	if err == nil {
 		t.Error("expected error when getting stats for non-existent channel, got nil")
 	}
 
 	// Try to get stats for non-existent topic
-	_, err = pq.GetStats(ctx, "non-existent", pgqueue.QueueTypePubSub)
+	_, err = pq.Stats(ctx, "non-existent", pgqueue.QueueTypePubSub)
 	if err == nil {
 		t.Error("expected error when getting stats for non-existent topic, got nil")
 	}
@@ -617,7 +617,7 @@ func TestConcurrentPublish(t *testing.T) {
 	}
 
 	// Verify all messages were published
-	depth, err := pq.GetQueueDepth(ctx, "concurrent-test", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "concurrent-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}

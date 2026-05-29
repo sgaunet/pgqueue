@@ -113,7 +113,7 @@ func consumeOrders(ctx context.Context, pq *pgqueue.Queue, channelName string) {
 }
 
 func printStats(ctx context.Context, pq *pgqueue.Queue, channelName string) {
-	stats, err := pq.GetStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		log.Printf("failed to get stats: %v", err)
 		return

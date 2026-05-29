@@ -162,9 +162,9 @@ func TestWithSchemaDLQAndStats(t *testing.T) {
 		t.Fatalf("expected 1 DLQ message, got %d", len(msgs))
 	}
 
-	stats, err := pq.GetStats(ctx, "failing", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "failing", pgqueue.QueueTypeChannel)
 	if err != nil {
-		t.Fatalf("GetStats: %v", err)
+		t.Fatalf("Stats: %v", err)
 	}
 	if stats.DLQCount != 1 {
 		t.Fatalf("expected DLQCount 1, got %d", stats.DLQCount)

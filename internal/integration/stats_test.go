@@ -9,7 +9,7 @@ import (
 	"github.com/sgaunet/pgqueue"
 )
 
-func TestGetStats(t *testing.T) {
+func TestStats(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -29,7 +29,7 @@ func TestGetStats(t *testing.T) {
 	}
 
 	// Get initial stats
-	stats, err := pq.GetStats(ctx, "stats-test", pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, "stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestGetStats(t *testing.T) {
 	}
 
 	// Get updated stats
-	stats, err = pq.GetStats(ctx, "stats-test", pgqueue.QueueTypeChannel)
+	stats, err = pq.Stats(ctx, "stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestGetStats(t *testing.T) {
 	}
 }
 
-func TestGetQueueDepth(t *testing.T) {
+func TestQueueDepth(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -85,7 +85,7 @@ func TestGetQueueDepth(t *testing.T) {
 	}
 
 	// Initial depth should be 0
-	depth, err := pq.GetQueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestGetQueueDepth(t *testing.T) {
 	}
 
 	// Depth should be 20
-	depth, err = pq.GetQueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
+	depth, err = pq.QueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestGetQueueDepth(t *testing.T) {
 	}
 
 	// Depth should still be 10 (consumed but not acked are processing, not pending)
-	depth, err = pq.GetQueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
+	depth, err = pq.QueueDepth(ctx, "depth-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestGetQueueDepth(t *testing.T) {
 	}
 }
 
-func TestGetSubscriberLag(t *testing.T) {
+func TestSubscriberLag(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -152,7 +152,7 @@ func TestGetSubscriberLag(t *testing.T) {
 	}
 
 	// Get subscriber lag
-	lag, err := pq.GetSubscriberLag(ctx, "lag-test", "subscriber-1")
+	lag, err := pq.SubscriberLag(ctx, "lag-test", "subscriber-1")
 	if err != nil {
 		t.Fatalf("failed to get subscriber lag: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestGetSubscriberLag(t *testing.T) {
 	}
 
 	// Get updated lag
-	lag, err = pq.GetSubscriberLag(ctx, "lag-test", "subscriber-1")
+	lag, err = pq.SubscriberLag(ctx, "lag-test", "subscriber-1")
 	if err != nil {
 		t.Fatalf("failed to get subscriber lag: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestGetSubscriberLag(t *testing.T) {
 	}
 }
 
-func TestGetDLQStats(t *testing.T) {
+func TestDLQStats(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -200,7 +200,7 @@ func TestGetDLQStats(t *testing.T) {
 	}
 
 	// Initial DLQ stats should be empty
-	dlqStats, err := pq.GetDLQStats(ctx, "dlq-stats-test", pgqueue.QueueTypeChannel)
+	dlqStats, err := pq.DLQStats(ctx, "dlq-stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestGetDLQStats(t *testing.T) {
 	}
 
 	// Get DLQ stats
-	dlqStats, err = pq.GetDLQStats(ctx, "dlq-stats-test", pgqueue.QueueTypeChannel)
+	dlqStats, err = pq.DLQStats(ctx, "dlq-stats-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get DLQ stats: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestGetDLQStats(t *testing.T) {
 	}
 }
 
-func TestGetSubscriberHealth(t *testing.T) {
+func TestSubscriberHealth(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -288,7 +288,7 @@ func TestGetSubscriberHealth(t *testing.T) {
 	// sub-lagging does nothing — all messages stay pending
 
 	// Check healthy subscriber
-	health, err := pq.GetSubscriberHealth(ctx, "health-test", "sub-healthy")
+	health, err := pq.SubscriberHealth(ctx, "health-test", "sub-healthy")
 	if err != nil {
 		t.Fatalf("failed to get subscriber health: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestGetSubscriberHealth(t *testing.T) {
 	}
 
 	// Check lagging subscriber
-	health, err = pq.GetSubscriberHealth(ctx, "health-test", "sub-lagging")
+	health, err = pq.SubscriberHealth(ctx, "health-test", "sub-lagging")
 	if err != nil {
 		t.Fatalf("failed to get subscriber health: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestGetSubscriberHealth(t *testing.T) {
 	}
 }
 
-func TestGetSubscriberHealthStuckMessages(t *testing.T) {
+func TestSubscriberHealthStuckMessages(t *testing.T) {
 	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -360,7 +360,7 @@ func TestGetSubscriberHealthStuckMessages(t *testing.T) {
 		t.Fatalf("failed to backdate visibility timeouts: %v", err)
 	}
 
-	health, err := pq.GetSubscriberHealth(ctx, "stuck-test", "sub-stuck")
+	health, err := pq.SubscriberHealth(ctx, "stuck-test", "sub-stuck")
 	if err != nil {
 		t.Fatalf("failed to get subscriber health: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestGetSubscriberHealthStuckMessages(t *testing.T) {
 	}
 }
 
-func TestGetUnhealthySubscribers(t *testing.T) {
+func TestUnhealthySubscribers(t *testing.T) {
 	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -441,7 +441,7 @@ func TestGetUnhealthySubscribers(t *testing.T) {
 	}
 
 	// With a 30-minute threshold, sub-stuck (stuck msgs) and sub-lagging (old pending) should be unhealthy
-	unhealthy, err := pq.GetUnhealthySubscribers(ctx, 30*time.Minute)
+	unhealthy, err := pq.UnhealthySubscribers(ctx, 30*time.Minute)
 	if err != nil {
 		t.Fatalf("failed to get unhealthy subscribers: %v", err)
 	}
@@ -464,13 +464,13 @@ func TestGetUnhealthySubscribers(t *testing.T) {
 	}
 }
 
-func TestGetUnhealthySubscribersNoTopics(t *testing.T) {
+func TestUnhealthySubscribersNoTopics(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	unhealthy, err := pq.GetUnhealthySubscribers(ctx, 5*time.Minute)
+	unhealthy, err := pq.UnhealthySubscribers(ctx, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("failed to get unhealthy subscribers: %v", err)
 	}
@@ -508,7 +508,7 @@ func TestPubSubStats(t *testing.T) {
 	}
 
 	// Get stats (should show subscriptions)
-	stats, err := pq.GetStats(ctx, "pubsub-stats-test", pgqueue.QueueTypePubSub)
+	stats, err := pq.Stats(ctx, "pubsub-stats-test", pgqueue.QueueTypePubSub)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -547,28 +547,28 @@ func TestStatsAPIRejectsAfterClose(t *testing.T) {
 		name string
 		call func() error
 	}{
-		{"GetStats", func() error {
-			_, err := pq.GetStats(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
+		{"Stats", func() error {
+			_, err := pq.Stats(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
 			return err
 		}},
-		{"GetQueueDepth", func() error {
-			_, err := pq.GetQueueDepth(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
+		{"QueueDepth", func() error {
+			_, err := pq.QueueDepth(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
 			return err
 		}},
-		{"GetSubscriberLag", func() error {
-			_, err := pq.GetSubscriberLag(ctx, "closed-stats-topic", "sub1")
+		{"SubscriberLag", func() error {
+			_, err := pq.SubscriberLag(ctx, "closed-stats-topic", "sub1")
 			return err
 		}},
-		{"GetDLQStats", func() error {
-			_, err := pq.GetDLQStats(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
+		{"DLQStats", func() error {
+			_, err := pq.DLQStats(ctx, "closed-stats-ch", pgqueue.QueueTypeChannel)
 			return err
 		}},
-		{"GetSubscriberHealth", func() error {
-			_, err := pq.GetSubscriberHealth(ctx, "closed-stats-topic", "sub1")
+		{"SubscriberHealth", func() error {
+			_, err := pq.SubscriberHealth(ctx, "closed-stats-topic", "sub1")
 			return err
 		}},
-		{"GetUnhealthySubscribers", func() error {
-			_, err := pq.GetUnhealthySubscribers(ctx, 5*time.Minute)
+		{"UnhealthySubscribers", func() error {
+			_, err := pq.UnhealthySubscribers(ctx, 5*time.Minute)
 			return err
 		}},
 	}
@@ -602,7 +602,7 @@ func TestStatsAgesNeverNegative(t *testing.T) {
 		}
 	}
 
-	stats, err := pq.GetStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	stats, err := pq.Stats(ctx, channelName, pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get stats: %v", err)
 	}
@@ -624,7 +624,7 @@ func TestStatsAgesNeverNegative(t *testing.T) {
 		}
 	}
 
-	lag, err := pq.GetSubscriberLag(ctx, topic, "sub-age")
+	lag, err := pq.SubscriberLag(ctx, topic, "sub-age")
 	if err != nil {
 		t.Fatalf("failed to get subscriber lag: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestStatsAgesNeverNegative(t *testing.T) {
 
 	// SubscriberHealth.OldestPending is a wall-clock timestamp; its age relative
 	// to now must not be in the future (which would imply a negative age).
-	health, err := pq.GetSubscriberHealth(ctx, topic, "sub-age")
+	health, err := pq.SubscriberHealth(ctx, topic, "sub-age")
 	if err != nil {
 		t.Fatalf("failed to get subscriber health: %v", err)
 	}

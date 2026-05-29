@@ -69,7 +69,7 @@ func TestPublish_PoolExhaustion(t *testing.T) {
 	t.Logf("successes: %d, errors: %d", successCount.Load(), errCount.Load())
 
 	// Verify no data corruption: queue depth must match success count
-	depth, err := pq.GetQueueDepth(ctx, "pool-exhaust", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "pool-exhaust", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestPublishWithID_ConcurrentDuplicates(t *testing.T) {
 	}
 
 	// Verify exactly 1 message in the queue
-	depth, err := pq.GetQueueDepth(ctx, "dedup-concurrent", pgqueue.QueueTypeChannel)
+	depth, err := pq.QueueDepth(ctx, "dedup-concurrent", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to get queue depth: %v", err)
 	}

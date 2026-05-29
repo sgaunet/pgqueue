@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// GetStats returns statistics for a queue.
-func (pq *Queue) GetStats(
+// Stats returns statistics for a queue.
+func (pq *Queue) Stats(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -56,11 +56,11 @@ func (pq *Queue) GetStats(
 	return stats, nil
 }
 
-// GetQueueDepth returns the number of pending messages currently consumable
+// QueueDepth returns the number of pending messages currently consumable
 // from a queue. Messages whose TTL has elapsed are excluded, matching what the
 // consume queries actually deliver, so the depth is not inflated by expired
 // rows that no consumer can ever receive.
-func (pq *Queue) GetQueueDepth(
+func (pq *Queue) QueueDepth(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -121,8 +121,8 @@ func queueDepthQuery(pq *Queue, tableName string, queueType QueueType, ttl time.
 	), nil
 }
 
-// GetSubscriberLag returns lag statistics for a specific subscriber on a topic.
-func (pq *Queue) GetSubscriberLag(
+// SubscriberLag returns lag statistics for a specific subscriber on a topic.
+func (pq *Queue) SubscriberLag(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
@@ -182,8 +182,8 @@ func (pq *Queue) GetSubscriberLag(
 	return lag, nil
 }
 
-// GetDLQStats returns statistics about messages in the dead letter queue.
-func (pq *Queue) GetDLQStats(
+// DLQStats returns statistics about messages in the dead letter queue.
+func (pq *Queue) DLQStats(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
@@ -376,8 +376,8 @@ func (pq *Queue) getPubSubStats(
 	return nil
 }
 
-// GetSubscriberHealth returns detailed health information for a specific subscriber on a topic.
-func (pq *Queue) GetSubscriberHealth(
+// SubscriberHealth returns detailed health information for a specific subscriber on a topic.
+func (pq *Queue) SubscriberHealth(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
@@ -429,11 +429,11 @@ func (pq *Queue) GetSubscriberHealth(
 	return health, nil
 }
 
-// GetUnhealthySubscribers returns subscribers with health issues across all topics.
+// UnhealthySubscribers returns subscribers with health issues across all topics.
 // A subscriber is unhealthy if it has messages stuck in processing (visibility timeout
 // expired) or pending messages older than the given threshold.
 // Note: this executes one query per topic due to the table-per-queue design.
-func (pq *Queue) GetUnhealthySubscribers(
+func (pq *Queue) UnhealthySubscribers(
 	ctx context.Context,
 	threshold time.Duration,
 ) ([]SubscriberHealth, error) {

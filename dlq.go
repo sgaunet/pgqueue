@@ -1,7 +1,8 @@
 package pgqueue
 
-// dlq.go holds the dead-letter-queue inspection API: keyset-paginated listing
-// and aggregate statistics (FR-022).
+// dlq.go holds the dead-letter-queue listing API: keyset-paginated listing of
+// dead-letter messages (FR-022). Aggregate DLQ statistics are in stats.go
+// (DLQStats).
 
 import (
 	"context"
@@ -114,21 +115,4 @@ func (pq *Queue) scanDLQMessage(queue string, rows rowScanner) (DLQMessage, erro
 // rowScanner is the subset of *sql.Rows / *sql.Row used by scanDLQMessage.
 type rowScanner interface {
 	Scan(dest ...any) error
-}
-
-// DLQStats returns aggregate statistics for a queue's dead-letter queue
-// (FR-022). It is the redesigned-API name for GetDLQStats.
-func (pq *Queue) DLQStats(
-	ctx context.Context,
-	name string,
-	queueType QueueType,
-) (DLQStats, error) {
-	if err := pq.checkClosed(); err != nil {
-		return DLQStats{}, err
-	}
-	stats, err := pq.GetDLQStats(ctx, name, queueType)
-	if err != nil {
-		return DLQStats{}, err
-	}
-	return *stats, nil
 }

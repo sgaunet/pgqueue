@@ -89,7 +89,7 @@ exact values and the encoding scheme.
 
 Scalability ceiling: each queue creates 2-3 tables plus 6-7 indexes, and
 admin operations (GarbageCollector.Collect, ListChannels, ListTopics,
-GetUnhealthySubscribers) scale linearly with queue count. The table-per-queue
+UnhealthySubscribers) scale linearly with queue count. The table-per-queue
 design targets tens to low hundreds of queues per database; it is not
 appropriate for per-tenant/per-user queues at multi-tenant scale. Use
 WithMaxQueues to enforce a deliberate cap. See ADR-002 in ADR.md.
