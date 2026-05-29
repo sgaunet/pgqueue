@@ -127,10 +127,14 @@ type ReplayDLQResult struct {
 // so a DLQ full of un-replayable rows still returns promptly rather than
 // scanning the whole table.
 //
-// For pub/sub topics: the original message must still exist in the message table.
-// If CompletedMessageTTL is shorter than DLQRetention in your GC policy, the message
-// row may be garbage-collected before the DLQ entry, causing a foreign key error on replay.
-// Ensure DLQRetention does not exceed CompletedMessageTTL for pub/sub topics.
+// For pub/sub topics replay re-creates the failed subscriber's subscription
+// row, which foreign-keys the original message row. That row is kept alive for
+// you: the garbage collector never purges a message while a DLQ entry still
+// references it (see purgeCompletedMessages / reclaimOrphanTopicMessages), so
+// the DLQ entry is always purged first and CompletedMessageTTL may safely be
+// shorter than DLQRetention. A DLQ entry whose message was removed by some
+// other means (manual SQL, PurgeQueue) is skipped, not replayed, so one stale
+// entry can never abort the whole replay.
 func (pq *Queue) ReplayDLQ(
 	ctx context.Context,
 	queueName string,

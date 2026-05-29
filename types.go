@@ -236,6 +236,13 @@ const KeepForever time.Duration = -1
 // message within the age limit. The shared message row and every other
 // subscriber's rows are left intact, so a slow subscriber can no longer cause
 // message loss for its peers.
+//
+// CompletedMessageTTL and DLQRetention may be set independently for pub/sub
+// topics — in particular DLQRetention may exceed CompletedMessageTTL, which is
+// the usual and default arrangement (keep failures around longer than
+// transient successes). The garbage collector never purges a message row while
+// a DLQ entry still references it, so the DLQ entry is always reaped first and
+// pub/sub DLQ replay always finds its parent message.
 type RetentionPolicy struct {
 	CompletedMessageTTL time.Duration // How long to keep completed messages (0 or KeepForever = forever)
 	MaxPendingAge       time.Duration // Maximum age for pending messages/deliveries (0 or KeepForever = no limit)

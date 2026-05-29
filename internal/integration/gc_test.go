@@ -1151,6 +1151,100 @@ func TestGCKeepsDLQReferencedPubSubMessage(t *testing.T) {
 	}
 }
 
+// TestGCPubSubDLQRetentionExceedsCompletedTTL is the regression test for the C9
+// audit finding (issue #140): for pub/sub topics a GC policy with
+// CompletedMessageTTL < DLQRetention must be safe. The completed-message purge
+// never removes a message while a DLQ entry references it, so the DLQ entry is
+// always reaped first and stays replayable even though the message is long past
+// its CompletedMessageTTL.
+func TestGCPubSubDLQRetentionExceedsCompletedTTL(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const topicName = "gc-c9-ttl-topic"
+	const msgTable = "pgqueue_msg_gc_c9_ttl_topic"
+	// MaxRetries=0 so the failing subscriber is dead-lettered on its first nack.
+	if err := pq.CreateTopic(ctx, topicName, pgqueue.WithQueueMaxRetries(0)); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicName, "sub-ok"); err != nil {
+		t.Fatalf("subscribe sub-ok: %v", err)
+	}
+	if err := pq.Subscribe(ctx, topicName, "sub-fail"); err != nil {
+		t.Fatalf("subscribe sub-fail: %v", err)
+	}
+	if _, err := pq.Publish(ctx, topicName, []byte("fan-out")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// sub-ok acks; sub-fail nacks straight to the DLQ. The message row is now
+	// "completed" (no non-acked subscription rows remain) but a DLQ entry
+	// references it.
+	okMsg, err := pq.ReceiveTopic(ctx, topicName, "sub-ok", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if err != nil || okMsg == nil {
+		t.Fatalf("sub-ok consume: msg=%v err=%v", okMsg, err)
+	}
+	if err := pq.Ack(ctx, okMsg.Receipt()); err != nil {
+		t.Fatalf("sub-ok ack: %v", err)
+	}
+	failMsg, err := pq.ReceiveTopic(ctx, topicName, "sub-fail", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if err != nil || failMsg == nil {
+		t.Fatalf("sub-fail consume: msg=%v err=%v", failMsg, err)
+	}
+	if err := pq.Nack(ctx, failMsg.Receipt(), "boom"); err != nil {
+		t.Fatalf("sub-fail nack: %v", err)
+	}
+
+	// Backdate the message well past CompletedMessageTTL so the completed-message
+	// purge would delete it if the DLQ guard were absent.
+	if _, err := db.ExecContext(ctx,
+		fmt.Sprintf("UPDATE %s SET created_at = NOW() - INTERVAL '2 hours'", msgTable)); err != nil {
+		t.Fatalf("backdate message: %v", err)
+	}
+
+	// CompletedMessageTTL (1ms) is far shorter than DLQRetention (1h): the exact
+	// configuration C9 warned about. The DLQ entry is fresh, so it survives this
+	// pass; the message must survive too because the DLQ entry pins it.
+	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		DefaultPolicy: pgqueue.RetentionPolicy{
+			CompletedMessageTTL: 1 * time.Millisecond,
+			DLQRetention:        1 * time.Hour,
+		},
+	})
+	if err := gc.Collect(ctx); err != nil {
+		t.Fatalf("GC collect: %v", err)
+	}
+
+	var msgCount int
+	if err := db.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT COUNT(*) FROM %s", msgTable)).Scan(&msgCount); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if msgCount != 1 {
+		t.Fatalf("expected message row to survive GC (pinned by DLQ entry), got %d rows", msgCount)
+	}
+
+	dlqStats, err := pq.GetDLQStats(ctx, topicName, pgqueue.QueueTypePubSub)
+	if err != nil {
+		t.Fatalf("DLQ stats: %v", err)
+	}
+	if dlqStats.TotalCount != 1 {
+		t.Fatalf("expected DLQ entry to survive (within DLQRetention), got %d", dlqStats.TotalCount)
+	}
+
+	// The surviving DLQ entry is still replayable.
+	res, err := pq.ReplayDLQ(ctx, topicName, pgqueue.QueueTypePubSub, pgqueue.ReplayOptions{})
+	if err != nil {
+		t.Fatalf("replay DLQ: %v", err)
+	}
+	if res.Replayed != 1 {
+		t.Errorf("expected 1 DLQ message replayed, got Replayed=%d Skipped=%d",
+			res.Replayed, res.Skipped)
+	}
+}
+
 // TestGarbageCollectorInertAfterClose verifies that a GarbageCollector created
 // after the owning Queue is closed does not start a background loop: Start is a
 // no-op and the create/start/stop sequence completes without panicking.

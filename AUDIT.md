@@ -16,7 +16,7 @@ The library is in good shape. The hardest correctness paths (retry/DLQ boundary,
 |------|-------|-------|
 | 1 | Breaking API — lock in before 1.0 | ~~#A1 DB interface~~ ✅, ~~#A2 batch results~~ ✅, ~~#A3 Listener contract~~ ✅ |
 | 2 | Robustness — non-breaking | ~~#B4 BIGINT counters~~ ✅, ~~#B5 invalid-index handling~~ ✅, #B6 unlock logging |
-| 3 | Operability / docs | #C7 queue ceiling, #C8 polling cost, #C9 DLQ/TTL FK hazard |
+| 3 | Operability / docs | #C7 queue ceiling, #C8 polling cost, ~~#C9 DLQ/TTL FK hazard~~ ✅ |
 
 User-flagged priorities for the eventual remediation pass: **#A2 (batch results)** and **#A3 (Listener contract)** — both now resolved (#133, #134).
 
@@ -85,10 +85,10 @@ User-flagged priorities for the eventual remediation pass: **#A2 (batch results)
 - **Context:** Default poll loop (consume.go) issues a query per poll per consumer even when empty. The `pglisten` LISTEN/NOTIFY adapter exists but is opt-in.
 - **Recommendation:** Document the polling cost trade-off prominently and point high-fan-in users at `pglisten`.
 
-#### C9. Pub/Sub DLQ foreign-key hazard when `CompletedMessageTTL < DLQRetention`
+#### ~~C9. Pub/Sub DLQ foreign-key hazard when `CompletedMessageTTL < DLQRetention`~~ ✅ RESOLVED (#140)
 - **Where:** sub table `FOREIGN KEY (message_id) REFERENCES pgqueue_msg_<queue>(id) ON DELETE CASCADE` (pgqueue.go ~:998); warning doc comment in replay.go.
-- **Problem:** If the message TTL is shorter than the DLQ retention, the parent message row is purged before the DLQ entry, cascading away DLQ rows / breaking replay. Currently only a doc comment guards this.
-- **Recommendation:** Validate `DLQRetention <= CompletedMessageTTL` for pub/sub at config time (or document as a hard constraint).
+- **Problem:** If the message TTL is shorter than the DLQ retention, the parent message row could be purged before the DLQ entry, orphaning the DLQ entry / breaking replay.
+- **Resolution:** The hazard is structurally prevented, not validated away. All three pub/sub message-purge paths (`purgeCompletedMessages`, `reclaimOrphanTopicMessages`, and `purgeOldPendingMessages`, which deletes only subscription rows) refuse to remove a message while a DLQ entry references it (`NOT EXISTS (... d.original_message_id = m.id)`, the FR-027 guard). The DLQ entry is therefore always reaped first, so `CompletedMessageTTL < DLQRetention` is safe — which is also the default (24h < 30d). The config-time validation the audit proposed would have wrongly rejected that default. The stale warning in `replay.go` and the `RetentionPolicy` doc were corrected to state the guarantee, and `TestGCPubSubDLQRetentionExceedsCompletedTTL` regression-tests the exact configuration (alongside the existing `TestGCKeepsDLQReferencedPubSubMessage`).
 
 ---
 
