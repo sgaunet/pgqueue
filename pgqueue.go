@@ -142,6 +142,14 @@ var readCommittedTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 // processes: migrations are serialized with a PostgreSQL advisory lock, so it
 // can be called on every application instance at startup.
 //
+// On every call (not only when a migration is pending) InitSchema also repairs
+// any pgqueue index left invalid by an interrupted build — see RepairIndexes.
+// This is why calling it at startup heals an index a prior crash invalidated.
+//
+// InitSchema accepts only WithSchema and WithLogger. WithLogger is honored so
+// the index-repair pass can report what it repaired; all other options are
+// rejected with ErrInvalidConfig.
+//
 // Example usage:
 //
 //	db, err := sql.Open("pgx", "postgres://user:pass@localhost/dbname")
@@ -168,13 +176,14 @@ func InitSchema(ctx context.Context, db DB, opts ...Option) error {
 		return ErrDBRequired
 	}
 
-	// InitSchema only honors WithSchema. Reject any other option rather than
-	// silently ignoring it, so a caller is not misled into believing an
-	// inapplicable option (WithMaxQueues, WithBackoffPolicy, …) took effect
-	// (R-14).
-	if !onlySchemaOption(opts) {
+	// InitSchema honors only WithSchema and WithLogger. WithSchema selects the
+	// target schema; WithLogger surfaces the post-migration index-repair pass
+	// (B5/#136). Reject any other option rather than silently ignoring it, so a
+	// caller is not misled into believing an inapplicable option (WithMaxQueues,
+	// WithBackoffPolicy, …) took effect (R-14).
+	if !onlySchemaOrLoggerOption(opts) {
 		return fmt.Errorf(
-			"InitSchema accepts only WithSchema: %w", ErrInvalidConfig,
+			"InitSchema accepts only WithSchema and WithLogger: %w", ErrInvalidConfig,
 		)
 	}
 
@@ -190,27 +199,29 @@ func InitSchema(ctx context.Context, db DB, opts ...Option) error {
 		return err
 	}
 
-	if err := runMigrations(ctx, db, cfg.schemaName); err != nil {
+	if err := runMigrations(ctx, db, cfg.schemaName, cfg.logger); err != nil {
 		return fmt.Errorf("failed to initialize base schema: %w", err)
 	}
 
 	return nil
 }
 
-// onlySchemaOption reports whether opts carries nothing beyond WithSchema.
-// InitSchema uses it to reject inapplicable options. The probe is inspected
-// field-by-field rather than with a struct comparison: queueConfig carries
-// interface fields (logger, tracer, metrics, listener) whose dynamic type may
-// not be comparable, which would make a struct == panic instead of returning a
-// clean ErrInvalidConfig.
-func onlySchemaOption(opts []Option) bool {
+// onlySchemaOrLoggerOption reports whether opts carries nothing beyond
+// WithSchema and/or WithLogger — the only options InitSchema applies (the logger
+// surfaces the post-migration index-repair pass). It uses it to reject
+// inapplicable options. The probe is inspected field-by-field rather than with a
+// struct comparison: queueConfig carries interface fields (logger, tracer,
+// metrics, listener) whose dynamic type may not be comparable, which would make
+// a struct == panic instead of returning a clean ErrInvalidConfig.
+func onlySchemaOrLoggerOption(opts []Option) bool {
 	probe := queueConfig{}
 	for _, o := range opts {
 		o(&probe)
 	}
-	// Each element is true when a non-WithSchema option set the corresponding
-	// field. The interface fields are tested with != nil, which never panics.
-	nonSchema := []bool{
+	// Each element is true when an option other than WithSchema / WithLogger set
+	// the corresponding field. The interface fields are tested with != nil, which
+	// never panics. logger is intentionally absent: WithLogger is allowed.
+	disallowed := []bool{
 		probe.maxMessageSize != 0,
 		probe.maxMetadataSize != 0,
 		probe.defaultMaxRetries != 0,
@@ -219,12 +230,11 @@ func onlySchemaOption(opts []Option) bool {
 		probe.maxQueues != 0,
 		probe.safetyNetPoll != 0,
 		probe.backoffConfigured,
-		probe.logger != nil,
 		probe.tracer != nil,
 		probe.metrics != nil,
 		probe.listener != nil,
 	}
-	for _, set := range nonSchema {
+	for _, set := range disallowed {
 		if set {
 			return false
 		}
@@ -1286,7 +1296,7 @@ func validateSchemaName(name string) error {
 // unqualified so existing databases and queries are unaffected; for any other
 // schema it returns "<schema>." (FR-024).
 func schemaTablePrefix(schema string) string {
-	if schema == "" || schema == "public" {
+	if schema == "" || schema == defaultSchemaName {
 		return ""
 	}
 

@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// defaultSchemaName is the PostgreSQL schema pgqueue uses when WithSchema is not
+// supplied (FR-024). It is also the value an empty schema string normalizes to.
+const defaultSchemaName = "public"
+
 // defaultMaxMessageSize is 256 KiB, per the spec (FR-032).
 const defaultMaxMessageSize = 256 * 1024
 
@@ -207,7 +211,7 @@ func applyConfigOptions(opts []Option) queueConfig {
 		c.defaultMaxRetries = 3
 	}
 	if c.schemaName == "" {
-		c.schemaName = "public"
+		c.schemaName = defaultSchemaName
 	}
 	// Complete the backoff policy per-field so a partially-specified policy
 	// (e.g. only MaxDelay set) still has sane BaseDelay/Multiplier values

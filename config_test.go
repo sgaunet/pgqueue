@@ -3,6 +3,7 @@ package pgqueue
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 )
 
@@ -28,29 +29,37 @@ func TestApplyConfigOptionsMaxRetries(t *testing.T) {
 }
 
 // uncomparableTestListener is a Listener whose dynamic type is not comparable
-// (it has a slice field). onlySchemaOption must handle it without panicking.
+// (it has a slice field). onlySchemaOrLoggerOption must handle it without
+// panicking.
 type uncomparableTestListener struct{ marker []int }
 
 func (uncomparableTestListener) Listen(context.Context, string) error { return nil }
 func (uncomparableTestListener) Notifications() <-chan string         { return nil }
 func (uncomparableTestListener) Close() error                         { return nil }
 
-// TestOnlySchemaOption verifies that InitSchema's option gate accepts only
-// WithSchema and, crucially, does not panic when an option carries a value
-// whose dynamic type is not comparable (a non-comparable Listener).
-func TestOnlySchemaOption(t *testing.T) {
-	if !onlySchemaOption(nil) {
-		t.Error("nil options: onlySchemaOption = false, want true")
+// TestOnlySchemaOrLoggerOption verifies that InitSchema's option gate accepts
+// WithSchema and WithLogger, rejects everything else, and, crucially, does not
+// panic when an option carries a value whose dynamic type is not comparable (a
+// non-comparable Listener).
+func TestOnlySchemaOrLoggerOption(t *testing.T) {
+	if !onlySchemaOrLoggerOption(nil) {
+		t.Error("nil options: onlySchemaOrLoggerOption = false, want true")
 	}
-	if !onlySchemaOption([]Option{WithSchema("custom")}) {
-		t.Error("WithSchema only: onlySchemaOption = false, want true")
+	if !onlySchemaOrLoggerOption([]Option{WithSchema("custom")}) {
+		t.Error("WithSchema only: onlySchemaOrLoggerOption = false, want true")
 	}
-	if onlySchemaOption([]Option{WithMaxQueues(5)}) {
-		t.Error("WithMaxQueues: onlySchemaOption = true, want false")
+	if !onlySchemaOrLoggerOption([]Option{WithLogger(slog.Default())}) {
+		t.Error("WithLogger only: onlySchemaOrLoggerOption = false, want true")
+	}
+	if !onlySchemaOrLoggerOption([]Option{WithSchema("custom"), WithLogger(slog.Default())}) {
+		t.Error("WithSchema+WithLogger: onlySchemaOrLoggerOption = false, want true")
+	}
+	if onlySchemaOrLoggerOption([]Option{WithMaxQueues(5)}) {
+		t.Error("WithMaxQueues: onlySchemaOrLoggerOption = true, want false")
 	}
 	// Must return false, not panic, for a non-comparable listener value.
-	if onlySchemaOption([]Option{WithListener(uncomparableTestListener{})}) {
-		t.Error("WithListener: onlySchemaOption = true, want false")
+	if onlySchemaOrLoggerOption([]Option{WithListener(uncomparableTestListener{})}) {
+		t.Error("WithListener: onlySchemaOrLoggerOption = true, want false")
 	}
 }
 
@@ -156,11 +165,11 @@ func TestValidateMaxMetadataSize(t *testing.T) {
 	}
 }
 
-// TestOnlySchemaOptionRejectsMaxMetadataSize confirms WithMaxMetadataSize is
-// not silently accepted by InitSchema.
-func TestOnlySchemaOptionRejectsMaxMetadataSize(t *testing.T) {
-	if onlySchemaOption([]Option{WithMaxMetadataSize(1024)}) {
-		t.Error("WithMaxMetadataSize: onlySchemaOption = true, want false")
+// TestOnlySchemaOrLoggerOptionRejectsMaxMetadataSize confirms WithMaxMetadataSize
+// is not silently accepted by InitSchema.
+func TestOnlySchemaOrLoggerOptionRejectsMaxMetadataSize(t *testing.T) {
+	if onlySchemaOrLoggerOption([]Option{WithMaxMetadataSize(1024)}) {
+		t.Error("WithMaxMetadataSize: onlySchemaOrLoggerOption = true, want false")
 	}
 }
 

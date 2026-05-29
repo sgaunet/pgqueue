@@ -15,7 +15,7 @@ The library is in good shape. The hardest correctness paths (retry/DLQ boundary,
 | Tier | Theme | Items |
 |------|-------|-------|
 | 1 | Breaking API — lock in before 1.0 | ~~#A1 DB interface~~ ✅, ~~#A2 batch results~~ ✅, ~~#A3 Listener contract~~ ✅ |
-| 2 | Robustness — non-breaking | #B4 BIGINT counters, #B5 invalid-index handling, #B6 unlock logging |
+| 2 | Robustness — non-breaking | ~~#B4 BIGINT counters~~ ✅, ~~#B5 invalid-index handling~~ ✅, #B6 unlock logging |
 | 3 | Operability / docs | #C7 queue ceiling, #C8 polling cost, #C9 DLQ/TTL FK hazard |
 
 User-flagged priorities for the eventual remediation pass: **#A2 (batch results)** and **#A3 (Listener contract)** — both now resolved (#133, #134).
@@ -56,15 +56,17 @@ User-flagged priorities for the eventual remediation pass: **#A2 (batch results)
 
 ### Tier 2 — robustness hardening (non-breaking)
 
-#### B4. `retry_count` / `max_retries` are 32-bit `INT`
+#### B4. `retry_count` / `max_retries` are 32-bit `INT` — ✅ RESOLVED (#135)
 - **Where:** channel message table DDL (pgqueue.go ~:1086, `max_retries INT CHECK (... >= 0)`); increment in Go `int` at channel.go:383.
 - **Problem:** The column only checks `>= 0`. A pathological crash-loop could overflow the counter; once `retry_count` wraps negative the exhaustion test `retryCount > channelMaxRetries(...)` becomes unreliable, so a message could dodge the DLQ.
 - **Recommendation:** Use `BIGINT` for the counters and/or add an explicit overflow guard before incrementing. Trivial as a forward-only migration now; annoying later.
+- **Resolution:** All four per-queue retry counters (`pgqueue_msg_*.retry_count` / `.max_retries`, `pgqueue_sub_*.retry_count`, `pgqueue_dlq_*.retry_count`) are now `BIGINT`, raising the overflow ceiling from ~2.1×10⁹ to ~9.2×10¹⁸. Fresh queues are born `BIGINT`; the forward-only v4 migration (`migrateBigintRetryCounts`) widens pre-existing per-queue tables, skipping columns already `BIGINT` for idempotency. Internal `max_retries` scan targets moved `sql.NullInt32`→`sql.NullInt64`; no public API change (`RetryCount`/`MaxRetries` were already `int`). No explicit Go guard added — `BIGINT` makes the wrap unreachable.
 
 #### B5. A failed `CREATE INDEX` leaves an invalid index that `IF NOT EXISTS` skips forever
 - **Where:** per-queue index creation (pgqueue.go:1113-1157) and the v2 migration index (migrations.go). All use `CREATE INDEX IF NOT EXISTS`.
 - **Problem:** If an index creation is interrupted (statement timeout, crash, or a future `CREATE INDEX CONCURRENTLY`), PostgreSQL leaves an **invalid** index (`pg_index.indisvalid = false`). A later `IF NOT EXISTS` silently sees the name and skips it forever, so GC/consume queries quietly degrade to scans with no signal.
 - **Recommendation:** Detect invalid leftovers (query `pg_index.indisvalid`) and drop+recreate, or add a startup validity check that logs/repairs.
+- **Resolution:** Added a catalog-driven repair pass (`index_repair.go`). A single query finds every invalid `idx_pgqueue_*` index in the schema and captures its exact recreate DDL via `pg_get_indexdef` — so no DDL registry is needed and it covers global, channel, sub, DLQ, and any future indexes; the `idx_pgqueue_` prefix filter deliberately excludes `*_pkey` constraint indexes. Each invalid index is dropped and recreated. The pass runs **automatically on every `InitSchema`** (not just when a migration is pending), reusing the advisory-locked migration connection so concurrent startups serialize — this is the "startup validity check that logs/repairs". A new public `Queue.RepairIndexes(ctx) (RepairResult, error)` exposes the same pass for long-running processes that self-heal without restarting. `InitSchema` now also accepts `WithLogger` (in addition to `WithSchema`) so the repair pass can report what it fixed. Repair is best-effort: an index that cannot be recreated is reported in `RepairResult.Failed` and logged rather than bricking startup; only a detection-query failure aborts. The common case (no invalid index) costs one catalog query and issues no DDL.
 
 #### B6. Migration advisory-unlock failure is swallowed
 - **Where:** migrations.go:397 — `_, _ = conn.ExecContext(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", ...)`.

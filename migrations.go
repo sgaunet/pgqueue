@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -488,7 +489,13 @@ func schemaVersion(ctx context.Context, q queryRower, versionTable string) (int,
 // the otherwise-unqualified base-schema DDL lands in that schema. search_path is
 // reliable here because the run holds one dedicated connection; it is RESET
 // before that connection returns to the pool.
-func runMigrations(ctx context.Context, db DB, schema string) error {
+//
+// After the migrations apply, runMigrations repairs any pgqueue index left
+// invalid by an interrupted build (B5/#136). This runs on every call, not just
+// when a migration is pending, so a crash that invalidates an index is healed at
+// the next startup. It reuses the advisory-locked connection so concurrent
+// startups do not race on the drop/recreate. logger may be nil.
+func runMigrations(ctx context.Context, db DB, schema string, logger *slog.Logger) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire migration connection: %w", err)
@@ -533,6 +540,11 @@ func runMigrations(ctx context.Context, db DB, schema string) error {
 		if err := applyMigration(ctx, conn, m); err != nil {
 			return fmt.Errorf("schema migration %d (%s): %w", m.version, m.name, err)
 		}
+	}
+
+	// Heal indexes left invalid by an interrupted build.
+	if err := repairIndexesAfterMigrations(ctx, conn, schema, logger); err != nil {
+		return err
 	}
 
 	return nil
