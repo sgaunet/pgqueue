@@ -15,19 +15,53 @@ import (
 // the failure with errors.Is.
 var errMalformedMigrations = errors.New("malformed migrations slice")
 
+// ErrSchemaTooNew is returned by InitSchema (and therefore by New via
+// checkSchemaReady) when the database's recorded schema version is strictly
+// greater than this binary's SchemaVersion constant. This indicates a
+// rolling-deploy scenario where an older binary is starting against a database
+// already migrated by a newer binary. Proceeding would risk data corruption or
+// query errors against columns that the older code does not expect, so the
+// binary aborts with this error instead of silently running against a schema it
+// does not understand.
+var ErrSchemaTooNew = errors.New(
+	"pgqueue schema is newer than this binary: upgrade the binary or roll back the schema",
+)
+
 // SchemaVersion is the latest schema version this build of pgqueue knows how to
 // produce. InitSchema migrates a database up to this version automatically.
 //
 // IMPORTANT: when adding a new entry to the migrations slice below, bump this
 // constant to match that entry's version number. An init() check enforces that
 // SchemaVersion equals the last migration's version.
-const SchemaVersion = 4
+const SchemaVersion = 7
 
-// migrationAdvisoryLockKey is a fixed PostgreSQL advisory-lock key (the ASCII
-// bytes of "pgqueue") used to serialize schema migrations across processes.
-// Multiple application instances calling InitSchema concurrently will block on
-// this lock so exactly one of them runs the DDL.
+// Advisory-lock key encoding scheme
+//
+// All pgqueue advisory-lock keys are int64 values encoded from the ASCII bytes
+// of a short, human-readable tag so that pg_locks rows are identifiable from
+// psql without a code lookup. The encoding concatenates the ASCII bytes of the
+// tag in big-endian order; underscore separators are used in the literal for
+// readability only and have no effect on the value.
+//
+// Current key assignments (tag → hexadecimal → decimal):
+//
+//	"pgqueue" → 0x7067717565_7565 → 481038094336869  migrationAdvisoryLockKey
+//	"pgquecq" → 0x70677175_65_6371 → 481038093893489  createQueueAdvisoryLockKey
+//
+// New keys must use a unique 7-byte ASCII tag so the values do not collide.
+
+// migrationAdvisoryLockKey is a fixed PostgreSQL advisory-lock key (ASCII bytes
+// of "pgqueue") used to serialize schema migrations across processes. Multiple
+// application instances calling InitSchema concurrently will block on this lock
+// so exactly one of them runs the DDL. createQueueInTx acquires the same key as
+// a shared transaction-scoped lock so queue creation cannot run its DDL
+// concurrently with a migration that iterates per-queue tables.
 const migrationAdvisoryLockKey int64 = 0x7067717565_7565
+
+// createQueueAdvisoryLockKey serializes concurrent createQueue calls when a
+// MaxQueues cap is configured, so the SELECT COUNT(*) check cannot race past
+// the cap. The ASCII bytes spell "pgquecq" (pgqueue create-queue).
+const createQueueAdvisoryLockKey int64 = 0x70677175_65_6371
 
 // schemaVersionTableSQL bootstraps the migration-tracking table. Unlike the
 // queue tables, this table is not itself created by a migration: it must exist
@@ -125,6 +159,21 @@ var migrations = []migration{
 		version: 4, //nolint:mnd // schema migration version number
 		name:    "bigint retry counters",
 		apply:   migrateBigintRetryCounts,
+	},
+	{
+		version: 5, //nolint:mnd // schema migration version number
+		name:    "max_retries NOT NULL with default 0",
+		apply:   migrateMaxRetriesNotNull,
+	},
+	{
+		version: 6, //nolint:mnd // schema migration version number
+		name:    "metadata JSONB DEFAULT empty object",
+		apply:   migrateMetadataDefault,
+	},
+	{
+		version: 7, //nolint:mnd // schema migration version number
+		name:    "pubsub DLQ subscriber_id partial index",
+		apply:   migratePubSubDLQSubscriberIndex,
 	},
 }
 
@@ -502,19 +551,11 @@ func runMigrations(ctx context.Context, db DB, schema string, logger *slog.Logge
 	}
 	defer func() { _ = conn.Close() }()
 
-	if _, err := conn.ExecContext(ctx,
-		"SELECT pg_advisory_lock($1)", migrationAdvisoryLockKey,
-	); err != nil {
-		return fmt.Errorf("failed to acquire migration lock: %w", err)
+	releaseLock, err := acquireMigrationLock(ctx, conn, logger)
+	if err != nil {
+		return err
 	}
-	// Release the lock explicitly: (*sql.Conn).Close returns the connection to
-	// the pool without ending the session, so a session-level lock would
-	// otherwise leak onto a pooled connection. context.WithoutCancel ensures
-	// the unlock still runs even if the caller's context was cancelled.
-	defer func() {
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx),
-			"SELECT pg_advisory_unlock($1)", migrationAdvisoryLockKey)
-	}()
+	defer releaseLock()
 
 	prefix := schemaTablePrefix(schema)
 	resetSearchPath, err := configureMigrationSchema(ctx, conn, schema)
@@ -523,11 +564,7 @@ func runMigrations(ctx context.Context, db DB, schema string, logger *slog.Logge
 	}
 	defer resetSearchPath()
 
-	if _, err := conn.ExecContext(ctx, schemaVersionTableSQL); err != nil {
-		return fmt.Errorf("failed to create schema version table: %w", err)
-	}
-
-	current, err := schemaVersion(ctx, conn, prefix+"pgqueue_schema_version")
+	current, err := loadSchemaVersion(ctx, conn, prefix+"pgqueue_schema_version")
 	if err != nil {
 		return err
 	}
@@ -548,6 +585,56 @@ func runMigrations(ctx context.Context, db DB, schema string, logger *slog.Logge
 	}
 
 	return nil
+}
+
+// acquireMigrationLock takes the session-level advisory lock on conn that
+// serializes concurrent migration runs and returns a release func. The lock is
+// released explicitly rather than via conn.Close — Close returns the connection
+// to the pool without ending the session, so a session-level lock would
+// otherwise leak onto a pooled connection. context.WithoutCancel ensures the
+// unlock still runs even if the caller's context was cancelled, and a non-nil
+// unlock error is logged at WARN when a logger is configured (#137) rather than
+// silently swallowed.
+func acquireMigrationLock(
+	ctx context.Context, conn *sql.Conn, logger *slog.Logger,
+) (func(), error) {
+	if _, err := conn.ExecContext(ctx,
+		"SELECT pg_advisory_lock($1)", migrationAdvisoryLockKey,
+	); err != nil {
+		return nil, fmt.Errorf("failed to acquire migration lock: %w", err)
+	}
+	return func() {
+		if _, unlockErr := conn.ExecContext(context.WithoutCancel(ctx),
+			"SELECT pg_advisory_unlock($1)", migrationAdvisoryLockKey,
+		); unlockErr != nil && logger != nil {
+			logger.Warn("pgqueue: failed to release migration advisory lock",
+				"err", unlockErr)
+		}
+	}, nil
+}
+
+// loadSchemaVersion ensures the schema-version bookkeeping table exists, reads
+// the current applied version, and rejects a database newer than this binary
+// understands (rolling-deploy guard, #53): an older binary must not silently run
+// against a schema it was not built for, so it returns ErrSchemaTooNew with the
+// version gap instead of proceeding with potentially incompatible DDL.
+func loadSchemaVersion(
+	ctx context.Context, conn *sql.Conn, versionTable string,
+) (int, error) {
+	if _, err := conn.ExecContext(ctx, schemaVersionTableSQL); err != nil {
+		return 0, fmt.Errorf("failed to create schema version table: %w", err)
+	}
+	current, err := schemaVersion(ctx, conn, versionTable)
+	if err != nil {
+		return 0, err
+	}
+	if current > SchemaVersion {
+		return 0, fmt.Errorf(
+			"%w: database at v%d, this binary knows v%d",
+			ErrSchemaTooNew, current, SchemaVersion,
+		)
+	}
+	return current, nil
 }
 
 // configureMigrationSchema creates the configured non-default schema and points
@@ -639,4 +726,205 @@ func (pq *PGQueue) GetSchemaVersion(ctx context.Context) (int, error) {
 	}
 
 	return schemaVersion(ctx, pq.db, versionTable)
+}
+
+// migrateMaxRetriesNotNull is the v5 migration. The channel message table's
+// max_retries column was previously BIGINT NULL with a CHECK that allowed NULL
+// to mean "no limit". New tables emit it as BIGINT NOT NULL DEFAULT 0 (a
+// concrete zero sentinel for "no limit"), which is less ambiguous and removes
+// the special-case NULL path in the consumer code. Pre-existing channel message
+// tables may still have the old nullable declaration and NULL rows, so:
+//  1. Backfill all NULL max_retries rows to 0 (preserves behaviour: 0 retries
+//     is handled as "use queue-level default" by the application).
+//  2. Set NOT NULL on the column so new rows cannot be written as NULL.
+//  3. Drop the old "max_retries IS NULL OR max_retries >= 0" CHECK constraint
+//     (which the v3 migration added) and add the simpler "max_retries >= 0".
+//
+// Pub/sub and DLQ tables do not have a max_retries column, so only channel
+// message tables are patched.
+func migrateMaxRetriesNotNull(ctx context.Context, tx *sql.Tx) error {
+	tableNames, err := listQueueTableNames(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	for _, tableName := range tableNames {
+		queueType, err := queueTypeForTable(ctx, tx, tableName)
+		if err != nil {
+			return err
+		}
+		if queueType != QueueTypeChannel {
+			continue
+		}
+		msgTable := "pgqueue_msg_" + tableName
+
+		// Step 1: backfill NULLs to 0.
+		//nolint:gosec // G201: validated pgqueue_metadata table name, not user input.
+		backfill := fmt.Sprintf(
+			`UPDATE %s SET max_retries = 0 WHERE max_retries IS NULL`,
+			msgTable,
+		)
+		if _, err := tx.ExecContext(ctx, backfill); err != nil {
+			return fmt.Errorf("backfill max_retries on %s: %w", msgTable, err)
+		}
+
+		// Step 2: set NOT NULL.
+		setNotNull := fmt.Sprintf(
+			`ALTER TABLE %s ALTER COLUMN max_retries SET NOT NULL`,
+			msgTable,
+		)
+		if _, err := tx.ExecContext(ctx, setNotNull); err != nil {
+			return fmt.Errorf("set max_retries NOT NULL on %s: %w", msgTable, err)
+		}
+
+		// Step 3: drop old nullable check and add the simple non-negative check.
+		// The old constraint name matches the pattern the v3 migration used.
+		oldConstraint := msgTable + "_max_retries_nonneg"
+		dropOld := fmt.Sprintf(
+			`ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s`,
+			msgTable, oldConstraint,
+		)
+		if _, err := tx.ExecContext(ctx, dropOld); err != nil {
+			return fmt.Errorf("drop old max_retries check on %s: %w", msgTable, err)
+		}
+		if err := addAndValidateCheck(ctx, tx, msgTable, "max_retries", "max_retries >= 0"); err != nil {
+			return fmt.Errorf("add max_retries check on %s: %w", msgTable, err)
+		}
+	}
+
+	return nil
+}
+
+// migrateMetadataDefault is the v6 migration. Tables that have a metadata JSONB
+// column previously declared it without a DEFAULT, leaving rows inserted by
+// older code (which omitted the column) with a NULL value. New tables emit
+// metadata JSONB NOT NULL DEFAULT '{}'::jsonb. This migration:
+//  1. Backfills NULL metadata to '{}' on every table that carries the column
+//     (pubsub message, channel message, and DLQ tables).
+//  2. Sets NOT NULL on the column.
+//  3. Adds the DEFAULT so future rows get '{}' automatically.
+//
+// The migration is safe on populated tables: the UPDATE uses a cheap indexed
+// IS NULL predicate, and the NOT NULL constraint is validated in the same
+// transaction after backfilling, so it cannot fail on a previously NULL row.
+func migrateMetadataDefault(ctx context.Context, tx *sql.Tx) error {
+	tableNames, err := listQueueTableNames(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	for _, tableName := range tableNames {
+		// Both queue types (channel and pubsub) have pgqueue_msg_* and
+		// pgqueue_dlq_* tables with a metadata column.
+		// setMetadataNotNullWithDefault probes information_schema first and
+		// skips tables where the column does not exist, so it is safe to call
+		// unconditionally for every table pattern.
+		for _, tbl := range []string{
+			"pgqueue_msg_" + tableName,
+			"pgqueue_dlq_" + tableName,
+		} {
+			if err := setMetadataNotNullWithDefault(ctx, tx, tbl); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// setMetadataNotNullWithDefault backfills NULL metadata rows to '{}', sets
+// NOT NULL, and adds DEFAULT '{}'::jsonb on a single table. It is idempotent:
+// if the column is already NOT NULL the UPDATE is a no-op and ALTER TABLE is
+// a no-op too. table must be a sanitized pgqueue table name (safe to interpolate).
+func setMetadataNotNullWithDefault(ctx context.Context, tx *sql.Tx, table string) error {
+	// Check whether the column exists on this table — sub tables have no
+	// metadata column so we skip them silently.
+	var colExists bool
+	err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name   = $1
+			  AND column_name  = 'metadata'
+		)`,
+		table,
+	).Scan(&colExists)
+	if err != nil {
+		return fmt.Errorf("check metadata column on %s: %w", table, err)
+	}
+	if !colExists {
+		return nil
+	}
+
+	// Step 1: backfill NULLs.
+	//nolint:gosec // G201: table is a pgqueue_metadata table name validated by queueNameRegex, not user input.
+	backfill := fmt.Sprintf(
+		`UPDATE %s SET metadata = '{}'::jsonb WHERE metadata IS NULL`,
+		table,
+	)
+	if _, err := tx.ExecContext(ctx, backfill); err != nil {
+		return fmt.Errorf("backfill metadata on %s: %w", table, err)
+	}
+
+	// Step 2: set NOT NULL.
+	setNotNull := fmt.Sprintf(
+		`ALTER TABLE %s ALTER COLUMN metadata SET NOT NULL`,
+		table,
+	)
+	if _, err := tx.ExecContext(ctx, setNotNull); err != nil {
+		return fmt.Errorf("set metadata NOT NULL on %s: %w", table, err)
+	}
+
+	// Step 3: set DEFAULT.
+	setDefault := fmt.Sprintf(
+		`ALTER TABLE %s ALTER COLUMN metadata SET DEFAULT '{}'::jsonb`,
+		table,
+	)
+	if _, err := tx.ExecContext(ctx, setDefault); err != nil {
+		return fmt.Errorf("set metadata DEFAULT on %s: %w", table, err)
+	}
+
+	return nil
+}
+
+// migratePubSubDLQSubscriberIndex is the v7 migration. It adds a partial index
+// on the subscriber_id column of each pub/sub DLQ table so queries that filter
+// by subscriber (e.g. per-subscriber DLQ listing) avoid scanning NULL rows from
+// channel DLQ entries. The index is WHERE subscriber_id IS NOT NULL, which
+// covers only the pub/sub rows. Channel DLQ tables always have
+// subscriber_id = NULL so the index would be empty for them; the migration
+// therefore skips non-pubsub queues.
+//
+// CREATE INDEX IF NOT EXISTS keeps the migration idempotent: re-running on a
+// table that already has the index (created by the new createDLQTable path) is
+// safe.
+func migratePubSubDLQSubscriberIndex(ctx context.Context, tx *sql.Tx) error {
+	tableNames, err := listQueueTableNames(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	for _, tableName := range tableNames {
+		queueType, err := queueTypeForTable(ctx, tx, tableName)
+		if err != nil {
+			return err
+		}
+		if queueType != QueueTypePubSub {
+			continue
+		}
+		//nolint:gosec // G201: tableName is a pgqueue_metadata queue name validated by queueNameRegex, not user input.
+		stmt := fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_dlq_%s_subscriber_id `+
+				`ON pgqueue_dlq_%s(subscriber_id) WHERE subscriber_id IS NOT NULL`,
+			tableName, tableName,
+		)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf(
+				"failed to create subscriber_id index on DLQ for queue %q: %w",
+				tableName, err,
+			)
+		}
+	}
+
+	return nil
 }

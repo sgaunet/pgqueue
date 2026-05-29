@@ -89,7 +89,7 @@ var _ DB = (*sql.DB)(nil)
 // Queue is the main struct for the message queue system.
 type Queue struct {
 	db       DB
-	cfg      queueConfig    // resolved config built from functional options
+	cfg      queueConfig // resolved config built from functional options
 	logger   *slog.Logger
 	closed   atomic.Bool    // set to true after Close() is called
 	mdcache  *metadataCache // per-queue table-name cache (immutable fields only)
@@ -100,10 +100,10 @@ type Queue struct {
 	// request-scoped context — storing it on the struct is the intended use.
 	//nolint:containedctx // process-lifetime cancellation signal, not request scope
 	bgCtx    context.Context
-	bgCancel context.CancelFunc // cancels bgCtx
-	gcMu     sync.Mutex         // guards gcs and serializes worker tracking against Close
+	bgCancel context.CancelFunc  // cancels bgCtx
+	gcMu     sync.Mutex          // guards gcs and serializes worker tracking against Close
 	gcs      []*GarbageCollector // GCs created via NewGarbageCollector for this Queue
-	workerWG sync.WaitGroup     // joins handler-based consume loops owned by this Queue
+	workerWG sync.WaitGroup      // joins handler-based consume loops owned by this Queue
 }
 
 // PGQueue is a backward-compatible alias for Queue.
@@ -380,6 +380,11 @@ func New(ctx context.Context, db DB, opts ...Option) (*Queue, error) {
 		notifier: newNotifier(cfg.listener, cfg.logger),
 		bgCtx:    bgCtx,
 		bgCancel: bgCancel,
+	}
+	// Wire the missed-notification metric (#91): the notifier reports a lost
+	// LISTEN confirmation through this hook so it can be surfaced as a metric.
+	if pq.notifier != nil {
+		pq.notifier.onMissedNotification = pq.recordMissedNotification
 	}
 
 	if err := pq.checkSchemaReady(ctx); err != nil {
@@ -658,8 +663,9 @@ func (pq *Queue) setQueuePaused(ctx context.Context, queueName string, queueType
 	return nil
 }
 
-// checkSchemaReady verifies the database schema has been created by InitSchema
-// and is at least at the version this build of pgqueue requires.
+// checkSchemaReady verifies the database schema has been created by InitSchema,
+// is at the version this build of pgqueue requires, and is not newer than this
+// binary knows how to handle.
 func (pq *Queue) checkSchemaReady(ctx context.Context) error {
 	schemaVer, err := pq.GetSchemaVersion(ctx)
 	if err != nil {
@@ -672,6 +678,11 @@ func (pq *Queue) checkSchemaReady(ctx context.Context) error {
 		return fmt.Errorf(
 			"%w: database at v%d, this build expects v%d",
 			ErrSchemaOutdated, schemaVer, SchemaVersion)
+	}
+	if schemaVer > SchemaVersion {
+		return fmt.Errorf(
+			"%w: database at v%d, this binary knows v%d",
+			ErrSchemaTooNew, schemaVer, SchemaVersion)
 	}
 
 	return nil
@@ -786,11 +797,6 @@ func (pq *Queue) createQueueInTx(
 
 	return nil
 }
-
-// createQueueAdvisoryLockKey serializes concurrent createQueue calls when a
-// MaxQueues cap is configured, so the SELECT COUNT(*) check cannot race past
-// the limit. The ASCII bytes spell "pgquecq" (pgqueue create-queue).
-const createQueueAdvisoryLockKey int64 = 0x70677175_65_6371
 
 // enforceMaxQueues serializes queue creation and checks the MaxQueues cap
 // within the given transaction. It is a no-op when no cap is configured.
@@ -998,7 +1004,7 @@ func (pq *Queue) createPubSubTables(
 			id UUID PRIMARY KEY,
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			metadata JSONB
+			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 		)`, pq.msgTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
@@ -1025,7 +1031,7 @@ func (pq *Queue) createPubSubTables(
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			acked_at TIMESTAMPTZ,
 			visibility_timeout TIMESTAMPTZ,
-			available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			claim_id UUID,
 			retry_count BIGINT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
 			error_message TEXT,
@@ -1043,7 +1049,38 @@ func (pq *Queue) createPubSubTables(
 	}
 
 	// Create DLQ table for pub/sub
-	return pq.createDLQTable(ctx, tx, tableName)
+	if err := pq.createDLQTable(ctx, tx, tableName); err != nil {
+		return err
+	}
+
+	if err := pq.createPubSubDLQSubscriberIndex(ctx, tx, tableName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// createPubSubDLQSubscriberIndex adds a partial index on the pub/sub DLQ's
+// subscriber_id column (#127). Queries that scope DLQ entries to a specific
+// subscriber (per-subscriber DLQ listing) use it to avoid scanning channel DLQ
+// rows, which always have subscriber_id = NULL; the partial predicate keeps the
+// index to pub/sub rows only.
+func (pq *Queue) createPubSubDLQSubscriberIndex(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+) error {
+	//nolint:gosec // G201: validated pgqueue_metadata table name, not user input.
+	dlqSubIdx := fmt.Sprintf(
+		`CREATE INDEX IF NOT EXISTS idx_pgqueue_dlq_%s_subscriber_id
+		 ON %s(subscriber_id)
+		 WHERE subscriber_id IS NOT NULL`,
+		tableName, pq.dlqTable(tableName),
+	)
+	if _, err := tx.ExecContext(ctx, dlqSubIdx); err != nil {
+		return fmt.Errorf("failed to create DLQ subscriber_id index: %w", err)
+	}
+	return nil
 }
 
 func (pq *Queue) createPubSubIndexes(
@@ -1118,13 +1155,13 @@ func (pq *Queue) createChannelTables(
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			status TEXT NOT NULL DEFAULT '%s',
 			retry_count BIGINT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
-			max_retries BIGINT CHECK (max_retries IS NULL OR max_retries >= 0),
+			max_retries BIGINT NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
 			visibility_timeout TIMESTAMPTZ,
-			available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			claim_id UUID,
 			processed_at TIMESTAMPTZ,
 			error_message TEXT,
-			metadata JSONB
+			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 		)`, pq.msgTable(tableName), MessageStatusPending)
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
@@ -1211,7 +1248,7 @@ func (pq *Queue) createDLQTable(
 			failure_reason TEXT NOT NULL,
 			retry_count BIGINT NOT NULL CHECK (retry_count >= 0),
 			moved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			metadata JSONB
+			metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 		)`, pq.dlqTable(tableName))
 
 	if _, err := tx.ExecContext(ctx, dlqTable); err != nil {
@@ -1314,9 +1351,15 @@ func (pq *Queue) tablePrefix() string {
 // msgTable, dlqTable, and subTable return the schema-qualified physical table
 // name for a queue's message, dead-letter, and subscription tables. tableName
 // is the sanitized per-queue table name stored in pgqueue_metadata.table_name.
-func (pq *Queue) msgTable(tableName string) string { return pq.tablePrefix() + "pgqueue_msg_" + tableName }
-func (pq *Queue) dlqTable(tableName string) string { return pq.tablePrefix() + "pgqueue_dlq_" + tableName }
-func (pq *Queue) subTable(tableName string) string { return pq.tablePrefix() + "pgqueue_sub_" + tableName }
+func (pq *Queue) msgTable(tableName string) string {
+	return pq.tablePrefix() + "pgqueue_msg_" + tableName
+}
+func (pq *Queue) dlqTable(tableName string) string {
+	return pq.tablePrefix() + "pgqueue_dlq_" + tableName
+}
+func (pq *Queue) subTable(tableName string) string {
+	return pq.tablePrefix() + "pgqueue_sub_" + tableName
+}
 
 // globalTable returns the schema-qualified name of a global pgqueue table
 // (pgqueue_metadata, pgqueue_subscribers, pgqueue_replay_log,
