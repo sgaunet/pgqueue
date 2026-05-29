@@ -57,10 +57,22 @@ func TestNackBackoffDelaysRedelivery(t *testing.T) {
 	}
 
 	// After the backoff window it must become available again.
-	time.Sleep(1300 * time.Millisecond)
-	if _, err := pq.ReceiveChannel(ctx, channelName); err != nil {
-		t.Fatalf("message not redelivered after backoff: %v", err)
-	}
+	// intentional: the configured backoff window is 800ms–1s; we must wait past
+	// that before attempting the consume. Polling via ReceiveChannel would
+	// consume the message on the first successful attempt, which is fine here
+	// since no assertions are made on the consumed message itself — but the next
+	// ReceiveChannel call for "override-me" would then receive the same
+	// "retry-me" message if the channel is FIFO. To avoid ordering ambiguity
+	// we ack the message inside the poll and rely on the channel being empty.
+	eventually(t, 2*time.Second, 50*time.Millisecond, func() bool {
+		msg, err := pq.ReceiveChannel(ctx, channelName)
+		if err != nil || msg == nil {
+			return false
+		}
+		// Ack so "retry-me" is gone before we publish "override-me".
+		_ = pq.Ack(ctx, msg.Receipt())
+		return true
+	}, "message not redelivered after backoff elapsed")
 
 	// --- WithRetryDelay override ---
 	if _, err := pq.Publish(ctx, channelName, []byte("override-me")); err != nil {
@@ -75,7 +87,11 @@ func TestNackBackoffDelaysRedelivery(t *testing.T) {
 		pgqueue.WithRetryDelay(10*time.Second)); err != nil {
 		t.Fatalf("nack with retry delay: %v", err)
 	}
-	time.Sleep(1300 * time.Millisecond) // longer than the default backoff
+	// intentional: negative assertion — the 10s WithRetryDelay must be holding
+	// the message back. Sleeping for the default backoff window (1.3s) proves
+	// the message is NOT yet visible. Polling for absence would be the same
+	// length without adding value.
+	time.Sleep(1300 * time.Millisecond) // intentional: prove message absent while delay holds it back
 	if _, err := pq.ReceiveChannel(ctx, channelName); !errors.Is(err, pgqueue.ErrQueueEmpty) {
 		t.Fatalf("WithRetryDelay override was ignored: err=%v", err)
 	}
@@ -122,8 +138,11 @@ func TestTimeoutReclaimAppliesBackoff(t *testing.T) {
 	// and never acks it.
 	claimed := crashedConsumerClaim(t, pq, channelName, crashedConsumerTimeout)
 
-	// Wait for the visibility timeout to lapse so the message is reclaim-eligible.
-	time.Sleep(crashedConsumerTimeout + 100*time.Millisecond)
+	// intentional: proves the visibility timeout (200ms) has elapsed before we
+	// attempt a consume. This is a necessary precondition, not a race guard;
+	// there is no observable DB state that signals "timeout has lapsed" without
+	// first running a consume (which is what we are about to test).
+	time.Sleep(crashedConsumerTimeout + 100*time.Millisecond) // intentional: let visibility timeout lapse
 
 	// Immediately after the timeout lapses, the backoff must still hold the
 	// message back: it is not yet redelivered.
@@ -132,7 +151,11 @@ func TestTimeoutReclaimAppliesBackoff(t *testing.T) {
 	}
 
 	// After the backoff window the message becomes available again.
-	time.Sleep(2500 * time.Millisecond)
+	// intentional: this test exercises the exact backoff window (2s configured
+	// MaxDelay). We cannot poll for visibility without consuming the message,
+	// which would invalidate the RetryCount assertion below. A fixed wait past
+	// the backoff window is the correct approach here.
+	time.Sleep(2500 * time.Millisecond) // intentional: wait for 2s backoff window to expire
 	redelivered, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
 	if err != nil {
 		t.Fatalf("message not redelivered after backoff: %v", err)

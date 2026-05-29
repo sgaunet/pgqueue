@@ -289,7 +289,9 @@ func TestPublish_ContextTimeout(t *testing.T) {
 	t.Run("publish_with_timeout", func(t *testing.T) {
 		timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Millisecond)
 		defer cancel()
-		time.Sleep(5 * time.Millisecond) // Ensure context is expired
+		// intentional: ensures the 1ms context deadline has actually expired
+		// before the Publish call; cannot be detected without sleeping past it.
+		time.Sleep(5 * time.Millisecond) // intentional: let 1ms context deadline expire
 
 		_, err := pq.Publish(timeoutCtx, "ctx-timeout", []byte("should-fail"))
 		if err == nil {
@@ -303,7 +305,8 @@ func TestPublish_ContextTimeout(t *testing.T) {
 	t.Run("consume_with_timeout", func(t *testing.T) {
 		timeoutCtx, cancel := context.WithTimeout(ctx, 1*time.Millisecond)
 		defer cancel()
-		time.Sleep(5 * time.Millisecond) // Ensure context is expired
+		// intentional: same as publish_with_timeout above.
+		time.Sleep(5 * time.Millisecond) // intentional: let 1ms context deadline expire
 
 		_, err := pq.ReceiveChannel(timeoutCtx, "ctx-timeout", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err == nil {

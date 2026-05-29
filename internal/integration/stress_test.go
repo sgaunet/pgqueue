@@ -82,6 +82,8 @@ func TestT024_StressWorkloadZeroLossZeroDuplication(t *testing.T) {
 
 				msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(200*time.Millisecond))
 				if err != nil || msg == nil {
+					// intentional: back-off between empty-queue polls in the stress
+					// consumer to avoid saturating the DB connection pool.
 					time.Sleep(10 * time.Millisecond)
 					continue
 				}

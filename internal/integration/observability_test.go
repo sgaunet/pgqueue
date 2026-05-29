@@ -42,12 +42,15 @@ func (recordingSpan) SetAttr(...pgqueue.Attr) {}
 
 // recordingMetrics is a test pgqueue.MetricsRecorder that counts every call.
 type recordingMetrics struct {
-	mu              sync.Mutex
-	publishes       int
-	consumes        int
-	acks            int
-	nacks           int
-	ackAfterExpired int
+	mu                  sync.Mutex
+	publishes           int
+	consumes            int
+	acks                int
+	nacks               int
+	ackAfterExpired     int
+	metadataParseErrors int
+	gcRuns              int
+	missedNotifications int
 }
 
 func (rm *recordingMetrics) RecordPublish(_ string, count int) {
@@ -75,6 +78,24 @@ func (rm *recordingMetrics) RecordAck(_ string, ok bool) {
 func (rm *recordingMetrics) RecordAckAfterExpired(_ string) {
 	rm.mu.Lock()
 	rm.ackAfterExpired++
+	rm.mu.Unlock()
+}
+
+func (rm *recordingMetrics) RecordMetadataParseError(_ string) {
+	rm.mu.Lock()
+	rm.metadataParseErrors++
+	rm.mu.Unlock()
+}
+
+func (rm *recordingMetrics) RecordGCRun(_ string, _ time.Duration, _, _ int64, _ error) {
+	rm.mu.Lock()
+	rm.gcRuns++
+	rm.mu.Unlock()
+}
+
+func (rm *recordingMetrics) RecordMissedNotification(_ string) {
+	rm.mu.Lock()
+	rm.missedNotifications++
 	rm.mu.Unlock()
 }
 
@@ -154,7 +175,11 @@ func TestObservabilityHooksReceiveSpansAndMetrics(t *testing.T) {
 
 	waitClosed(t, gotOK, "ok message never handled")
 	waitClosed(t, gotBad, "bad message never handled")
-	time.Sleep(300 * time.Millisecond) // let ack/nack settle
+	// intentional: ack/nack are issued asynchronously after the handler returns;
+	// we need them to have been sent to the DB before asserting on metric counts.
+	// There is no observable DB state that confirms the ack/nack have been
+	// processed — the handler channel closure only signals handler completion.
+	time.Sleep(300 * time.Millisecond) // intentional: allow async ack/nack to reach DB
 	cancel()
 
 	// Replay drives a replay span.
@@ -244,14 +269,11 @@ func TestAutoAckSurfacesClaimExpired(t *testing.T) {
 
 	waitClosed(t, handled, "handler never ran")
 
-	// Auto-ack runs after the handler returns; poll briefly for the metric.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if metrics.ackAfterExpiredCount() >= 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Auto-ack runs after the handler returns; poll for the metric.
+	eventually(t, 3*time.Second, 20*time.Millisecond,
+		func() bool { return metrics.ackAfterExpiredCount() >= 1 },
+		"RecordAckAfterExpired never emitted (want 1)",
+	)
 	if got := metrics.ackAfterExpiredCount(); got != 1 {
 		t.Fatalf("RecordAckAfterExpired emissions = %d, want 1", got)
 	}

@@ -100,8 +100,12 @@ func TestNotifyIdleConsumerWakesUnderOneSecond(t *testing.T) {
 			})
 	}()
 
-	// Let the consumer attach and go idle (it must be blocked, not polling).
-	time.Sleep(500 * time.Millisecond)
+	// intentional: lets the consumer goroutine start, call ConsumeChannel, and
+	// block waiting for a NOTIFY — i.e. reach idle state. There is no signal
+	// the goroutine exposes when it is "ready to receive"; a fixed delay is the
+	// only reliable way to avoid a race between the consumer attaching and the
+	// publish below firing the NOTIFY.
+	time.Sleep(500 * time.Millisecond) // intentional: wait for consumer to reach idle/listening state
 
 	publishedAt := time.Now()
 	if _, err := pq.Publish(ctx, channelName, []byte("wake up")); err != nil {
@@ -172,9 +176,11 @@ func TestNotifyKeepalivePreservesPushDelivery(t *testing.T) {
 			})
 	}()
 
-	// Let the consumer attach and let several keepalive ticks fire while
-	// the connection is idle.
-	time.Sleep(2 * time.Second)
+	// intentional: lets 4+ keepalive ticks fire (500ms interval) while the
+	// consumer is idle. There is no observable signal when a keepalive fires;
+	// the test is proving a negative (no corruption), so a fixed window is
+	// required.
+	time.Sleep(2 * time.Second) // intentional: let several keepalive ticks fire on an idle connection
 
 	publishedAt := time.Now()
 	if _, err := pq.Publish(ctx, channelName, []byte("wake up")); err != nil {
@@ -315,9 +321,11 @@ func TestWakeChanConcurrent(t *testing.T) {
 		}
 	}
 
-	// Give the consumers a moment to all register their LISTENs, racing each
-	// other on the same-channel registrations.
-	time.Sleep(150 * time.Millisecond)
+	// intentional: lets all consumer goroutines start and race to register their
+	// LISTENs. There is no observable signal when all LISTENs are registered;
+	// the point is to exercise the registration racing, not to guarantee all
+	// are complete before Close is called.
+	time.Sleep(150 * time.Millisecond) // intentional: let LISTEN registrations race in-flight
 
 	// Concurrently: stop the consumers and Close() the queue. Close() must join
 	// cleanly with LISTEN traffic still in flight; no LISTEN may be issued after
@@ -389,7 +397,11 @@ func TestPglistenUnlistenReleasesBackendRegistration(t *testing.T) {
 	if err := listener.Unlisten(ctx, ch); err != nil {
 		t.Fatalf("Unlisten(%q): %v", ch, err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	// intentional: lets the UNLISTEN command propagate through the run loop so
+	// any in-flight NOTIFY fired after UNLISTEN can still arrive before the
+	// drain loop below. There is no observable signal that the UNLISTEN has
+	// been processed by PostgreSQL.
+	time.Sleep(300 * time.Millisecond) // intentional: let UNLISTEN drain on the run loop
 
 	// Drain any stray in-flight notifications scheduled before UNLISTEN.
 	drainDeadline := time.After(200 * time.Millisecond)

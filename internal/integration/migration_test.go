@@ -127,7 +127,10 @@ func TestVisibilityTimeoutReclaim(t *testing.T) {
 	}
 
 	// After the timeout expires it is reclaimed by consume — no GC involved.
-	time.Sleep(200 * time.Millisecond)
+	// intentional: the 100ms visibility timeout must have elapsed before the
+	// reclaim consume; there is no DB state that confirms expiry without running
+	// a consume (which is what we are testing).
+	time.Sleep(200 * time.Millisecond) // intentional: let 100ms visibility timeout lapse
 	second, err := pq.ReceiveChannel(ctx, "reclaim", pgqueue.WithVisibilityTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("reclaim consume failed: %v", err)

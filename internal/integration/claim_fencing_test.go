@@ -28,7 +28,9 @@ func TestClaimFencing(t *testing.T) {
 		if err != nil || msgA == nil {
 			t.Fatalf("consumer A consume: msg=%v err=%v", msgA, err)
 		}
-		time.Sleep(100 * time.Millisecond) // let A's visibility timeout lapse
+		// intentional: lets A's 50ms visibility timeout lapse so consumer B can
+		// reclaim the message with a fresh claim token.
+		time.Sleep(100 * time.Millisecond) // intentional: let A's 50ms visibility timeout lapse
 		msgB, err := pq.ReceiveChannel(ctx, "fence-chan", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msgB == nil {
 			t.Fatalf("consumer B reclaim: msg=%v err=%v", msgB, err)
@@ -55,7 +57,8 @@ func TestClaimFencing(t *testing.T) {
 		if err != nil || msgA == nil {
 			t.Fatalf("consumer A consume: msg=%v err=%v", msgA, err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		// intentional: let A's 50ms visibility timeout lapse before B reclaims.
+		time.Sleep(100 * time.Millisecond) // intentional: let A's 50ms visibility timeout lapse
 		msgB, err := pq.ReceiveChannel(ctx, "fence-chan-n", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msgB == nil {
 			t.Fatalf("consumer B reclaim: msg=%v err=%v", msgB, err)
@@ -82,7 +85,8 @@ func TestClaimFencing(t *testing.T) {
 		if err != nil || msgA == nil {
 			t.Fatalf("consumer A consume: msg=%v err=%v", msgA, err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		// intentional: let A's 50ms visibility timeout lapse before B reclaims.
+		time.Sleep(100 * time.Millisecond) // intentional: let A's 50ms visibility timeout lapse
 		msgB, err := pq.ReceiveTopic(ctx, "fence-topic", "sub-1", pgqueue.WithVisibilityTimeout(30*time.Second))
 		if err != nil || msgB == nil {
 			t.Fatalf("consumer B reclaim: msg=%v err=%v", msgB, err)

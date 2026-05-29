@@ -67,10 +67,13 @@ func TestGracefulShutdownAcksInFlightMessage(t *testing.T) {
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- pq.Close() }()
 
-	// Give Close time to mark the Queue closed (it does so before it blocks on
-	// the worker WaitGroup). The handler's auto-ack therefore runs against an
-	// already-closed Queue — exactly the window the bug lived in.
-	time.Sleep(150 * time.Millisecond)
+	// intentional: gives Close time to mark the Queue closed (it does so before
+	// it blocks on the worker WaitGroup). The handler's auto-ack therefore runs
+	// against an already-closed Queue — exactly the window the bug lived in.
+	// There is no observable signal for "Queue marked closed but worker loop
+	// not yet joined"; we rely on the implementation detail that Close() marks
+	// the Queue closed before waiting on the WaitGroup.
+	time.Sleep(150 * time.Millisecond) // intentional: let Close mark queue closed before handler finishes
 
 	// Let the handler finish; its auto-ack must still go through.
 	close(proceed)
@@ -145,8 +148,11 @@ func TestPubSubMaxPendingAgePreservesOtherSubscribers(t *testing.T) {
 		t.Fatalf("fast subscriber failed to receive: %v", err)
 	}
 
-	// Let the message age past the (tiny) MaxPendingAge cutoff.
-	time.Sleep(30 * time.Millisecond)
+	// intentional: lets the message age past the 1ms MaxPendingAge cutoff so the
+	// GC purge considers it stale. There is no observable DB state that signals
+	// "message is now past MaxPendingAge" without running the GC, which is what
+	// we are about to test.
+	time.Sleep(30 * time.Millisecond) // intentional: let 1ms MaxPendingAge cutoff elapse
 
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{

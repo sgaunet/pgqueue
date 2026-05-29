@@ -297,7 +297,10 @@ func TestMessageOrdering(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to publish message %d: %v", i, err)
 			}
-			time.Sleep(time.Millisecond) // Small delay to ensure UUIDv7 ordering
+			// intentional: UUIDv7 embeds a millisecond-resolution timestamp; without a
+			// 1ms gap between publishes two UUIDs can share the same timestamp prefix
+			// and their ordering is random, breaking the ORDER BY id assertion below.
+			time.Sleep(time.Millisecond)
 		}
 
 		// Consume messages and verify order
@@ -346,7 +349,8 @@ func TestMessageOrdering(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to publish message %d: %v", i, err)
 			}
-			time.Sleep(time.Millisecond) // Small delay to ensure UUIDv7 ordering
+			// intentional: UUIDv7 millisecond-resolution ordering; see channel_ordering
+			time.Sleep(time.Millisecond)
 		}
 
 		// Consume messages and verify order
@@ -531,8 +535,10 @@ func TestChannelTTLEnforcedOnConsume(t *testing.T) {
 		t.Fatalf("failed to publish message: %v", err)
 	}
 
-	// Wait for TTL to expire
-	time.Sleep(10 * time.Millisecond)
+	// intentional: proves the 1-second TTL has elapsed so the message is
+	// filtered out on consume; we cannot observe TTL expiry from outside before
+	// attempting the consume that exercises the filter.
+	time.Sleep(10 * time.Millisecond) // intentional: let TTL=1s expire
 
 	// Consume should return ErrQueueEmpty (message expired, filtered out)
 	msg, err := pq.ReceiveChannel(ctx, "ttl-test", pgqueue.WithVisibilityTimeout(30*time.Second))
@@ -603,8 +609,9 @@ func TestTopicTTLEnforcedOnConsume(t *testing.T) {
 		t.Fatalf("failed to publish: %v", err)
 	}
 
-	// Wait for TTL to expire
-	time.Sleep(10 * time.Millisecond)
+	// intentional: proves the 1-second TTL has elapsed before the consume that
+	// exercises the filter.
+	time.Sleep(10 * time.Millisecond) // intentional: let TTL=1s expire
 
 	// Consume should return ErrQueueEmpty (message expired, filtered out)
 	msg, err := pq.ReceiveTopic(ctx, "ttl-topic", "sub-1", pgqueue.WithVisibilityTimeout(30*time.Second))
@@ -792,8 +799,9 @@ func TestResubscribePreservesCreatedAt(t *testing.T) {
 		t.Fatalf("failed to unsubscribe: %v", err)
 	}
 
-	// Wait to ensure timestamps would differ
-	time.Sleep(10 * time.Millisecond)
+	// intentional: ensures the created_at timestamp would differ if the DB were
+	// reset on re-subscribe; cannot be observed any other way.
+	time.Sleep(10 * time.Millisecond) // intentional: let time advance so a clock-reset would be detectable
 
 	// Re-subscribe
 	if err := pq.Subscribe(ctx, "resub-test", "sub-1"); err != nil {
@@ -1403,8 +1411,11 @@ func TestCloseJoinsBackgroundGoroutines(t *testing.T) {
 			pgqueue.WithPollInterval(10*time.Millisecond))
 	}()
 
-	// Let the GC and the consume loop run a few iterations.
-	time.Sleep(200 * time.Millisecond)
+	// intentional: lets the GC and the consume loop run a few iterations before
+	// Close is called. There is no observable DB state that confirms "enough
+	// iterations have run"; the test is verifying the graceful-shutdown path,
+	// not message delivery count.
+	time.Sleep(200 * time.Millisecond) // intentional: let GC and consume loop run several iterations
 
 	// Close() must join all background goroutines before returning.
 	if err := pq.Close(); err != nil {
@@ -1417,8 +1428,10 @@ func TestCloseJoinsBackgroundGoroutines(t *testing.T) {
 		t.Fatalf("db.Close() returned error: %v", err)
 	}
 
-	// Give any (incorrectly) surviving goroutine a moment to fail a query.
-	time.Sleep(200 * time.Millisecond)
+	// intentional: a negative assertion — any goroutine still alive after
+	// Close() would attempt a DB query and log an error; the sleep gives it
+	// time to do so before we inspect the log buffer.
+	time.Sleep(200 * time.Millisecond) // intentional: expose surviving goroutines via logged DB errors
 
 	logs := logBuf.String()
 	for _, bad := range []string{"closed", "bad connection", "sql: database is closed"} {

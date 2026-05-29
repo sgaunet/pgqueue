@@ -9,6 +9,33 @@ import (
 	"github.com/sgaunet/pgqueue"
 )
 
+// eventually polls cond every interval until it returns true or timeout elapses.
+// If the condition is not met within timeout the test is failed with msg.
+//
+// Use this instead of a fixed time.Sleep when waiting for an asynchronous
+// side-effect that should become observable quickly once it has happened (e.g.
+// a row count reaching a target, a status column flipping, a metric counter
+// incrementing). The polling reduces unnecessary wait time while keeping the
+// test deterministic.
+//
+// For "negative" assertions — proving that something does NOT happen within a
+// window — keep the plain time.Sleep and add an "// intentional:" comment
+// explaining the reason.
+func eventually(t *testing.T, timeout, interval time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+			return
+		}
+		time.Sleep(interval)
+	}
+}
+
 // crashedConsumerTimeout is the visibility timeout used by crashedConsumerClaim;
 // it is short so redelivery-eligibility tests do not wait long.
 const crashedConsumerTimeout = 200 * time.Millisecond

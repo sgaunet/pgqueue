@@ -939,11 +939,16 @@ func TestNackChannelBatchAppliesBackoff(t *testing.T) {
 		t.Fatalf("batch-nacked message redelivered before backoff elapsed: err=%v", err)
 	}
 
-	// After the backoff window they become available again.
-	time.Sleep(1300 * time.Millisecond)
-	if _, err := pq.ReceiveChannel(ctx, channelName); err != nil {
-		t.Fatalf("message not redelivered after backoff: %v", err)
-	}
+	// After the backoff window they become available again. Poll so the test
+	// finishes as soon as the window expires rather than waiting a fixed 1.3s.
+	eventually(t, 2*time.Second, 50*time.Millisecond, func() bool {
+		msg, err := pq.ReceiveChannel(ctx, channelName)
+		if err != nil || msg == nil {
+			return false
+		}
+		_ = pq.Ack(ctx, msg.Receipt())
+		return true
+	}, "batch-nacked channel messages not redelivered after backoff elapsed")
 }
 
 // TestNackTopicBatchAppliesBackoff is the pub/sub counterpart of
@@ -985,11 +990,16 @@ func TestNackTopicBatchAppliesBackoff(t *testing.T) {
 		t.Fatalf("batch-nacked subscription redelivered before backoff elapsed: err=%v", err)
 	}
 
-	// After the backoff window they become available again.
-	time.Sleep(1300 * time.Millisecond)
-	if _, err := pq.ReceiveTopic(ctx, topicName, subID); err != nil {
-		t.Fatalf("message not redelivered after backoff: %v", err)
-	}
+	// After the backoff window they become available again. Poll so the test
+	// finishes as soon as the window expires rather than waiting a fixed 1.3s.
+	eventually(t, 2*time.Second, 50*time.Millisecond, func() bool {
+		msg, err := pq.ReceiveTopic(ctx, topicName, subID)
+		if err != nil || msg == nil {
+			return false
+		}
+		_ = pq.Ack(ctx, msg.Receipt())
+		return true
+	}, "batch-nacked topic messages not redelivered after backoff elapsed")
 }
 
 // TestAckChannelBatchMixedOutcomes is the issue #133 (AUDIT A2) verification:

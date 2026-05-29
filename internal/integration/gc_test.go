@@ -40,8 +40,11 @@ func TestGarbageCollector(t *testing.T) {
 		}
 	}
 
-	// Wait a bit for processed_at to be set
-	time.Sleep(100 * time.Millisecond)
+	// Wait for processed_at to be set by polling the completed count.
+	eventually(t, 2*time.Second, 10*time.Millisecond, func() bool {
+		stats, err := pq.GetStats(ctx, "gc-test", pgqueue.QueueTypeChannel)
+		return err == nil && stats.CompletedCount == 3
+	}, "timed out waiting for 3 completed messages before GC run")
 
 	// Run garbage collector to purge completed messages
 	gcConfig := pgqueue.GarbageCollectorConfig{
@@ -51,7 +54,8 @@ func TestGarbageCollector(t *testing.T) {
 	}
 	gc := pgqueue.NewGarbageCollector(pq, gcConfig)
 
-	// Wait for TTL to expire
+	// Wait for TTL to expire (intentional: proves the 1ms TTL is actually elapsed
+	// before GC runs — we cannot detect TTL expiry via a DB query).
 	time.Sleep(10 * time.Millisecond)
 
 	if err := gc.Collect(ctx); err != nil {
@@ -106,7 +110,10 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 		t.Errorf("expected 1 processing message, got %d", stats.ProcessingCount)
 	}
 
-	// Wait for visibility timeout to expire
+	// Wait for visibility timeout to expire (intentional: proves the 100ms
+	// timeout is actually elapsed before GC runs — we cannot detect the timeout
+	// firing via a DB query without running GC first, which is what we are
+	// testing).
 	time.Sleep(150 * time.Millisecond)
 
 	// Run GC to reset timed-out messages
@@ -167,8 +174,11 @@ func TestGarbageCollectorKeepForeverPreservesMessages(t *testing.T) {
 		t.Fatalf("failed to ack message: %v", err)
 	}
 
-	// Wait for processed_at to be set
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the acked message to appear in the completed count.
+	eventually(t, 2*time.Second, 10*time.Millisecond, func() bool {
+		stats, err := pq.GetStats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
+		return err == nil && stats.CompletedCount == 1
+	}, "timed out waiting for message to reach completed state before GC run")
 
 	// Verify message is completed
 	stats, err := pq.GetStats(ctx, "gc-keep-forever-test", pgqueue.QueueTypeChannel)
@@ -189,12 +199,14 @@ func TestGarbageCollectorKeepForeverPreservesMessages(t *testing.T) {
 	}
 	gc := pgqueue.NewGarbageCollector(pq, gcConfig)
 
-	// Run collection multiple times
+	// Run collection multiple times — the inter-iteration sleep is intentional:
+	// it spaces out the GC passes to confirm the message survives repeated runs,
+	// not just a single pass.
 	for i := 0; i < 3; i++ {
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("garbage collection failed: %v", err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) // intentional: spaces out repeated GC passes
 	}
 
 	// Verify completed message is still present
@@ -283,8 +295,17 @@ func TestGarbageCollectorParallel(t *testing.T) {
 		}
 	}
 
-	// Wait for processed_at to be set
-	time.Sleep(100 * time.Millisecond)
+	// Wait for all acked messages to appear as completed (one per queue).
+	eventually(t, 2*time.Second, 10*time.Millisecond, func() bool {
+		for i := 0; i < numQueues; i++ {
+			name := "gc-parallel-" + string(rune('a'+i))
+			stats, err := pq.GetStats(ctx, name, pgqueue.QueueTypeChannel)
+			if err != nil || stats.CompletedCount != 1 {
+				return false
+			}
+		}
+		return true
+	}, "timed out waiting for all per-queue acked messages to reach completed state")
 
 	// Run parallel GC with MaxWorkers=3 (less than numQueues to test semaphore)
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
@@ -294,6 +315,8 @@ func TestGarbageCollectorParallel(t *testing.T) {
 		MaxWorkers: 3,
 	})
 
+	// Wait for TTL to expire (intentional: 1ms TTL must be elapsed before GC
+	// runs; we cannot observe TTL expiry through a DB query).
 	time.Sleep(10 * time.Millisecond)
 
 	if err := gc.Collect(ctx); err != nil {
@@ -368,7 +391,8 @@ func TestGarbageCollectorPubSub(t *testing.T) {
 		t.Fatalf("expected 5 messages before GC, got %d", msgCount)
 	}
 
-	// Wait for TTL to expire then run GC
+	// Wait for TTL to expire (intentional: the 1ms TTL must have elapsed before
+	// the GC purge runs; no observable DB state change signals this).
 	time.Sleep(10 * time.Millisecond)
 
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
@@ -430,7 +454,8 @@ func TestGarbageCollectorPubSubPartialAck(t *testing.T) {
 		}
 	}
 
-	// Wait for TTL to expire then run GC
+	// Wait for TTL to expire (intentional: the 1ms TTL must have elapsed before
+	// the GC purge runs; no observable DB state change signals this).
 	time.Sleep(10 * time.Millisecond)
 
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
@@ -511,8 +536,9 @@ func TestGarbageCollectorDoubleStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	gc.Start(ctx)
 
-	// Let it run briefly
-	time.Sleep(50 * time.Millisecond)
+	// Let it run briefly (intentional: we need at least one GC tick to fire
+	// before cancelling, so Stop has a non-trivial state to observe).
+	time.Sleep(50 * time.Millisecond) // intentional: allow at least one GC iteration
 	cancel()
 
 	// First Stop should work
@@ -569,8 +595,10 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 		t.Fatal("expected message, got nil")
 	}
 
-	// Wait for visibility timeout to expire
-	time.Sleep(50 * time.Millisecond)
+	// Wait for visibility timeout to expire (intentional: proves the 1ms
+	// visibility timeout has elapsed before GC runs the reset; this cannot be
+	// observed via a DB query without running GC first).
+	time.Sleep(50 * time.Millisecond) // intentional: wait for 1ms visibility timeout to lapse
 
 	// GC should reset timed-out subscription back to pending
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
@@ -634,7 +662,10 @@ func TestExhaustedTimedOutSubscriptionsPromotedByGC(t *testing.T) {
 	if _, err := pq.ReceiveTopic(ctx, topicName, subID, pgqueue.WithVisibilityTimeout(1*time.Millisecond)); err != nil {
 		t.Fatalf("first consume failed: %v", err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	// Wait for the 1ms visibility timeout to lapse (intentional: we need the
+	// subscription to be in a timed-out state before GC runs; DB state only
+	// flips after GC, which is what we are testing here).
+	time.Sleep(20 * time.Millisecond) // intentional: let 1ms visibility timeout lapse
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("first GC collect failed: %v", err)
 	}
@@ -645,6 +676,7 @@ func TestExhaustedTimedOutSubscriptionsPromotedByGC(t *testing.T) {
 	if _, err := pq.ReceiveTopic(ctx, topicName, subID, pgqueue.WithVisibilityTimeout(1*time.Millisecond)); err != nil {
 		t.Fatalf("second consume failed: %v", err)
 	}
+	// intentional: let 1ms visibility timeout lapse again before the second GC pass
 	time.Sleep(20 * time.Millisecond)
 
 	// The GC backstop must promote the exhausted timed-out subscription to the
@@ -938,8 +970,10 @@ func TestT019_GCReclaimCountsVisibilityTimeoutOnce(t *testing.T) {
 		t.Fatalf("failed to consume: %v", err)
 	}
 
-	// Wait for the visibility timeout to expire.
-	time.Sleep(50 * time.Millisecond)
+	// Wait for visibility timeout to expire (intentional: the 1ms visibility
+	// timeout must have lapsed before GC runs the reset; this state is not
+	// observable through the DB until after GC runs).
+	time.Sleep(50 * time.Millisecond) // intentional: let 1ms visibility timeout lapse
 
 	// Run GC: it resets the timed-out message to pending and counts the timeout
 	// as one delivery attempt (retry_count 0 -> 1).
@@ -1012,6 +1046,8 @@ func TestExhaustedTimedOutMessagesPromotedByConsume(t *testing.T) {
 			}
 			// Never ack: let the 1ms visibility timeout lapse.
 		}
+		// intentional: let all 1ms visibility timeouts lapse so the next consume
+		// pass can reclaim and re-deliver the timed-out messages.
 		time.Sleep(20 * time.Millisecond)
 	}
 
@@ -1066,6 +1102,9 @@ func TestGCCountsVisibilityTimeoutTowardDLQ(t *testing.T) {
 			t.Fatalf("attempt %d: message not redelivered (lost before reaching DLQ)", attempt)
 		}
 		// Never ack: let the visibility timeout lapse, then GC reclaims it.
+		// intentional: the 1ms visibility timeout must have elapsed before GC
+		// can reclaim and increment retry_count; no DB query can detect this
+		// state without running GC.
 		time.Sleep(30 * time.Millisecond)
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("attempt %d GC collect: %v", attempt, err)
@@ -1130,6 +1169,8 @@ func TestGCKeepsDLQReferencedPubSubMessage(t *testing.T) {
 
 	// Run the completed-message GC pass: every remaining subscription is acked,
 	// so without the FR-027 guard the message row would be purged here.
+	// intentional: the 1ms CompletedMessageTTL must have elapsed before GC
+	// would attempt to delete the row; we cannot observe TTL expiry via DB.
 	time.Sleep(20 * time.Millisecond)
 	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{CompletedMessageTTL: 1 * time.Millisecond},

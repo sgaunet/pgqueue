@@ -101,8 +101,10 @@ func TestConsumeChannelHandlerAutoAck(t *testing.T) {
 		t.Fatalf("expected fail-once to be delivered >=2 times, got %d", failCount)
 	}
 
-	// Allow lingering goroutines to wind down, then assert no leak.
-	time.Sleep(200 * time.Millisecond)
+	// intentional: gives lingering goroutines time to exit after context
+	// cancellation. There is no observable signal for "all goroutines exited";
+	// the goroutine-count check below is the assertion, not a precondition.
+	time.Sleep(200 * time.Millisecond) // intentional: let goroutines wind down after ctx cancel
 	runtime.GC()
 	goroutinesAfter := runtime.NumGoroutine()
 	if goroutinesAfter > goroutinesBefore+2 {
