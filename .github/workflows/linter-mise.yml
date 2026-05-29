@@ -15,11 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Setup Go environment
-      # Uses Go version from go.mod for consistency
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: 'go.mod'
       - uses: jdx/mise-action@v3
         with:
           install: true # [default: true] run `mise install`
