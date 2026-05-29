@@ -463,7 +463,7 @@ func (pq *Queue) processNackBatch(
 	for _, s := range states {
 		maxRetry := pq.cfg.defaultMaxRetries
 		if s.maxRetries.Valid {
-			maxRetry = int(s.maxRetries.Int32)
+			maxRetry = int(s.maxRetries.Int64)
 		}
 
 		if s.retryCount+1 > maxRetry {
@@ -754,7 +754,7 @@ func (pq *Queue) insertSubscriptionRecords(
 type batchMessageState struct {
 	id           uuid.UUID
 	retryCount   int
-	maxRetries   sql.NullInt32
+	maxRetries   sql.NullInt64
 	payload      []byte
 	metadataJSON sql.NullString
 }

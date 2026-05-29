@@ -222,7 +222,7 @@ func (pq *Queue) nackChannelImpl(
 
 type messageState struct {
 	retryCount   int
-	maxRetries   sql.NullInt32
+	maxRetries   sql.NullInt64
 	payload      []byte
 	metadataJSON sql.NullString
 }
@@ -236,9 +236,9 @@ const errReasonVisibilityTimeout = "exceeded max retries: not acknowledged befor
 // its per-message max_retries when present (including an explicit 0, meaning no
 // retries), otherwise the configured default. max_retries is NULL only for
 // rows reinstated by a DLQ replay, which fall back to the default.
-func channelMaxRetries(defaultMax int, maxRetries sql.NullInt32) int {
+func channelMaxRetries(defaultMax int, maxRetries sql.NullInt64) int {
 	if maxRetries.Valid {
-		return int(maxRetries.Int32)
+		return int(maxRetries.Int64)
 	}
 	return defaultMax
 }
@@ -250,7 +250,7 @@ type channelCandidate struct {
 	createdAt    time.Time
 	status       string
 	retryCount   int
-	maxRetries   sql.NullInt32
+	maxRetries   sql.NullInt64
 	metadataJSON sql.NullString
 	processedAt  sql.NullTime
 	errorMessage sql.NullString

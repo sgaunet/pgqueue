@@ -20,7 +20,7 @@ var errMalformedMigrations = errors.New("malformed migrations slice")
 // IMPORTANT: when adding a new entry to the migrations slice below, bump this
 // constant to match that entry's version number. An init() check enforces that
 // SchemaVersion equals the last migration's version.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 // migrationAdvisoryLockKey is a fixed PostgreSQL advisory-lock key (the ASCII
 // bytes of "pgqueue") used to serialize schema migrations across processes.
@@ -119,6 +119,11 @@ var migrations = []migration{
 		version: 3, //nolint:mnd // schema migration version number
 		name:    "non-negative retry_count and max_retries",
 		apply:   migrateNonNegativeRetryCounts,
+	},
+	{
+		version: 4, //nolint:mnd // schema migration version number
+		name:    "bigint retry counters",
+		apply:   migrateBigintRetryCounts,
 	},
 }
 
@@ -246,6 +251,112 @@ func addAndValidateCheck(
 	)
 	if _, err := tx.ExecContext(ctx, validate); err != nil {
 		return fmt.Errorf("validate constraint %s: %w", constraint, err)
+	}
+
+	return nil
+}
+
+// migrateBigintRetryCounts is the v4 migration. createChannelTables,
+// createPubSubTables, and createDLQTable now declare retry_count (and the
+// channel msg table's max_retries) as BIGINT instead of 32-bit INT. A
+// pathological crash-loop could otherwise overflow the counter; once retry_count
+// wraps negative the DLQ exhaustion test retryCount > channelMaxRetries(...) in
+// channel.go becomes unreliable and a message could dodge the DLQ (#135).
+// Pre-existing per-queue tables predate the wider type, so discover them from
+// pgqueue_metadata and ALTER each one to match what a fresh CREATE TABLE emits.
+//
+// LOCK NOTE: integer -> bigint changes the on-disk column width, so PostgreSQL
+// rewrites the table under an ACCESS EXCLUSIVE lock for the duration of the
+// ALTER. There is no online path for a width change in vanilla PostgreSQL; this
+// is accepted because the change is cheap on the small/empty tables of a
+// not-yet-released schema ("trivial now, annoying later"). It runs in the
+// transactional apply phase — it is plain DDL, not CREATE INDEX CONCURRENTLY.
+// The ALTER preserves the column DEFAULT and the v3 _nonneg CHECK constraint
+// (PostgreSQL re-derives the check against the wider type), so neither is
+// dropped or rebuilt. alterColumnToBigint skips columns already BIGINT, keeping
+// the migration idempotent and avoiding a needless lock on queues whose newer
+// CREATE TABLE already emitted BIGINT.
+func migrateBigintRetryCounts(ctx context.Context, tx *sql.Tx) error {
+	tableNames, err := listQueueTableNames(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	for _, tableName := range tableNames {
+		queueType, err := queueTypeForTable(ctx, tx, tableName)
+		if err != nil {
+			return err
+		}
+		if err := widenRetryCountsToBigint(ctx, tx, queueType, tableName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// widenRetryCountsToBigint widens every retry_count / max_retries column the
+// given queue actually has — the same column set the v3 migration constrains.
+// tableName is the sanitized per-queue identifier ([a-z0-9_]+, <= 28 chars)
+// written by sanitizeTableName, so direct interpolation is safe.
+func widenRetryCountsToBigint(
+	ctx context.Context, tx *sql.Tx, queueType QueueType, tableName string,
+) error {
+	cols := []struct{ table, column string }{
+		{"pgqueue_dlq_" + tableName, "retry_count"},
+	}
+	switch queueType {
+	case QueueTypeChannel:
+		cols = append(cols,
+			struct{ table, column string }{"pgqueue_msg_" + tableName, "retry_count"},
+			struct{ table, column string }{"pgqueue_msg_" + tableName, "max_retries"},
+		)
+	case QueueTypePubSub:
+		cols = append(cols, struct{ table, column string }{
+			"pgqueue_sub_" + tableName, "retry_count",
+		})
+	}
+
+	for _, c := range cols {
+		if err := alterColumnToBigint(ctx, tx, c.table, c.column); err != nil {
+			return fmt.Errorf(
+				"failed to widen %s.%s to bigint: %w", c.table, c.column, err,
+			)
+		}
+	}
+
+	return nil
+}
+
+// alterColumnToBigint widens a column from integer to bigint, skipping the
+// ALTER (and its ACCESS EXCLUSIVE lock and table rewrite) when the column is
+// already bigint. The data_type probe is scoped to current_schema() so it
+// resolves the same table the search_path-qualified ALTER will target (FR-024
+// non-default schemas). table is built from the sanitized per-queue name and
+// column is one of a fixed set of literals, so both are safe to interpolate.
+func alterColumnToBigint(ctx context.Context, tx *sql.Tx, table, column string) error {
+	var dataType string
+	err := tx.QueryRowContext(ctx,
+		`SELECT data_type FROM information_schema.columns
+		  WHERE table_schema = current_schema()
+		    AND table_name = $1 AND column_name = $2`,
+		table, column,
+	).Scan(&dataType)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Column absent: nothing to widen. Defensive — callers only pass columns
+		// the queue type is known to have.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read data_type for %s.%s: %w", table, column, err)
+	}
+	if dataType == "bigint" {
+		return nil
+	}
+
+	stmt := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s TYPE BIGINT`, table, column)
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("alter %s.%s to bigint: %w", table, column, err)
 	}
 
 	return nil

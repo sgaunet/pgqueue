@@ -1014,7 +1014,7 @@ func (pq *Queue) createPubSubTables(
 			visibility_timeout TIMESTAMPTZ,
 			available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			claim_id UUID,
-			retry_count INT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+			retry_count BIGINT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
 			error_message TEXT,
 			UNIQUE(message_id, subscriber_id),
 			FOREIGN KEY (message_id)
@@ -1104,8 +1104,8 @@ func (pq *Queue) createChannelTables(
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			status TEXT NOT NULL DEFAULT '%s',
-			retry_count INT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
-			max_retries INT CHECK (max_retries IS NULL OR max_retries >= 0),
+			retry_count BIGINT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+			max_retries BIGINT CHECK (max_retries IS NULL OR max_retries >= 0),
 			visibility_timeout TIMESTAMPTZ,
 			available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			claim_id UUID,
@@ -1196,7 +1196,7 @@ func (pq *Queue) createDLQTable(
 			subscriber_id TEXT,
 			payload BYTEA NOT NULL,
 			failure_reason TEXT NOT NULL,
-			retry_count INT NOT NULL CHECK (retry_count >= 0),
+			retry_count BIGINT NOT NULL CHECK (retry_count >= 0),
 			moved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			metadata JSONB
 		)`, pq.dlqTable(tableName))
