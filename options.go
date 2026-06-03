@@ -23,7 +23,8 @@ type queueCreateOpts struct {
 // channel or topic.
 //
 // An explicit zero is honored: WithQueueMaxRetries(0) dead-letters a message on
-// its first failed delivery instead of retrying it.
+// its first failed delivery instead of retrying it. A negative value makes
+// CreateChannel/CreateTopic return ErrInvalidConfig.
 func WithQueueMaxRetries(n int) QueueOption {
 	return func(o *queueCreateOpts) {
 		o.maxRetries = n
@@ -136,6 +137,10 @@ func WithVisibilityTimeout(d time.Duration) ConsumeOption {
 // WithConcurrency sets the number of parallel workers for handler-based consume
 // APIs (ConsumeChannel/ConsumeTopic). It is ignored by single-shot
 // ReceiveChannel/ReceiveTopic.
+//
+// A non-positive n is coerced to 1 (a single worker) rather than rejected,
+// since consume runs in a long-lived loop with no natural place to surface a
+// configuration error.
 func WithConcurrency(n int) ConsumeOption {
 	return func(o *consumeOpts) {
 		o.concurrency = n
@@ -144,6 +149,10 @@ func WithConcurrency(n int) ConsumeOption {
 
 // WithPollInterval sets the polling interval between successive consume attempts
 // when no message is available.
+//
+// A non-positive d is ignored: the queue-wide WithSafetyNetPoll interval (or
+// the built-in default) is used instead, as if WithPollInterval had not been
+// called.
 func WithPollInterval(d time.Duration) ConsumeOption {
 	return func(o *consumeOpts) {
 		o.pollInterval = d

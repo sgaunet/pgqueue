@@ -18,11 +18,14 @@ var (
 	// ErrDBRequired is returned when a nil database connection is provided.
 	ErrDBRequired = errors.New("database connection is required")
 
-	// ErrInvalidConfig is returned by Init when the Config contains a negative
-	// value for a numeric field.
-	ErrInvalidConfig = errors.New(
-		"invalid config: numeric fields must not be negative",
-	)
+	// ErrInvalidConfig is returned by New, InitSchema, and the Create/Replay
+	// APIs when a configuration value is out of range. This covers more than
+	// negative numbers: sizes above MaxAllowedMessageSize/MaxAllowedMetadataSize,
+	// an invalid schema name, an invalid backoff policy (negative delays,
+	// multiplier in (0,1), or MaxDelay < BaseDelay), a negative safety-net poll
+	// or per-queue max-retries, a negative replay limit, and InitSchema being
+	// given an option other than WithSchema/WithLogger.
+	ErrInvalidConfig = errors.New("invalid config")
 
 	// ErrInvalidQueueName is returned when a queue name contains invalid characters.
 	ErrInvalidQueueName = errors.New(

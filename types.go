@@ -243,6 +243,13 @@ const KeepForever time.Duration = -1
 // transient successes). The garbage collector never purges a message row while
 // a DLQ entry still references it, so the DLQ entry is always reaped first and
 // pub/sub DLQ replay always finds its parent message.
+//
+// CompletedMessageTTL is measured from different anchors per queue type. For
+// channels it is the age since completion (processed_at). For pub/sub topics the
+// message row has no completion timestamp, so it is the age since publish
+// (created_at); a topic message is still only purged once every subscriber has
+// acked it (and no DLQ entry references it), so this affects when a fully-acked
+// message is reaped, not whether an in-flight one is.
 type RetentionPolicy struct {
 	CompletedMessageTTL time.Duration // How long to keep completed messages (0 or KeepForever = forever)
 	MaxPendingAge       time.Duration // Maximum age for pending messages/deliveries (0 or KeepForever = no limit)

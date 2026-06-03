@@ -82,6 +82,12 @@ type MetricsRecorder interface {
 	// separate time-waiting-in-queue from time-in-handler. The value is clamped
 	// to zero when consumer/database clock skew would otherwise make it
 	// negative.
+	//
+	// Latency is always measured from the original publish time, so a redelivery
+	// (after a nack or a visibility-timeout reclaim) reports the cumulative
+	// time since publish, not since the redelivery. The histogram therefore
+	// mixes fresh deliveries with redeliveries: a long tail can reflect
+	// redelivery or DLQ replay rather than queue backlog.
 	RecordDeliveryLatency(queue string, latency time.Duration)
 	// RecordAck reports an acknowledgement outcome; ok is false for a nack.
 	RecordAck(queue string, ok bool)

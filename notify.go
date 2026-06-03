@@ -60,6 +60,12 @@ type Listener interface {
 	Listen(ctx context.Context, channel string) error
 	// Notifications returns a stream of notification channel names, one per
 	// received NOTIFY. The returned channel is closed when the Listener closes.
+	//
+	// Consumers MUST drain this channel continuously. An implementation may block
+	// its receive loop when the channel is full (to avoid dropping a wake), which
+	// would also stall its keepalive/reconnect handling until the channel is
+	// read. pgqueue's built-in notifier satisfies this; a custom consumer of this
+	// channel must not stop reading while the Listener is live.
 	Notifications() <-chan string
 	// Close releases the listener's database connection and resources.
 	Close() error

@@ -338,6 +338,12 @@ func (l *Listener) Unlisten(_ context.Context, channel string) error {
 
 // Notifications returns the stream of notification channel names. It is closed
 // when the Listener is closed.
+//
+// The receiver must drain this channel continuously. The buffer is bounded; when
+// it fills, deliverNotification blocks the single receive loop (rather than
+// dropping a wake) until a slot frees or the Listener closes, which also pauses
+// keepalive/reconnect detection for that interval. pgqueue's notifier drains it
+// promptly, so this only affects a custom consumer that stops reading.
 func (l *Listener) Notifications() <-chan string {
 	return l.notifs
 }
