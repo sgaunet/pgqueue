@@ -135,6 +135,13 @@ type ReplayDLQResult struct {
 // shorter than DLQRetention. A DLQ entry whose message was removed by some
 // other means (manual SQL, PurgeQueue) is skipped, not replayed, so one stale
 // entry can never abort the whole replay.
+//
+// DryRun caveat: a dry run walks the real paginated path with each page rolled
+// back, so inserts from earlier pages are not visible to later ones. If two DLQ
+// entries share the same original_message_id and fall in different pages, a real
+// run would replay the first and skip the second (ON CONFLICT), but a dry run
+// counts both as Replayed. The preview can therefore over-report Replayed (and
+// under-report Skipped) for duplicate ids; a real run is always exact.
 func (pq *Queue) ReplayDLQ(
 	ctx context.Context,
 	queueName string,
@@ -164,7 +171,13 @@ func (pq *Queue) ReplayDLQ(
 	// only genuinely replayable rows — a raw COUNT(*) would overstate the result
 	// because the real run skips rows whose original message is still live, rows
 	// with no active subscriber, and duplicate ids deferred to a later call.
-	result, err := pq.executeReplayDLQ(ctx, queueName, tableName, queueType, opts, opts.DryRun)
+	// Channel DLQ rows carry no max_retries column, so a reinstated message must
+	// be given the queue's configured cap explicitly. Otherwise it inherits the
+	// message-table column default (0), which channelMaxRetries reads as "no
+	// retries", and the message is dead-lettered again on its first failed
+	// delivery — silently losing its retry budget on every DLQ round-trip.
+	maxRetries := pq.resolveMaxRetries(metadata)
+	result, err := pq.executeReplayDLQ(ctx, queueName, tableName, queueType, opts, maxRetries, opts.DryRun)
 	if err != nil {
 		span.SetError(err)
 		if opts.DryRun {
@@ -600,6 +613,7 @@ func (pq *Queue) executeReplayDLQ(
 	queueName, tableName string,
 	queueType QueueType,
 	opts ReplayOptions,
+	maxRetries int,
 	dryRun bool,
 ) (ReplayDLQResult, error) {
 	var afterID uuid.UUID
@@ -618,7 +632,7 @@ func (pq *Queue) executeReplayDLQ(
 		}
 
 		page, err := pq.replayDLQPage(
-			ctx, queueName, tableName, queueType, afterID, pageLimit, opts.PerformedBy, dryRun,
+			ctx, queueName, tableName, queueType, afterID, pageLimit, opts.PerformedBy, maxRetries, dryRun,
 		)
 		if err != nil {
 			return result, err
@@ -661,6 +675,7 @@ func (pq *Queue) replayDLQPage(
 	afterID uuid.UUID,
 	pageLimit int,
 	performedBy string,
+	maxRetries int,
 	dryRun bool,
 ) (dlqPageResult, error) {
 	var page dlqPageResult
@@ -674,7 +689,7 @@ func (pq *Queue) replayDLQPage(
 			return nil
 		}
 
-		replayed, err := pq.reinsertDLQMessages(ctx, tx, queueName, tableName, queueType, dlqMessages)
+		replayed, err := pq.reinsertDLQMessages(ctx, tx, queueName, tableName, queueType, maxRetries, dlqMessages)
 		if err != nil {
 			return fmt.Errorf("failed to reinsert DLQ messages: %w", err)
 		}
@@ -789,13 +804,17 @@ func (pq *Queue) reinsertDLQMessages(
 	tx *sql.Tx,
 	queueName, tableName string,
 	queueType QueueType,
+	maxRetries int,
 	dlqMessages []dlqRow,
 ) (int, error) {
 	if queueType == QueueTypePubSub {
+		// Pub/sub message tables have no max_retries column — per-subscriber
+		// retry state is resolved from queue config at consume time — so the
+		// resolved cap is not needed here.
 		return pq.reinsertDLQPubSub(ctx, tx, queueName, tableName, dlqMessages)
 	}
 
-	return pq.reinsertDLQChannel(ctx, tx, tableName, dlqMessages)
+	return pq.reinsertDLQChannel(ctx, tx, tableName, maxRetries, dlqMessages)
 }
 
 // dedupeDLQByMessageID returns the DLQ rows keeping only the first occurrence
@@ -820,6 +839,7 @@ func (pq *Queue) reinsertDLQChannel(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
+	maxRetries int,
 	dlqMessages []dlqRow,
 ) (int, error) {
 	if len(dlqMessages) == 0 {
@@ -834,7 +854,7 @@ func (pq *Queue) reinsertDLQChannel(
 	unique := dedupeDLQByMessageID(dlqMessages)
 
 	// Insert messages and collect which IDs were actually inserted (ON CONFLICT skips dupes).
-	insertedIDs, err := pq.insertDLQChannelMessages(ctx, tx, tableName, unique)
+	insertedIDs, err := pq.insertDLQChannelMessages(ctx, tx, tableName, maxRetries, unique)
 	if err != nil {
 		return 0, err
 	}
@@ -864,17 +884,24 @@ func (pq *Queue) reinsertDLQChannel(
 
 // insertDLQChannelMessages batch-inserts DLQ messages back into the channel message table.
 // Returns the set of message IDs that were actually inserted (ON CONFLICT skips duplicates).
+//
+// max_retries is set explicitly to the queue's resolved cap rather than left to
+// the column default (0): the DLQ table carries no max_retries column to restore
+// from, and a stored 0 reads as "no retries", which would dead-letter the
+// message again on its first failed delivery. maxRetries is a library-resolved
+// int, so it is interpolated directly (no injection surface).
 func (pq *Queue) insertDLQChannelMessages(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
+	maxRetries int,
 	dlqMessages []dlqRow,
 ) (map[uuid.UUID]struct{}, error) {
 	const paramsPerRow = 3 // id, payload, metadata
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb,
-		"INSERT INTO %s (id, payload, created_at, status, retry_count, metadata) VALUES ",
+		"INSERT INTO %s (id, payload, created_at, status, retry_count, max_retries, metadata) VALUES ",
 		pq.msgTable(tableName),
 	)
 
@@ -884,8 +911,8 @@ func (pq *Queue) insertDLQChannelMessages(
 			sb.WriteString(", ")
 		}
 		base := i * paramsPerRow
-		fmt.Fprintf(&sb, "($%d, $%d, NOW(), '%s', 0, $%d)",
-			base+1, base+2, MessageStatusPending, base+3, //nolint:mnd // SQL placeholder arithmetic
+		fmt.Fprintf(&sb, "($%d, $%d, NOW(), '%s', 0, %d, $%d)",
+			base+1, base+2, MessageStatusPending, maxRetries, base+3, //nolint:mnd // SQL placeholder arithmetic
 		)
 		args = append(args, msg.originalMessageID, msg.payload, jsonbParam(msg.metadata))
 	}

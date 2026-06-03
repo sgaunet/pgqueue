@@ -33,7 +33,7 @@ var ErrSchemaTooNew = errors.New(
 // IMPORTANT: when adding a new entry to the migrations slice below, bump this
 // constant to match that entry's version number. An init() check enforces that
 // SchemaVersion equals the last migration's version.
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 // Advisory-lock key encoding scheme
 //
@@ -175,6 +175,11 @@ var migrations = []migration{
 		name:    "pubsub DLQ subscriber_id partial index",
 		apply:   migratePubSubDLQSubscriberIndex,
 	},
+	{
+		version: 8, //nolint:mnd // schema migration version number
+		name:    "metadata table_name charset CHECK",
+		apply:   migrateMetadataTableNameCheck,
+	},
 }
 
 // migrateIndexDLQOriginalMessageID is the v2 migration. It backfills the index
@@ -220,8 +225,10 @@ func migrateIndexDLQOriginalMessageID(ctx context.Context, tx *sql.Tx) error {
 // added NOT VALID first (a brief catalog-only lock) and then VALIDATEd in a
 // second statement (SHARE UPDATE EXCLUSIVE — concurrent reads and writes keep
 // running) so the migration stays usable against populated, in-use tables.
-// addAndValidateCheck swallows duplicate_object on ADD CONSTRAINT to stay
-// idempotent for queues whose newer CREATE TABLE already emitted the check.
+// addAndValidateCheck tolerates a duplicate_object on ADD CONSTRAINT (via a
+// SAVEPOINT) to stay idempotent for queues whose newer CREATE TABLE already
+// emitted the check, or for an earlier run that was interrupted after the
+// constraint was committed.
 func migrateNonNegativeRetryCounts(ctx context.Context, tx *sql.Tx) error {
 	tableNames, err := listQueueTableNames(ctx, tx)
 	if err != nil {
@@ -285,6 +292,20 @@ func applyRetryCountChecks(
 // (a queue created after the new CREATE TABLE began emitting the constraint
 // up front), and VALIDATE is still issued to cover an earlier interrupted run
 // that left the constraint NOT VALID.
+//
+// table is built from the sanitized per-queue name, and column and expr are
+// fixed in-tree literals at every call site (never caller- or data-derived), so
+// all three are safe to interpolate. Keep that contract if adding call sites:
+// route only constant identifiers/expressions through here, never values read
+// from the catalog or supplied by a caller.
+//
+// ADD CONSTRAINT is wrapped in a SAVEPOINT. In PostgreSQL a failed statement
+// aborts the entire surrounding transaction, so merely swallowing the Go error
+// on duplicate_object is not enough — the VALIDATE below, and the migration's
+// own version-row INSERT, would then fail with current_transaction_is_aborted
+// (25P02) and the whole migration run would error. ROLLBACK TO SAVEPOINT
+// rewinds just the failed ADD, leaving the transaction usable so VALIDATE can
+// still run against the pre-existing constraint.
 func addAndValidateCheck(
 	ctx context.Context, tx *sql.Tx, table, column, expr string,
 ) error {
@@ -293,8 +314,20 @@ func addAndValidateCheck(
 		`ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID`,
 		table, constraint, expr,
 	)
-	if _, err := tx.ExecContext(ctx, add); err != nil && !isDuplicateObjectError(err) {
-		return fmt.Errorf("add constraint %s: %w", constraint, err)
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT add_constraint"); err != nil {
+		return fmt.Errorf("savepoint for %s: %w", constraint, err)
+	}
+	if _, err := tx.ExecContext(ctx, add); err != nil {
+		if !isDuplicateObjectError(err) {
+			return fmt.Errorf("add constraint %s: %w", constraint, err)
+		}
+		// duplicate_object aborted the statement; rewind so the tx stays usable.
+		if _, rbErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT add_constraint"); rbErr != nil {
+			return fmt.Errorf("rollback to savepoint for %s: %w", constraint, rbErr)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT add_constraint"); err != nil {
+		return fmt.Errorf("release savepoint for %s: %w", constraint, err)
 	}
 	validate := fmt.Sprintf(
 		`ALTER TABLE %s VALIDATE CONSTRAINT %s`, table, constraint,
@@ -742,18 +775,29 @@ func (pq *PGQueue) SchemaVersion(ctx context.Context) (int, error) {
 
 // migrateMaxRetriesNotNull is the v5 migration. The channel message table's
 // max_retries column was previously BIGINT NULL with a CHECK that allowed NULL
-// to mean "no limit". New tables emit it as BIGINT NOT NULL DEFAULT 0 (a
-// concrete zero sentinel for "no limit"), which is less ambiguous and removes
-// the special-case NULL path in the consumer code. Pre-existing channel message
-// tables may still have the old nullable declaration and NULL rows, so:
-//  1. Backfill all NULL max_retries rows to 0 (preserves behaviour: 0 retries
-//     is handled as "use queue-level default" by the application).
+// to mean "fall back to the queue default". New tables emit it as BIGINT NOT
+// NULL DEFAULT 0, which is less ambiguous and removes the special-case NULL path
+// in the consumer code. Pre-existing channel message tables may still have the
+// old nullable declaration and NULL rows, so:
+//  1. Backfill all NULL max_retries rows to 0. NOTE: from v5 on, channelMaxRetries
+//     reads a stored 0 as an explicit "no retries" (dead-letter on first
+//     failure), NOT "use the queue default". For a not-yet-released schema with
+//     no NULL rows in practice this is moot, but it does mean a backfilled NULL
+//     row no longer inherits the default — publish and DLQ replay now always
+//     write the resolved cap explicitly so live rows are unaffected.
 //  2. Set NOT NULL on the column so new rows cannot be written as NULL.
 //  3. Drop the old "max_retries IS NULL OR max_retries >= 0" CHECK constraint
 //     (which the v3 migration added) and add the simpler "max_retries >= 0".
 //
 // Pub/sub and DLQ tables do not have a max_retries column, so only channel
 // message tables are patched.
+//
+// LOCK NOTE: step 2 (SET NOT NULL) briefly takes an ACCESS EXCLUSIVE lock and
+// scans the table to verify no NULLs remain (the pre-existing v3 CHECK permits
+// NULL, so PostgreSQL cannot skip the scan). Like the v4 migration's rewrite,
+// this is accepted because it ships against the small/empty tables of a
+// not-yet-released schema; on a large populated table it would block writes for
+// the scan's duration.
 func migrateMaxRetriesNotNull(ctx context.Context, tx *sql.Tx) error {
 	tableNames, err := listQueueTableNames(ctx, tx)
 	if err != nil {
@@ -918,5 +962,46 @@ func migratePubSubDLQSubscriberIndex(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 
+	return nil
+}
+
+// metadataTableNameConstraint is the name of the v8 CHECK constraint.
+const metadataTableNameConstraint = "pgqueue_metadata_table_name_charset"
+
+// migrateMetadataTableNameCheck is the v8 migration. Every dynamic per-queue
+// table name is interpolated directly into DDL/DML (DROP TABLE, CREATE INDEX,
+// DELETE FROM, …) after being read back from pgqueue_metadata.table_name. That
+// column is only ever written via sanitizeTableName, which restricts it to
+// [a-z0-9_]+, but nothing at the database layer enforced it — the safety of all
+// that interpolation rested on a runtime convention. This adds a CHECK so the
+// invariant is a structural guarantee: defense in depth against a future
+// in-tree bug or direct-SQL tampering ever planting an injection-bearing value.
+//
+// Existing rows already satisfy the pattern (they were written by
+// sanitizeTableName), so the validating ADD CONSTRAINT scan passes. The
+// existence probe keeps the migration idempotent on a crash-recovery re-run.
+// The bare table name resolves through the migration connection's search_path,
+// which runMigrations points at the configured schema.
+func migrateMetadataTableNameCheck(ctx context.Context, tx *sql.Tx) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname = $1 AND conrelid = 'pgqueue_metadata'::regclass
+		)`, metadataTableNameConstraint,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("check %s: %w", metadataTableNameConstraint, err)
+	}
+	if exists {
+		return nil
+	}
+
+	stmt := fmt.Sprintf(
+		`ALTER TABLE pgqueue_metadata ADD CONSTRAINT %s CHECK (table_name ~ '^[a-z0-9_]+$')`,
+		metadataTableNameConstraint,
+	)
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("add %s: %w", metadataTableNameConstraint, err)
+	}
 	return nil
 }

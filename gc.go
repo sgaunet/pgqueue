@@ -60,8 +60,11 @@ func NewGarbageCollector(
 	pq *Queue,
 	config GarbageCollectorConfig,
 ) *GarbageCollector {
-	// Set defaults
-	if config.Interval == 0 {
+	// Set defaults. A non-positive interval (zero or, via a caller-side
+	// misconfiguration, negative) is normalized to the default rather than
+	// reaching time.NewTicker in run(), which panics on a <= 0 duration and would
+	// crash the background goroutine. Matches the MaxWorkers guard below.
+	if config.Interval <= 0 {
 		config.Interval = defaultGCInterval
 	}
 	// An all-zero DefaultPolicy is treated as unconfigured and replaced with
@@ -1033,8 +1036,14 @@ func (gc *GarbageCollector) purgeDLQMessages(
 // that handles a given row. Each timed-out row is claimed by exactly one of the
 // two (FOR UPDATE SKIP LOCKED plus the status transition), so the increment is
 // applied exactly once. A row reset here becomes immediately available rather
-// than backoff-delayed; that window is bounded by the multi-minute GC interval.
-// Returns the number of rows updated.
+// than backoff-delayed: unlike the inline reclaim (deferReclaimedChannelMessage,
+// which pushes available_at by the backoff delay when a BackoffPolicy is set),
+// this bulk UPDATE deliberately skips the per-row jittered backoff — it cannot
+// be expressed as a set-based SQL expression, and the skipped delay is bounded
+// by the multi-minute GC interval, which already exceeds the default backoff
+// cap. Under active consumption the inline path wins the row first and applies
+// the backoff; the GC path only runs when no consumer has polled for a full GC
+// interval. Returns the number of rows updated.
 func (gc *GarbageCollector) resetTimedOutMessages(
 	ctx context.Context,
 	tableName string,
@@ -1136,6 +1145,15 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 // purgeCompletedMessages only deletes a message once every subscription row for
 // it is acked. A re-subscribe flips the subscriber back to active before the
 // next GC pass, sparing its rows.
+//
+// Rows still being processed within a live claim window (status = 'processing'
+// AND visibility_timeout in the future) are preserved: that is exactly the
+// in-flight message a soft Unsubscribe promises to let drain. Deleting it would
+// destroy the row out from under a consumer that is still working on it — its
+// later Ack/Nack would match nothing and the message would be silently lost
+// (no DLQ, no retry). Such a row is reaped on a later pass once it is acked or
+// its claim expires (after which resetTimedOutSubscriptions / the DLQ-promotion
+// step take over).
 func (gc *GarbageCollector) purgeInactiveSubscriptions(
 	ctx context.Context,
 	queueName, tableName string,
@@ -1147,7 +1165,8 @@ func (gc *GarbageCollector) purgeInactiveSubscriptions(
 			SELECT subscriber_id FROM %s
 			WHERE topic_name = $1 AND active = FALSE
 		)
-	`, gc.pq.subTable(tableName), gc.pq.globalTable("pgqueue_subscribers"))
+		AND NOT (status = '%s' AND visibility_timeout > NOW())
+	`, gc.pq.subTable(tableName), gc.pq.globalTable("pgqueue_subscribers"), MessageStatusProcessing)
 
 	result, err := gc.pq.db.ExecContext(ctx, query, queueName)
 	if err != nil {

@@ -115,6 +115,35 @@ func TestValidateMaxMessageSize(t *testing.T) {
 	}
 }
 
+// TestValidateMaxRetries pins that a per-queue max-retries override must be
+// non-negative. A negative cap would make every message dead-letter on its
+// first failure; channels are guarded by a DB CHECK but topics are not, so this
+// validation is the only thing that fails the topic path loudly.
+func TestValidateMaxRetries(t *testing.T) {
+	cases := []struct {
+		name    string
+		n       int
+		wantErr bool
+	}{
+		{"zero", 0, false},
+		{"positive", 5, false},
+		{"negative", -1, true},
+		{"large negative", -1 << 20, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMaxRetries(tc.n)
+			if tc.wantErr {
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Errorf("n=%d: err = %v, want ErrInvalidConfig", tc.n, err)
+				}
+			} else if err != nil {
+				t.Errorf("n=%d: unexpected err %v", tc.n, err)
+			}
+		})
+	}
+}
+
 // TestApplyConfigOptionsMaxMetadataSize verifies the 0-coerces-to-default
 // behavior and that an explicit positive value (including MaxAllowedMetadataSize)
 // is preserved verbatim.

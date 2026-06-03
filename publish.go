@@ -137,6 +137,10 @@ func (pq *Queue) validatePayloadSize(
 		MaxMessageSize int `json:"MaxMessageSize"`
 	}
 	if err := json.Unmarshal(queueMeta.Config, &config); err != nil {
+		// A corrupt config row is library-written, so this should never happen;
+		// surface it rather than silently applying a possibly-different cap.
+		pq.logWarn("failed to unmarshal queue config for max message size; using queue-wide default",
+			"queue", queueMeta.QueueName, "error", err)
 		config.MaxMessageSize = pq.cfg.maxMessageSize
 	}
 	if config.MaxMessageSize == 0 {
@@ -160,7 +164,10 @@ func (pq *Queue) resolveMaxMetadataSize(queueMeta *QueueMetadata) int {
 	var config struct {
 		MaxMetadataSize int `json:"MaxMetadataSize"`
 	}
-	if err := json.Unmarshal(queueMeta.Config, &config); err == nil && config.MaxMetadataSize > 0 {
+	if err := json.Unmarshal(queueMeta.Config, &config); err != nil {
+		pq.logWarn("failed to unmarshal queue config for max metadata size; using queue-wide default",
+			"queue", queueMeta.QueueName, "error", err)
+	} else if config.MaxMetadataSize > 0 {
 		return config.MaxMetadataSize
 	}
 	return pq.cfg.maxMetadataSize
@@ -205,7 +212,10 @@ func (pq *Queue) resolveMaxRetries(
 		MaxRetries    int  `json:"MaxRetries"`
 		MaxRetriesSet bool `json:"MaxRetriesSet"`
 	}
-	if err := json.Unmarshal(queueMeta.Config, &opts); err == nil {
+	if err := json.Unmarshal(queueMeta.Config, &opts); err != nil {
+		pq.logWarn("failed to unmarshal queue config for max retries; using queue-wide default",
+			"queue", queueMeta.QueueName, "error", err)
+	} else {
 		if opts.MaxRetriesSet {
 			return opts.MaxRetries
 		}

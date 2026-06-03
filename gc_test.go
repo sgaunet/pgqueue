@@ -56,6 +56,27 @@ func TestNewGarbageCollectorKeepForeverNotOverridden(t *testing.T) {
 	}
 }
 
+// TestNewGarbageCollectorNormalizesNonPositiveInterval pins the fix for the
+// negative-interval crash: a non-positive Interval (zero, or a negative from a
+// caller-side misconfiguration) must be normalized to defaultGCInterval. A
+// negative value used to pass through unchanged and reach time.NewTicker in the
+// background GC goroutine, which panics on a <= 0 duration and crashed the
+// whole process.
+func TestNewGarbageCollectorNormalizesNonPositiveInterval(t *testing.T) {
+	for _, in := range []time.Duration{0, -time.Second, -time.Hour} {
+		gc := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{Interval: in})
+		if gc.config.Interval != defaultGCInterval {
+			t.Errorf("Interval %v: got %v, want default %v",
+				in, gc.config.Interval, defaultGCInterval)
+		}
+	}
+	// A positive interval must still be honored verbatim.
+	gc := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{Interval: 90 * time.Second})
+	if gc.config.Interval != 90*time.Second {
+		t.Errorf("positive Interval: got %v, want %v", gc.config.Interval, 90*time.Second)
+	}
+}
+
 // TestAppendCappedErrCapsAtThreshold is the issue #62 regression: a sustained
 // database outage used to grow the per-queue error slice to len(allQueues)
 // every tick, producing megabyte-sized joined-error logs. The cap stops

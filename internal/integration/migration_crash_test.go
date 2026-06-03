@@ -94,11 +94,13 @@ func TestMigrationCrashRecoveryPartialApply(t *testing.T) {
 	}
 
 	// ----- Simulate Scenario A -----
-	// Delete version rows for migrations 5, 6, and 7 — as if the process crashed
-	// after committing v4 but before committing v5, then was restarted twice
-	// more without ever completing v6 or v7.
+	// Delete every version row above v4 — as if the process crashed after
+	// committing v4 but before committing v5, then was restarted repeatedly
+	// without ever completing the later migrations. Deleting the whole suffix
+	// (rather than a fixed list) keeps this robust as SchemaVersion grows: the
+	// runner resumes from COALESCE(MAX(version), 0), so the gap must reach the top.
 	if _, err := db.ExecContext(ctx,
-		`DELETE FROM pgqueue_schema_version WHERE version IN (5, 6, 7)`); err != nil {
+		`DELETE FROM pgqueue_schema_version WHERE version > 4`); err != nil {
 		t.Fatalf("delete version rows to simulate partial crash: %v", err)
 	}
 

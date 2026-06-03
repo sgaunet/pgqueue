@@ -274,6 +274,18 @@ func validateMaxMetadataSize(n int) error {
 	return nil
 }
 
+// validateMaxRetries rejects a negative per-queue max-retry override. A negative
+// cap would make retry_count+1 > maxRetry true on the first failure, silently
+// dead-lettering every message. Channels are also guarded by the max_retries
+// CHECK constraint, but topics have no per-message column, so this is the only
+// place a bad value is caught for them — fail both paths loudly and identically.
+func validateMaxRetries(n int) error {
+	if n < 0 {
+		return fmt.Errorf("max retries %d must not be negative: %w", n, ErrInvalidConfig)
+	}
+	return nil
+}
+
 // validateResolvedConfig runs the post-applyConfigOptions checks shared by New
 // so the constructor stays under the cyclomatic-complexity budget.
 func validateResolvedConfig(cfg queueConfig) error {
@@ -415,6 +427,9 @@ func (pq *Queue) CreateChannel(
 	if err := validateMaxMetadataSize(o.maxMetadataSize); err != nil {
 		return err
 	}
+	if err := validateMaxRetries(o.maxRetries); err != nil {
+		return err
+	}
 	co := ChannelOptions{
 		MaxMessageSize:  o.maxMessageSize,
 		MaxMetadataSize: o.maxMetadataSize,
@@ -441,6 +456,9 @@ func (pq *Queue) CreateTopic(
 		return err
 	}
 	if err := validateMaxMetadataSize(o.maxMetadataSize); err != nil {
+		return err
+	}
+	if err := validateMaxRetries(o.maxRetries); err != nil {
 		return err
 	}
 	to := TopicOptions{
