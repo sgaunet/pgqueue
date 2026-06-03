@@ -318,15 +318,20 @@ func secondsToProcessingTime(secs sql.NullFloat64) *time.Duration {
 }
 
 // secondsToAge converts an age in seconds from a SQL EXTRACT(EPOCH …) result
-// into a *time.Duration, clamping any negative value to zero so a reported age
-// is never negative (R-19).
+// into a *time.Duration, clamping to [0, maxProcessingTimeSeconds] so a reported
+// age is never negative (R-19) and a NaN or +Inf from overflowed timestamp
+// arithmetic cannot wrap the int64-nanosecond cast into a bogus value (matches
+// secondsToProcessingTime, issue #116).
 func secondsToAge(secs sql.NullFloat64) *time.Duration {
 	if !secs.Valid {
 		return nil
 	}
 	v := secs.Float64
-	if v < 0 {
+	if v < 0 || v != v { // v != v catches NaN
 		v = 0
+	}
+	if v > maxProcessingTimeSeconds {
+		v = maxProcessingTimeSeconds
 	}
 	age := time.Duration(v * float64(time.Second))
 	return &age

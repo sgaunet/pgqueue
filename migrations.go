@@ -45,8 +45,8 @@ const SchemaVersion = 7
 //
 // Current key assignments (tag → hexadecimal → decimal):
 //
-//	"pgqueue" → 0x7067717565_7565 → 481038094336869  migrationAdvisoryLockKey
-//	"pgquecq" → 0x70677175_65_6371 → 481038093893489  createQueueAdvisoryLockKey
+//	"pgqueue" → 0x70677175657565 → 31638934390142309  migrationAdvisoryLockKey
+//	"pgquecq" → 0x70677175656371 → 31638934390137713  createQueueAdvisoryLockKey
 //
 // New keys must use a unique 7-byte ASCII tag so the values do not collide.
 
@@ -430,15 +430,27 @@ func queueTypeForTable(ctx context.Context, tx *sql.Tx, tableName string) (Queue
 	return QueueType(qt), nil
 }
 
+// pgDuplicateObject is the PostgreSQL SQLSTATE for a duplicate_object error
+// (e.g. ADD CONSTRAINT for a constraint that already exists).
+const pgDuplicateObject = "42710"
+
 // isDuplicateObjectError reports whether err is PostgreSQL's duplicate_object
-// SQLSTATE 42710. Both pgx and lib/pq surface it as a generic error whose
-// message contains "already exists", so the v3 migration matches on that to
-// stay idempotent against a queue whose newer CREATE TABLE already emitted the
-// CHECK constraint up front.
+// SQLSTATE 42710. The v3 migration uses it to stay idempotent against a queue
+// whose newer CREATE TABLE already emitted the CHECK constraint up front. It is
+// driver-agnostic: pgx errors are matched on SQLSTATE via the sqlStater
+// interface; drivers whose accessor has a different shape (lib/pq) fall back to
+// the error text. The text fallback deliberately stays narrow — matching the
+// bare phrase "already exists" only when no SQLSTATE is available — because that
+// phrase also appears in duplicate_table/duplicate_index (42P07) messages.
 func isDuplicateObjectError(err error) bool {
 	if err == nil {
 		return false
 	}
+	var s sqlStater
+	if errors.As(err, &s) {
+		return s.SQLState() == pgDuplicateObject
+	}
+	// Error-text fallback for drivers without a SQLState() accessor (lib/pq).
 	return strings.Contains(err.Error(), "already exists")
 }
 

@@ -143,6 +143,14 @@ func WithOnReconnect(fn func(attempt int)) Option {
 // errListenerClosed is returned by Listen after the Listener has been closed.
 var errListenerClosed = errors.New("pglisten: listener is closed")
 
+// errChannelContainsNUL is returned by Listen/Unlisten when a channel name
+// contains a NUL byte. PostgreSQL cannot represent a NUL in a LISTEN/UNLISTEN
+// identifier (quoteListenIdent doubles double-quotes but cannot escape a NUL),
+// so it would otherwise reach the wire and fail opaquely. pgqueue's own callers
+// never hit this (validateQueueName forbids NUL); this guards third parties
+// using pglisten standalone.
+var errChannelContainsNUL = errors.New("pglisten: channel name contains a NUL byte")
+
 // listenReq is a queued LISTEN request. done carries the outcome back to a
 // synchronous Listen caller: nil once the LISTEN is confirmed on the server, or
 // the error if issuing it failed. It is buffered (cap 1) so drainPending can
@@ -191,6 +199,12 @@ type Listener struct {
 	waitMu           sync.Mutex
 	waitCancel       context.CancelFunc // cancels the active wait, if any
 	interruptPending bool               // a LISTEN/Close arrived with no active wait
+
+	// notifBlocked records whether the most recent delivery to notifs had to
+	// block on a full buffer. It is touched only by the run goroutine
+	// (receiveOne), so it needs no lock; it exists purely to log backpressure on
+	// the rising/falling edge instead of on every notification.
+	notifBlocked bool
 }
 
 // compile-time check: *Listener satisfies the pgqueue.Listener hook interface,
@@ -253,6 +267,9 @@ func New(ctx context.Context, connString string, opts ...Option) (*Listener, err
 // pgqueue's own callers always satisfy this via validateQueueName; third
 // parties using pglisten standalone should impose their own validation.
 func (l *Listener) Listen(ctx context.Context, channel string) error {
+	if strings.IndexByte(channel, 0) >= 0 {
+		return errChannelContainsNUL
+	}
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -297,6 +314,9 @@ func (l *Listener) Listen(ctx context.Context, channel string) error {
 // nothing a caller could usefully do with a confirmation. The ctx is accepted
 // for interface symmetry but the work is asynchronous.
 func (l *Listener) Unlisten(_ context.Context, channel string) error {
+	if strings.IndexByte(channel, 0) >= 0 {
+		return errChannelContainsNUL
+	}
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -429,12 +449,38 @@ func (l *Listener) receiveOne() bool {
 		}
 	}
 
+	return l.deliverNotification(n.Channel)
+}
+
+// deliverNotification hands a notification channel name to the notifs buffer for
+// the consumer. It returns false only when the listener is shutting down. When
+// the buffer is full it does not drop the notification (that would silently lose
+// a wake) but surfaces the backpressure on the rising edge — so a permanently
+// slow consumer is observable — and then blocks until a slot frees or the
+// listener closes. notifBlocked is touched only by the run goroutine, so the
+// edge-triggered logging needs no lock.
+func (l *Listener) deliverNotification(channel string) bool {
 	select {
-	case l.notifs <- n.Channel:
+	case l.notifs <- channel:
+		if l.notifBlocked {
+			l.notifBlocked = false
+			l.logWarn("pglisten: notification buffer drained; consumer caught up",
+				"buffer", cap(l.notifs))
+		}
+		return true
+	default:
+	}
+	if !l.notifBlocked {
+		l.notifBlocked = true
+		l.logWarn("pglisten: notification buffer full; receive loop blocked on slow consumer",
+			"buffer", cap(l.notifs))
+	}
+	select {
+	case l.notifs <- channel:
+		return true
 	case <-l.done:
 		return false
 	}
-	return true
 }
 
 // keepaliveProbe runs a short-bounded Ping on the listener's connection to
@@ -522,10 +568,12 @@ func (l *Listener) reconnect() bool {
 			l.logWarn("pglisten: reconnect attempt failed; retrying",
 				"attempt", attempt+1, "delay", delay, "error", err)
 			attempt++
+			timer := time.NewTimer(delay)
 			select {
 			case <-l.done:
+				timer.Stop()
 				return false
-			case <-time.After(delay):
+			case <-timer.C:
 				continue
 			}
 		}

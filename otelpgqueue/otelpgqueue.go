@@ -79,8 +79,9 @@ type Tracer struct {
 // compile-time check.
 var _ pgqueue.Tracer = (*Tracer)(nil)
 
-// NewTracer builds a pgqueue.Tracer backed by tp. A nil provider falls back to
-// the global OpenTelemetry tracer provider.
+// NewTracer builds a pgqueue.Tracer backed by tp. A nil provider installs a
+// no-op tracer (it does NOT fall back to the OpenTelemetry global provider); to
+// wire the global provider, pass otel.GetTracerProvider() explicitly.
 func NewTracer(tp trace.TracerProvider, opts ...TracerOption) *Tracer {
 	t := &Tracer{}
 	if tp == nil {
@@ -287,11 +288,11 @@ func (m *Metrics) RecordAck(queue string, ok bool) {
 	}
 }
 
-// RecordAckAfterExpired counts one receipt whose claim no longer matched at
-// ack/nack time — the message will be redelivered.
-func (m *Metrics) RecordAckAfterExpired(queue string) {
+// RecordAckAfterExpired counts n receipts whose claims expired at ack/nack time
+// — those messages will be redelivered.
+func (m *Metrics) RecordAckAfterExpired(queue string, n int) {
 	if m.ackAfterExpired != nil {
-		m.ackAfterExpired.Add(context.Background(), 1, queueAttr(queue))
+		m.ackAfterExpired.Add(context.Background(), int64(n), queueAttr(queue))
 	}
 }
 

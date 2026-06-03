@@ -226,7 +226,17 @@ func (pq *Queue) finishBatch(
 		return BatchResult{}, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	pq.recordAckAfterExpired(queueName, len(res.Failed))
+	// Count only genuinely expired claims toward the redelivery metric. A miss
+	// can also be ErrMessageAlreadyAcked or ErrMessageNotFound (purged), neither
+	// of which redelivers, so including them would overstate at-least-twice
+	// delivery.
+	expired := 0
+	for _, f := range res.Failed {
+		if errors.Is(f.Reason, ErrClaimExpired) {
+			expired++
+		}
+	}
+	pq.recordAckAfterExpired(queueName, expired)
 	return res, nil
 }
 

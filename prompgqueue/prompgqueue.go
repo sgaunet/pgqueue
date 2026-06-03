@@ -254,10 +254,10 @@ func (m *Metrics) RecordAck(queue string, ok bool) {
 	m.acks.WithLabelValues(queue, result).Inc()
 }
 
-// RecordAckAfterExpired counts one receipt whose claim no longer matched at
-// ack/nack time — the message will be redelivered.
-func (m *Metrics) RecordAckAfterExpired(queue string) {
-	m.ackAfterExpired.WithLabelValues(queue).Inc()
+// RecordAckAfterExpired counts n receipts whose claims expired at ack/nack time
+// — those messages will be redelivered.
+func (m *Metrics) RecordAckAfterExpired(queue string, n int) {
+	m.ackAfterExpired.WithLabelValues(queue).Add(float64(n))
 }
 
 // ObserveQueueDepth records the current pending-message count for a queue.

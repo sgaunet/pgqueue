@@ -137,6 +137,13 @@ type notifier struct {
 	closed         bool
 
 	pumpOnce sync.Once
+
+	// wg tracks the pump and confirmListen goroutines so close() can join them
+	// before returning. wakeChan starts both via wg.Go (keeping pump/confirmListen
+	// directly callable in tests), and wg.Go performs its Add synchronously under
+	// mu; wakeChan returns early once closed is set, so no Add can race close()'s
+	// Wait().
+	wg sync.WaitGroup
 }
 
 // newNotifier wraps a Listener. It returns nil when listener is nil so callers
@@ -192,7 +199,7 @@ func (n *notifier) wakeChan(_ context.Context, notifyChannel string) <-chan stru
 	// Start the demux pump once. pumpOnce.Do does not take n.mu; the spawned
 	// pump goroutine blocks on n.mu until this call returns, so calling it
 	// under the lock is safe.
-	n.pumpOnce.Do(func() { go n.pump() })
+	n.pumpOnce.Do(func() { n.wg.Go(n.pump) })
 
 	// Confirm LISTEN exactly once per channel. listenInFlight guards against a
 	// second goroutine while one is still blocked confirming, so a sustained
@@ -201,7 +208,7 @@ func (n *notifier) wakeChan(_ context.Context, notifyChannel string) <-chan stru
 	// previous attempt has returned and (on failure) cleared the flag.
 	if !n.listening[notifyChannel] && !n.listenInFlight[notifyChannel] {
 		n.listenInFlight[notifyChannel] = true
-		go n.confirmListen(notifyChannel)
+		n.wg.Go(func() { n.confirmListen(notifyChannel) })
 	}
 	return w.wait()
 }
@@ -352,6 +359,15 @@ func (n *notifier) close() error {
 
 	err := n.listener.Close()
 	n.wakeAll()
+
+	// Join the pump and any in-flight confirmListen goroutines before returning,
+	// so close() cannot hand back to a caller that then tears down the DB while a
+	// goroutine still touches the listener or the notifier's maps. cancel() (for
+	// a blocked Listen) and listener.Close() (which ends the pump's range) above
+	// guarantee both goroutines unwind; Wait() runs without n.mu held so they can
+	// still take the lock to finish.
+	n.wg.Wait()
+
 	if err != nil {
 		return fmt.Errorf("listener close: %w", err)
 	}

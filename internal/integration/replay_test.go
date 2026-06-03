@@ -765,6 +765,81 @@ func TestReplayDLQAllUnreplayableReturnsPromptly(t *testing.T) {
 	}
 }
 
+// TestReplayDLQDryRunCountsOnlyReplayable verifies the dry-run accuracy fix: for
+// a DLQ mixing replayable and un-replayable rows, DryRun reports exactly what a
+// real run would replay/skip (not a raw COUNT of all rows), and mutates nothing
+// — the subsequent real run still finds and replays the same rows.
+func TestReplayDLQDryRunCountsOnlyReplayable(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "replay-dlq-dryrun-mixed"
+	if err := pq.CreateChannel(ctx, channelName, pgqueue.WithQueueMaxRetries(1)); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// Push 4 messages to the DLQ via two nacks each.
+	const total = 4
+	for range total {
+		if _, err := pq.Publish(ctx, channelName, []byte("payload")); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	for pass := range 2 {
+		for range total {
+			msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
+			if err != nil || msg == nil {
+				t.Fatalf("consume (pass %d): %v", pass, err)
+			}
+			if err := pq.Nack(ctx, msg.Receipt(), "fail"); err != nil {
+				t.Fatalf("nack (pass %d): %v", pass, err)
+			}
+		}
+	}
+
+	// Make exactly 2 of the 4 DLQ rows un-replayable by re-inserting their
+	// original_message_id into the live message table, so a replay would collide
+	// with an existing live row and skip them.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO pgqueue_msg_replay_dlq_dryrun_mixed
+			(id, payload, status, retry_count, max_retries, created_at)
+		SELECT original_message_id, '\x00'::bytea, 'pending', 0, 1, NOW()
+		FROM pgqueue_dlq_replay_dlq_dryrun_mixed
+		ORDER BY id LIMIT 2`); err != nil {
+		t.Fatalf("seed un-replayable rows: %v", err)
+	}
+
+	// Dry run: must report the 2 replayable rows, skip the 2 un-replayable ones,
+	// and NOT report all 4 (the old raw-COUNT behavior).
+	dry, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry-run replay: %v", err)
+	}
+	if dry.Replayed != 2 || dry.Skipped != 2 {
+		t.Errorf("dry-run = {Replayed:%d Skipped:%d}, want {2 2}", dry.Replayed, dry.Skipped)
+	}
+
+	// The dry run must not have mutated the DLQ — all 4 rows remain.
+	dlqStats, err := pq.DLQStats(ctx, channelName, pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("DLQ stats after dry-run: %v", err)
+	}
+	if dlqStats.TotalCount != total {
+		t.Errorf("DLQ count after dry-run = %d, want %d (dry-run must not delete)", dlqStats.TotalCount, total)
+	}
+
+	// Real run: replays the same 2 the dry run predicted.
+	actual, err := pq.ReplayDLQ(ctx, channelName, pgqueue.QueueTypeChannel, pgqueue.ReplayOptions{PerformedBy: "test"})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if actual.Replayed != dry.Replayed || actual.Skipped != dry.Skipped {
+		t.Errorf("real = {Replayed:%d Skipped:%d}, want it to match dry-run {Replayed:%d Skipped:%d}",
+			actual.Replayed, actual.Skipped, dry.Replayed, dry.Skipped)
+	}
+}
+
 // TestReplayDLQPerPageAuditLog (R-11) seeds a channel DLQ with a backlog that
 // spans more than one replay page (the internal page size is 100), runs
 // ReplayDLQ, and verifies that the audit row is written per-page inside each

@@ -786,10 +786,13 @@ func newMetricsQueue(t *testing.T) (*pgqueue.Queue, *recordingMetrics, func()) {
 	}
 }
 
-// TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts verifies that the
-// silently-skipped receipts of a partial-success AckChannelBatch are reported
-// to the registered MetricsRecorder via RecordAckAfterExpired (issue #113).
-func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
+// TestAckChannelBatchEmitsAckAfterExpiredForExpiredClaims verifies that an
+// AckBatch receipt whose claim genuinely expired (the message was reclaimed by
+// another consumer after the visibility timeout lapsed, so it will redeliver)
+// is reported to the registered MetricsRecorder via RecordAckAfterExpired
+// (issue #113). Receipts that fail for other reasons — a purged or never-seen
+// message (ErrMessageNotFound) — do not redeliver and must NOT be counted.
+func TestAckChannelBatchEmitsAckAfterExpiredForExpiredClaims(t *testing.T) {
 	pq, metrics, cleanup := newMetricsQueue(t)
 	defer cleanup()
 
@@ -799,9 +802,8 @@ func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 		t.Fatalf("create channel: %v", err)
 	}
 
-	// Publish 2 valid messages, then build a batch mixing real receipts with
-	// stale ones whose ClaimID is zero and whose MessageIDs do not match any
-	// processing row.
+	// Publish 2 messages and consume them with a short visibility timeout so the
+	// claims can be expired out from under us.
 	if _, err := pq.PublishBatch(ctx, channelName, []pgqueue.PublishMessage{
 		{Payload: []byte("v1")},
 		{Payload: []byte("v2")},
@@ -809,56 +811,105 @@ func TestAckChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	valid := make([]pgqueue.Receipt, 0, 2)
+	stale := make([]pgqueue.Receipt, 0, 2)
 	for range 2 {
-		msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
-		if err != nil {
-			t.Fatalf("consume: %v", err)
+		msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(50*time.Millisecond))
+		if err != nil || msg == nil {
+			t.Fatalf("consumer A consume: msg=%v err=%v", msg, err)
 		}
-		valid = append(valid, msg.Receipt())
+		stale = append(stale, msg.Receipt())
 	}
 
-	staleA, err := uuid.NewV7()
-	if err != nil {
-		t.Fatalf("uuid v7: %v", err)
+	// Let the 50ms visibility timeouts lapse, then reclaim both messages as a
+	// second consumer with fresh claim tokens so consumer A's receipts above are
+	// now stale and resolve to ErrClaimExpired.
+	time.Sleep(100 * time.Millisecond) // intentional: let the 50ms visibility timeouts lapse
+	for range 2 {
+		if _, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second)); err != nil {
+			t.Fatalf("consumer B reclaim: %v", err)
+		}
 	}
-	staleB, err := uuid.NewV7()
+
+	res, err := pq.AckBatch(ctx, stale)
+	if err != nil {
+		t.Fatalf("ack batch: %v", err)
+	}
+
+	if got := metrics.ackAfterExpiredCount(); got != 2 {
+		t.Errorf("RecordAckAfterExpired emissions = %d, want 2 (one per expired claim)", got)
+	}
+	// Both stale receipts fail with ErrClaimExpired — the messages still exist
+	// but are now held under the reclaiming consumer's fresh claims.
+	if len(res.Succeeded) != 0 {
+		t.Errorf("expected 0 succeeded, got %d", len(res.Succeeded))
+	}
+	if len(res.Failed) != 2 {
+		t.Fatalf("expected 2 failed, got %d", len(res.Failed))
+	}
+	for _, f := range res.Failed {
+		if !errors.Is(f.Reason, pgqueue.ErrClaimExpired) {
+			t.Errorf("receipt %s: reason = %v, want ErrClaimExpired", f.Receipt.MessageID, f.Reason)
+		}
+	}
+}
+
+// TestAckChannelBatchDoesNotCountNotFoundReceipts confirms the metric's negative
+// case: receipts for messages that do not exist fail with ErrMessageNotFound and
+// are NOT counted toward RecordAckAfterExpired, since those messages do not
+// redeliver (the corrected semantics behind the batch counter).
+func TestAckChannelBatchDoesNotCountNotFoundReceipts(t *testing.T) {
+	pq, metrics, cleanup := newMetricsQueue(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "ack-batch-notfound"
+	if err := pq.CreateChannel(ctx, channelName); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	if _, err := pq.PublishBatch(ctx, channelName, []pgqueue.PublishMessage{
+		{Payload: []byte("v1")},
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	stale, err := uuid.NewV7()
 	if err != nil {
 		t.Fatalf("uuid v7: %v", err)
 	}
 	mixed := []pgqueue.Receipt{
-		valid[0],
-		{MessageID: staleA, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel},
-		valid[1],
-		{MessageID: staleB, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel},
+		msg.Receipt(),
+		{MessageID: stale, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel},
 	}
 	res, err := pq.AckBatch(ctx, mixed)
 	if err != nil {
 		t.Fatalf("ack batch: %v", err)
 	}
 
-	if got := metrics.ackAfterExpiredCount(); got != 2 {
-		t.Errorf("RecordAckAfterExpired emissions = %d, want 2 (one per skipped receipt)", got)
+	if got := metrics.ackAfterExpiredCount(); got != 0 {
+		t.Errorf("RecordAckAfterExpired emissions = %d, want 0 (ErrMessageNotFound does not redeliver)", got)
 	}
-	// The two valid receipts succeed; the two stale (nonexistent) ones fail with
-	// ErrMessageNotFound.
-	if len(res.Succeeded) != 2 {
-		t.Errorf("expected 2 succeeded, got %d", len(res.Succeeded))
+	if len(res.Succeeded) != 1 {
+		t.Errorf("expected 1 succeeded, got %d", len(res.Succeeded))
 	}
-	if len(res.Failed) != 2 {
-		t.Fatalf("expected 2 failed, got %d", len(res.Failed))
+	if len(res.Failed) != 1 {
+		t.Fatalf("expected 1 failed, got %d", len(res.Failed))
 	}
-	for _, f := range res.Failed {
-		if !errors.Is(f.Reason, pgqueue.ErrMessageNotFound) {
-			t.Errorf("receipt %s: reason = %v, want ErrMessageNotFound", f.Receipt.MessageID, f.Reason)
-		}
+	if !errors.Is(res.Failed[0].Reason, pgqueue.ErrMessageNotFound) {
+		t.Errorf("reason = %v, want ErrMessageNotFound", res.Failed[0].Reason)
 	}
 }
 
-// TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts is the nack
-// counterpart of the AckChannelBatch test: receipts that do not match any
-// processing row are counted via RecordAckAfterExpired (issue #113).
-func TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
+// TestNackChannelBatchEmitsAckAfterExpiredForExpiredClaims is the nack
+// counterpart: a NackBatch receipt whose claim genuinely expired (the message
+// was reclaimed after the visibility timeout lapsed) is counted via
+// RecordAckAfterExpired (issue #113).
+func TestNackChannelBatchEmitsAckAfterExpiredForExpiredClaims(t *testing.T) {
 	pq, metrics, cleanup := newMetricsQueue(t)
 	defer cleanup()
 
@@ -874,32 +925,34 @@ func TestNackChannelBatchEmitsAckAfterExpiredForSkippedReceipts(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	msg, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second))
-	if err != nil {
-		t.Fatalf("consume: %v", err)
+	msgA, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(50*time.Millisecond))
+	if err != nil || msgA == nil {
+		t.Fatalf("consumer A consume: msg=%v err=%v", msgA, err)
 	}
 
-	staleA, err := uuid.NewV7()
-	if err != nil {
-		t.Fatalf("uuid v7: %v", err)
+	// Let A's visibility timeout lapse, then reclaim the message as a second
+	// consumer so A's receipt is stale and resolves to ErrClaimExpired.
+	time.Sleep(100 * time.Millisecond) // intentional: let the 50ms visibility timeout lapse
+	if _, err := pq.ReceiveChannel(ctx, channelName, pgqueue.WithVisibilityTimeout(30*time.Second)); err != nil {
+		t.Fatalf("consumer B reclaim: %v", err)
 	}
-	mixed := []pgqueue.Receipt{msg.Receipt(), {MessageID: staleA, QueueName: channelName, QueueType: pgqueue.QueueTypeChannel}}
-	res, err := pq.NackBatch(ctx, mixed, "transient")
+
+	res, err := pq.NackBatch(ctx, []pgqueue.Receipt{msgA.Receipt()}, "transient")
 	if err != nil {
 		t.Fatalf("nack batch: %v", err)
 	}
 
 	if got := metrics.ackAfterExpiredCount(); got != 1 {
-		t.Errorf("RecordAckAfterExpired emissions = %d, want 1 (one per skipped receipt)", got)
+		t.Errorf("RecordAckAfterExpired emissions = %d, want 1 (one per expired claim)", got)
 	}
-	if len(res.Succeeded) != 1 {
-		t.Errorf("expected 1 succeeded, got %d", len(res.Succeeded))
+	if len(res.Succeeded) != 0 {
+		t.Errorf("expected 0 succeeded, got %d", len(res.Succeeded))
 	}
 	if len(res.Failed) != 1 {
 		t.Fatalf("expected 1 failed, got %d", len(res.Failed))
 	}
-	if !errors.Is(res.Failed[0].Reason, pgqueue.ErrMessageNotFound) {
-		t.Errorf("reason = %v, want ErrMessageNotFound", res.Failed[0].Reason)
+	if !errors.Is(res.Failed[0].Reason, pgqueue.ErrClaimExpired) {
+		t.Errorf("reason = %v, want ErrClaimExpired", res.Failed[0].Reason)
 	}
 }
 

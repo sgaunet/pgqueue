@@ -82,9 +82,9 @@ func (rm *recordingMetrics) RecordAck(_ string, ok bool) {
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordAckAfterExpired(_ string) {
+func (rm *recordingMetrics) RecordAckAfterExpired(_ string, n int) {
 	rm.mu.Lock()
-	rm.ackAfterExpired++
+	rm.ackAfterExpired += n
 	rm.mu.Unlock()
 }
 

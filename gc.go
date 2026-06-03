@@ -431,10 +431,12 @@ func (gc *GarbageCollector) doCollectQueue(
 		}
 	}
 
-	// Promote timed-out-and-exhausted channel messages to the DLQ. The consume
-	// path no longer does this inline (R-12), so the GC owns it; run it before
-	// resetTimedOutEntries so a still-exhausted message is dead-lettered rather
-	// than reset back to pending.
+	// Promote timed-out-and-exhausted channel messages to the DLQ. This is the
+	// backstop for exhausted rows that no consumer reaches: the consume path
+	// (reclaimChannelAttempt, channel.go) already dead-letters an exhausted row
+	// inline when a consumer hits it, but a backlog nobody polls needs the GC.
+	// Run it before resetTimedOutEntries so a still-exhausted message is
+	// dead-lettered rather than reset back to pending.
 	if queue.QueueType == QueueTypeChannel {
 		if err := gc.promoteExhaustedChannelMessages(ctx, queue.TableName); err != nil {
 			return purged, 0, fmt.Errorf("failed to promote exhausted messages: %w", err)
@@ -1062,9 +1064,14 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 
 	rows, raErr := rowsAffectedOrErr(result)
 	if raErr != nil {
+		// Propagate rather than swallow: a discarded error here makes rows=0,
+		// which the caller reports as "nothing reclaimed" even though the UPDATE
+		// ran — the same class of bug fixed for the paged purge loop (#67).
 		gc.pq.logError("reset timed-out messages rows affected",
 			"table", tableName, "error", raErr)
-	} else if rows > 0 {
+		return 0, fmt.Errorf("reset timed-out messages rows affected: %w", raErr)
+	}
+	if rows > 0 {
 		gc.pq.logInfo("reset timed-out messages", "count", rows, "table", tableName)
 	}
 
@@ -1108,9 +1115,12 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 
 	rows, raErr := rowsAffectedOrErr(result)
 	if raErr != nil {
+		// Propagate rather than swallow — see resetTimedOutMessages (#67).
 		gc.pq.logError("reset timed-out subscriptions rows affected",
 			"table", tableName, "error", raErr)
-	} else if rows > 0 {
+		return 0, fmt.Errorf("reset timed-out subscriptions rows affected: %w", raErr)
+	}
+	if rows > 0 {
 		gc.pq.logInfo("reset timed-out subscriptions", "count", rows, "table", tableName)
 	}
 

@@ -126,11 +126,13 @@ var readCommittedTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 // This function must be called once at startup before creating or using any
 // queues or topics.
 //
-// It creates four tables:
+// It creates four global tables. pgqueue_schema_version is bootstrapped by the
+// migration runner itself before any migration runs; the other three are
+// created by the v1 migration:
+//   - pgqueue_schema_version: Tracks which schema migrations have been applied
 //   - pgqueue_metadata: Tracks all queues and topics with their configurations
 //   - pgqueue_subscribers: Tracks pub/sub subscriptions for topics
 //   - pgqueue_replay_log: Audit log for message replay operations
-//   - pgqueue_schema_version: Tracks which schema migrations have been applied
 //
 // InitSchema is also the upgrade path: when a newer build of pgqueue introduces
 // schema changes, InitSchema transparently applies the pending migrations to

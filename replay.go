@@ -158,20 +158,18 @@ func (pq *Queue) ReplayDLQ(
 
 	tableName := metadata.TableName
 
-	if opts.DryRun {
-		count, err := pq.countDLQMessages(ctx, tableName)
-		if err != nil {
-			return ReplayDLQResult{}, err
-		}
-		if opts.Limit > 0 && count > opts.Limit {
-			count = opts.Limit
-		}
-		return ReplayDLQResult{Replayed: count}, nil
-	}
-
-	result, err := pq.executeReplayDLQ(ctx, queueName, tableName, queueType, opts)
+	// A dry run reports exactly what a real run would replay (and skip) without
+	// mutating anything: it walks the same paginated replay path with dryRun=true
+	// so each page transaction is rolled back instead of committed. This counts
+	// only genuinely replayable rows — a raw COUNT(*) would overstate the result
+	// because the real run skips rows whose original message is still live, rows
+	// with no active subscriber, and duplicate ids deferred to a later call.
+	result, err := pq.executeReplayDLQ(ctx, queueName, tableName, queueType, opts, opts.DryRun)
 	if err != nil {
 		span.SetError(err)
+		if opts.DryRun {
+			return ReplayDLQResult{}, fmt.Errorf("failed to preview DLQ replay: %w", err)
+		}
 		return result, fmt.Errorf("failed to execute DLQ replay: %w", err)
 	}
 
@@ -590,20 +588,6 @@ func (pq *Queue) executeReplayMessage(
 	})
 }
 
-func (pq *Queue) countDLQMessages(
-	ctx context.Context,
-	tableName string,
-) (int, error) {
-	countQuery := "SELECT COUNT(*) FROM " + pq.dlqTable(tableName)
-
-	var count int
-	if err := pq.db.QueryRowContext(ctx, countQuery).Scan(&count); err != nil {
-		return 0, fmt.Errorf("failed to count DLQ messages: %w", err)
-	}
-
-	return count, nil
-}
-
 // executeReplayDLQ replays the dead-letter queue in keyset-paginated pages
 // (defaultDLQReplayPageSize per page), each page in its own transaction, so
 // memory stays bounded by the page size regardless of backlog size (FR-025).
@@ -616,6 +600,7 @@ func (pq *Queue) executeReplayDLQ(
 	queueName, tableName string,
 	queueType QueueType,
 	opts ReplayOptions,
+	dryRun bool,
 ) (ReplayDLQResult, error) {
 	var afterID uuid.UUID
 	var result ReplayDLQResult
@@ -633,7 +618,7 @@ func (pq *Queue) executeReplayDLQ(
 		}
 
 		page, err := pq.replayDLQPage(
-			ctx, queueName, tableName, queueType, afterID, pageLimit, opts.PerformedBy,
+			ctx, queueName, tableName, queueType, afterID, pageLimit, opts.PerformedBy, dryRun,
 		)
 		if err != nil {
 			return result, err
@@ -663,6 +648,12 @@ type dlqPageResult struct {
 // per-page audit row is written inside that same transaction, so the audit
 // trail stays consistent with the messages actually replayed even if the
 // process crashes mid-replay (R-11).
+// errDryRunRollback is returned from the replayDLQPage transaction body when
+// dryRun is set, so withTx rolls the page back instead of committing. It never
+// escapes replayDLQPage — it is the signal that the page ran successfully and
+// its counts should be kept without persisting any of its writes.
+var errDryRunRollback = errors.New("pgqueue: dry-run page rollback")
+
 func (pq *Queue) replayDLQPage(
 	ctx context.Context,
 	queueName, tableName string,
@@ -670,6 +661,7 @@ func (pq *Queue) replayDLQPage(
 	afterID uuid.UUID,
 	pageLimit int,
 	performedBy string,
+	dryRun bool,
 ) (dlqPageResult, error) {
 	var page dlqPageResult
 	if err := pq.withTx(ctx, func(tx *sql.Tx) error {
@@ -688,7 +680,8 @@ func (pq *Queue) replayDLQPage(
 		}
 
 		// Audit row per page, committed atomically with the page it describes.
-		if replayed > 0 {
+		// Skipped on a dry run — the whole transaction is about to be rolled back.
+		if replayed > 0 && !dryRun {
 			if err := pq.writeReplayLog(
 				ctx, tx, queueName, queueType, "dlq",
 				replayed, performedBy,
@@ -704,8 +697,21 @@ func (pq *Queue) replayDLQPage(
 			lastID:   dlqMessages[len(dlqMessages)-1].id,
 			fetched:  len(dlqMessages),
 		}
+		// A dry run exercises the exact replay predicate (reinsertDLQMessages runs
+		// the real INSERT/DELETE, including the original-message and active-
+		// subscriber filters) but persists nothing: returning the sentinel makes
+		// withTx roll back. The keyset cursor still advances by lastID, so the
+		// next page moves forward exactly as a committed run would.
+		if dryRun {
+			return errDryRunRollback
+		}
 		return nil
 	}); err != nil {
+		// errDryRunRollback is only ever returned on a dry run; it signals the
+		// page ran successfully and was deliberately rolled back, so keep counts.
+		if errors.Is(err, errDryRunRollback) {
+			return page, nil
+		}
 		return dlqPageResult{}, err
 	}
 	return page, nil

@@ -91,3 +91,67 @@ func TestSecondsToProcessingTime(t *testing.T) {
 		})
 	}
 }
+
+// TestSecondsToAge guards the same overflow class as TestSecondsToProcessingTime
+// for the age conversion: NaN and +Inf (from overflowed timestamp arithmetic)
+// must never reach the int64-nanosecond cast and wrap to a negative or
+// nonsensical duration.
+func TestSecondsToAge(t *testing.T) {
+	maxExpected := time.Duration(maxProcessingTimeSeconds * float64(time.Second))
+
+	tests := []struct {
+		name    string
+		input   sql.NullFloat64
+		wantNil bool
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{name: "null", input: sql.NullFloat64{}, wantNil: true},
+		{
+			name:    "normal one hour",
+			input:   sql.NullFloat64{Float64: 3600, Valid: true},
+			wantMin: time.Hour, wantMax: time.Hour,
+		},
+		{
+			name:    "negative clamped to zero",
+			input:   sql.NullFloat64{Float64: -1, Valid: true},
+			wantMin: 0, wantMax: 0,
+		},
+		{
+			name:    "NaN clamped to zero",
+			input:   sql.NullFloat64{Float64: math.NaN(), Valid: true},
+			wantMin: 0, wantMax: 0,
+		},
+		{
+			name:    "+Inf clamped to max",
+			input:   sql.NullFloat64{Float64: math.Inf(1), Valid: true},
+			wantMin: maxExpected, wantMax: maxExpected,
+		},
+		{
+			name:    "absurdly large clamped to max",
+			input:   sql.NullFloat64{Float64: 1e300, Valid: true},
+			wantMin: maxExpected, wantMax: maxExpected,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := secondsToAge(tc.input)
+			if tc.wantNil {
+				if got != nil {
+					t.Errorf("want nil, got %v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("got nil, want non-nil duration")
+			}
+			if *got < 0 {
+				t.Errorf("duration is negative: %v", *got)
+			}
+			if *got < tc.wantMin || *got > tc.wantMax {
+				t.Errorf("duration %v outside [%v, %v]", *got, tc.wantMin, tc.wantMax)
+			}
+		})
+	}
+}
