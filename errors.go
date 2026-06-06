@@ -36,10 +36,15 @@ var (
 	ErrQueueAlreadyExists = errors.New("queue already exists")
 
 	// ErrQueueNotFound is returned when a queue or topic cannot be found.
+	// Because ErrTopicNotFound wraps it, errors.Is(err, ErrQueueNotFound)
+	// also matches a missing topic.
 	ErrQueueNotFound = errors.New("queue not found")
 
-	// ErrTopicNotFound is returned when a topic cannot be found.
-	ErrTopicNotFound = errors.New("topic not found")
+	// ErrTopicNotFound is returned when a topic cannot be found. It wraps
+	// ErrQueueNotFound so callers can match either the topic-specific sentinel
+	// or the general not-found one with errors.Is, while ErrTopicNotFound still
+	// distinguishes the topic-specific path.
+	ErrTopicNotFound = fmt.Errorf("topic %w", ErrQueueNotFound)
 
 	// ErrDuplicateMessageID is returned when publishing a message with an ID that already exists.
 	ErrDuplicateMessageID = errors.New("duplicate message ID")

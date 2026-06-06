@@ -55,7 +55,7 @@ func TestRowsAffectedOrErrReturnsCount(t *testing.T) {
 func TestResolveMaxMetadataSizePrefersPerQueue(t *testing.T) {
 	pq := &Queue{cfg: queueConfig{maxMetadataSize: 1024}}
 
-	perQueueConfig, _ := json.Marshal(ChannelOptions{MaxMetadataSize: 4096})
+	perQueueConfig, _ := json.Marshal(channelOptions{MaxMetadataSize: 4096})
 	meta := &QueueMetadata{Config: perQueueConfig}
 	if got := pq.resolveMaxMetadataSize(meta); got != 4096 {
 		t.Errorf("per-queue 4096 + queue-wide 1024: got %d, want 4096", got)

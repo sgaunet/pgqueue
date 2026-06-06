@@ -13,23 +13,23 @@ func (pq *Queue) Stats(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
-) (*QueueStats, error) {
+) (QueueStats, error) {
 	if err := pq.checkClosed(); err != nil {
-		return nil, err
+		return QueueStats{}, err
 	}
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, ErrQueueNotFound) {
-		return nil, fmt.Errorf(
+		return QueueStats{}, fmt.Errorf(
 			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
 		)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get queue metadata: %w", err)
+		return QueueStats{}, fmt.Errorf("failed to get queue metadata: %w", err)
 	}
 
 	tableName := metadata.TableName
-	stats := &QueueStats{
+	stats := QueueStats{
 		QueueName: queueName,
 	}
 
@@ -39,18 +39,26 @@ func (pq *Queue) Stats(
 	// separate queries and the returned counts would not sum to a real point
 	// in time (issue #112).
 	if queueType == QueueTypeChannel {
-		if err := pq.getChannelStats(ctx, tableName, stats); err != nil {
-			return nil, fmt.Errorf("failed to get channel stats: %w", err)
+		if err := pq.getChannelStats(ctx, tableName, &stats); err != nil {
+			return QueueStats{}, fmt.Errorf("failed to get channel stats: %w", err)
 		}
 	} else {
-		if err := pq.getPubSubStats(ctx, tableName, stats); err != nil {
-			return nil, fmt.Errorf("failed to get pub/sub stats: %w", err)
+		if err := pq.getPubSubStats(ctx, tableName, &stats); err != nil {
+			return QueueStats{}, fmt.Errorf("failed to get pub/sub stats: %w", err)
 		}
 	}
 
 	// Feed the observed depth to a registered MetricsRecorder (FR-018); a no-op
-	// when none is registered.
-	pq.observeQueueDepth(queueName, stats.PendingCount)
+	// when none is registered. The gauge reports the consumable depth (the same
+	// TTL-excluded count QueueDepth returns), not the raw PendingCount above,
+	// which still includes TTL-expired rows no consumer can ever receive
+	// (issue #12). The QueueStats value returned to the caller keeps reporting
+	// the raw PendingCount — that is its documented contract.
+	depth, err := pq.consumableDepth(ctx, tableName, queueType, metadata.Config)
+	if err != nil {
+		return QueueStats{}, err
+	}
+	pq.observeQueueDepth(queueName, depth)
 	pq.observeDLQSize(queueName, stats.DLQCount)
 
 	return stats, nil
@@ -79,8 +87,20 @@ func (pq *Queue) QueueDepth(
 		return 0, fmt.Errorf("failed to get queue metadata: %w", err)
 	}
 
-	tableName := metadata.TableName
-	ttl := pq.getQueueTTL(metadata.Config)
+	return pq.consumableDepth(ctx, metadata.TableName, queueType, metadata.Config)
+}
+
+// consumableDepth runs the consumable-depth COUNT for a queue: pending messages
+// whose TTL has not elapsed, matching what the consume queries actually deliver.
+// Shared by QueueDepth and the queue_depth gauge in Stats so both report the same
+// TTL-excluded count rather than the raw pending count (issue #12).
+func (pq *Queue) consumableDepth(
+	ctx context.Context,
+	tableName string,
+	queueType QueueType,
+	config []byte,
+) (int64, error) {
+	ttl := pq.getQueueTTL(config)
 	query, args := queueDepthQuery(pq, tableName, queueType, ttl)
 
 	var count int64
@@ -126,12 +146,12 @@ func (pq *Queue) SubscriberLag(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
-) (*SubscriberLag, error) {
+) (SubscriberLag, error) {
 	if err := pq.checkClosed(); err != nil {
-		return nil, err
+		return SubscriberLag{}, err
 	}
 	if err := validateSubscriberID(subscriberID); err != nil {
-		return nil, err
+		return SubscriberLag{}, err
 	}
 
 	// Get topic metadata
@@ -139,10 +159,10 @@ func (pq *Queue) SubscriberLag(
 		ctx, string(QueueTypePubSub), topicName,
 	)
 	if errors.Is(err, ErrQueueNotFound) {
-		return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		return SubscriberLag{}, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
+		return SubscriberLag{}, fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
 	tableName := metadata.TableName
@@ -160,7 +180,7 @@ func (pq *Queue) SubscriberLag(
 		WHERE subscriber_id = $1
 	`, MessageStatusPending, MessageStatusProcessing, MessageStatusAcked, MessageStatusPending, pq.subTable(tableName))
 
-	lag := &SubscriberLag{
+	lag := SubscriberLag{
 		SubscriberID: subscriberID,
 		TopicName:    topicName,
 	}
@@ -174,7 +194,7 @@ func (pq *Queue) SubscriberLag(
 		&oldestPendingAge,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get subscriber lag: %w", err)
+		return SubscriberLag{}, fmt.Errorf("failed to get subscriber lag: %w", err)
 	}
 
 	lag.OldestPendingAge = secondsToAge(oldestPendingAge)
@@ -187,19 +207,19 @@ func (pq *Queue) DLQStats(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
-) (*DLQStats, error) {
+) (DLQStats, error) {
 	if err := pq.checkClosed(); err != nil {
-		return nil, err
+		return DLQStats{}, err
 	}
 	// Get queue metadata
 	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, ErrQueueNotFound) {
-		return nil, fmt.Errorf(
+		return DLQStats{}, fmt.Errorf(
 			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
 		)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get queue metadata: %w", err)
+		return DLQStats{}, fmt.Errorf("failed to get queue metadata: %w", err)
 	}
 
 	tableName := metadata.TableName
@@ -214,7 +234,7 @@ func (pq *Queue) DLQStats(
 		FROM %s
 	`, pq.dlqTable(tableName))
 
-	stats := &DLQStats{
+	stats := DLQStats{
 		QueueName: queueName,
 	}
 
@@ -228,7 +248,7 @@ func (pq *Queue) DLQStats(
 		&avgRetryCount,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get DLQ stats: %w", err)
+		return DLQStats{}, fmt.Errorf("failed to get DLQ stats: %w", err)
 	}
 
 	if oldestMovedAt.Valid {
@@ -386,27 +406,27 @@ func (pq *Queue) SubscriberHealth(
 	ctx context.Context,
 	topicName string,
 	subscriberID string,
-) (*SubscriberHealth, error) {
+) (SubscriberHealth, error) {
 	if err := pq.checkClosed(); err != nil {
-		return nil, err
+		return SubscriberHealth{}, err
 	}
 	if err := validateSubscriberID(subscriberID); err != nil {
-		return nil, err
+		return SubscriberHealth{}, err
 	}
 
 	metadata, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,
 	)
 	if errors.Is(err, ErrQueueNotFound) {
-		return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		return SubscriberHealth{}, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
+		return SubscriberHealth{}, fmt.Errorf("failed to get topic metadata: %w", err)
 	}
 
 	query := buildSubscriberHealthQuery(pq.subTable(metadata.TableName))
 
-	health := &SubscriberHealth{
+	health := SubscriberHealth{
 		TopicName:    topicName,
 		SubscriberID: subscriberID,
 	}
@@ -420,7 +440,7 @@ func (pq *Queue) SubscriberHealth(
 		&lastActivity,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get subscriber health: %w", err)
+		return SubscriberHealth{}, fmt.Errorf("failed to get subscriber health: %w", err)
 	}
 
 	if oldestPending.Valid {

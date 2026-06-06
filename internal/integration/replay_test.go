@@ -408,7 +408,7 @@ func TestT021_ConcurrentReplayDLQNoLossNoDuplication(t *testing.T) {
 	// Two concurrent ReplayDLQ calls
 	var wg sync.WaitGroup
 	wg.Add(2)
-	counts := make([]int, 2)
+	counts := make([]int64, 2)
 	errs := make([]error, 2)
 	for i := range 2 {
 		go func(idx int) {
@@ -913,7 +913,7 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 
 	// The sum of the per-page audit rows' message counts must equal the total
 	// number of messages replayed.
-	totalLogged := 0
+	var totalLogged int64
 	for _, entry := range history {
 		if entry.MessageCount <= 0 {
 			t.Errorf("audit-log row has non-positive message count %d", entry.MessageCount)
@@ -927,7 +927,8 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 
 	// Cross-check directly against the replay log table: same row count and
 	// same message-count sum.
-	var rowCount, dbSum int
+	var rowCount int
+	var dbSum int64
 	if err := db.QueryRowContext(ctx,
 		`SELECT COUNT(*), COALESCE(SUM(message_count), 0)
 		   FROM pgqueue_replay_log

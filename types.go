@@ -31,8 +31,8 @@ const (
 	MessageStatusAcked MessageStatus = "acked"
 )
 
-// TopicOptions holds configuration for a pub/sub topic.
-type TopicOptions struct {
+// topicOptions holds configuration for a pub/sub topic.
+type topicOptions struct {
 	MaxMessageSize  int           // Maximum message size (0 = use default)
 	MaxMetadataSize int           // Maximum marshaled metadata size (0 = use default)
 	TTL             time.Duration // Message time-to-live (0 = no expiration)
@@ -42,8 +42,8 @@ type TopicOptions struct {
 	MaxRetriesSet bool
 }
 
-// ChannelOptions holds configuration for a point-to-point channel.
-type ChannelOptions struct {
+// channelOptions holds configuration for a point-to-point channel.
+type channelOptions struct {
 	MaxMessageSize  int           // Maximum message size (0 = use default)
 	MaxMetadataSize int           // Maximum marshaled metadata size (0 = use default)
 	TTL             time.Duration // Message time-to-live (0 = no expiration)
@@ -180,7 +180,7 @@ type ReplayLog struct {
 	QueueName    string
 	ReplayType   string
 	ReplayParams []byte // json.RawMessage from database
-	MessageCount int
+	MessageCount int64
 	CreatedAt    time.Time
 	CreatedBy    *string // nullable string
 }
@@ -269,6 +269,9 @@ const MaxBatchSize = 1000
 
 // PublishMessage represents a message to be published in a batch operation.
 type PublishMessage struct {
+	// ID optionally sets the message ID for publish-side dedup. The zero value
+	// (uuid.Nil) auto-generates a UUIDv7.
+	ID       uuid.UUID
 	Payload  []byte         // Message payload (required)
 	Metadata map[string]any // Optional message metadata
 }
@@ -276,7 +279,7 @@ type PublishMessage struct {
 // ReplayOptions holds options for replay operations.
 type ReplayOptions struct {
 	DryRun      bool   // If true, return count without performing replay
-	Limit       int    // Maximum number of messages to replay (0 = no limit)
+	Limit       int64  // Maximum number of messages to replay (0 = no limit)
 	PerformedBy string // Who initiated the replay (for audit log)
 }
 

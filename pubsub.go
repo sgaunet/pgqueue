@@ -17,6 +17,9 @@ func (pq *Queue) Subscribe(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return err
 	}
@@ -44,6 +47,9 @@ func (pq *Queue) Unsubscribe(
 	ctx context.Context,
 	topicName, subscriberID string,
 ) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	if err := validateSubscriberID(subscriberID); err != nil {
 		return err
 	}

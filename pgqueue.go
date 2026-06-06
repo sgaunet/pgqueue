@@ -430,7 +430,7 @@ func (pq *Queue) CreateChannel(
 	if err := validateMaxRetries(o.maxRetries); err != nil {
 		return err
 	}
-	co := ChannelOptions{
+	co := channelOptions{
 		MaxMessageSize:  o.maxMessageSize,
 		MaxMetadataSize: o.maxMetadataSize,
 		TTL:             o.ttl,
@@ -461,7 +461,7 @@ func (pq *Queue) CreateTopic(
 	if err := validateMaxRetries(o.maxRetries); err != nil {
 		return err
 	}
-	to := TopicOptions{
+	to := topicOptions{
 		MaxMessageSize:  o.maxMessageSize,
 		MaxMetadataSize: o.maxMetadataSize,
 		TTL:             o.ttl,
@@ -576,6 +576,9 @@ func (pq *Queue) Close() error {
 //
 // Deprecated: Use PauseChannel or PauseTopic instead.
 func (pq *Queue) PauseQueue(ctx context.Context, queueName string, queueType QueueType) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	return pq.setQueuePaused(ctx, queueName, queueType, true)
 }
 
@@ -583,33 +586,51 @@ func (pq *Queue) PauseQueue(ctx context.Context, queueName string, queueType Que
 //
 // Deprecated: Use ResumeChannel or ResumeTopic instead.
 func (pq *Queue) ResumeQueue(ctx context.Context, queueName string, queueType QueueType) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	return pq.setQueuePaused(ctx, queueName, queueType, false)
 }
 
 // PauseChannel pauses a point-to-point channel, preventing new messages from
 // being consumed. Publishing is still allowed while paused.
 func (pq *Queue) PauseChannel(ctx context.Context, name string) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	return pq.setQueuePaused(ctx, name, QueueTypeChannel, true)
 }
 
 // ResumeChannel resumes a paused channel, allowing message consumption again.
 func (pq *Queue) ResumeChannel(ctx context.Context, name string) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	return pq.setQueuePaused(ctx, name, QueueTypeChannel, false)
 }
 
 // PauseTopic pauses a pub/sub topic, preventing new messages from being consumed
 // by any subscriber. Publishing is still allowed while paused.
 func (pq *Queue) PauseTopic(ctx context.Context, name string) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	return pq.setQueuePaused(ctx, name, QueueTypePubSub, true)
 }
 
 // ResumeTopic resumes a paused pub/sub topic, allowing message consumption again.
 func (pq *Queue) ResumeTopic(ctx context.Context, name string) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
 	return pq.setQueuePaused(ctx, name, QueueTypePubSub, false)
 }
 
 // IsQueuePaused returns whether the specified queue is currently paused.
 func (pq *Queue) IsQueuePaused(ctx context.Context, queueName string, queueType QueueType) (bool, error) {
+	if err := pq.checkClosed(); err != nil {
+		return false, err
+	}
 	meta, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
@@ -936,6 +957,18 @@ func (pq *Queue) executeDelete(
 	queueType QueueType,
 	name, tableName string,
 ) error {
+	// Take a shared lock on the migration advisory key so queue deletion cannot
+	// run its DDL concurrently with a schema migration, which holds the same key
+	// exclusively. A migration's dynamic fan-out across per-queue tables snapshots
+	// pgqueue_metadata once; without this lock a queue could be dropped mid-migration
+	// while the migration still references it. Concurrent queue ops share the lock
+	// freely. The lock is released when this transaction ends.
+	if _, err := tx.ExecContext(ctx,
+		"SELECT pg_advisory_xact_lock_shared($1)", migrationAdvisoryLockKey,
+	); err != nil {
+		return fmt.Errorf("failed to acquire migration lock: %w", err)
+	}
+
 	// For pub/sub, drop subscription table first (has FK to msg table)
 	if queueType == QueueTypePubSub {
 		//nolint:gosec // G202: table name validated by queueNameRegex
