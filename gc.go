@@ -404,8 +404,9 @@ func (gc *GarbageCollector) collectQueue(
 
 // doCollectQueue is the body of collectQueue. It returns the total rows
 // deleted by the retention policy (purged) and the total timed-out messages
-// reset to pending (reclaimed), plus any error. Factored out so collectQueue
-// can record the metric unconditionally, even on error.
+// reclaimed — reset to pending by resetTimedOutEntries plus those moved to the
+// DLQ by the promote* passes (#11) — plus any error. Factored out so
+// collectQueue can record the metric unconditionally, even on error.
 func (gc *GarbageCollector) doCollectQueue(
 	ctx context.Context,
 	queue QueueMetadata,
@@ -416,6 +417,12 @@ func (gc *GarbageCollector) doCollectQueue(
 	if retErr != nil {
 		return purged, 0, fmt.Errorf("failed to apply retention policy: %w", retErr)
 	}
+
+	// promoted accumulates rows dead-lettered by the promote* passes below.
+	// RecordGCRun documents reclaimed as rows "reset to pending or moved to the
+	// DLQ", so these promotions count toward the reclaimed total alongside the
+	// resetTimedOutEntries reset count (#11).
+	var promoted int64
 
 	if queue.QueueType == QueueTypePubSub {
 		if err := gc.purgeInactiveSubscriptions(
@@ -429,9 +436,11 @@ func (gc *GarbageCollector) doCollectQueue(
 		// Promote timed-out-and-exhausted subscriptions to the DLQ before
 		// resetTimedOutEntries runs, so a still-exhausted subscription is
 		// dead-lettered rather than reset back to pending.
-		if err := gc.promoteExhaustedTopicSubscriptions(ctx, queue); err != nil {
-			return purged, 0, fmt.Errorf("failed to promote exhausted subscriptions: %w", err)
+		n, err := gc.promoteExhaustedTopicSubscriptions(ctx, queue)
+		if err != nil {
+			return purged, n, fmt.Errorf("failed to promote exhausted subscriptions: %w", err)
 		}
+		promoted += n
 	}
 
 	// Promote timed-out-and-exhausted channel messages to the DLQ. This is the
@@ -441,16 +450,18 @@ func (gc *GarbageCollector) doCollectQueue(
 	// Run it before resetTimedOutEntries so a still-exhausted message is
 	// dead-lettered rather than reset back to pending.
 	if queue.QueueType == QueueTypeChannel {
-		if err := gc.promoteExhaustedChannelMessages(ctx, queue.TableName); err != nil {
-			return purged, 0, fmt.Errorf("failed to promote exhausted messages: %w", err)
+		n, err := gc.promoteExhaustedChannelMessages(ctx, queue.TableName)
+		if err != nil {
+			return purged, n, fmt.Errorf("failed to promote exhausted messages: %w", err)
 		}
+		promoted += n
 	}
 
 	reclaimed, resetErr := gc.resetTimedOutEntries(ctx, queue)
 	if resetErr != nil {
-		return purged, reclaimed, resetErr
+		return purged, promoted + reclaimed, resetErr
 	}
-	return purged, reclaimed, nil
+	return purged, promoted + reclaimed, nil
 }
 
 // promoteExhaustedChannelMessagesPageSize bounds the rows promoted to the DLQ
@@ -467,7 +478,7 @@ const promoteExhaustedChannelMessagesPageSize = 100
 func (gc *GarbageCollector) promoteExhaustedChannelMessages(
 	ctx context.Context,
 	tableName string,
-) error {
+) (int64, error) {
 	defaultMax := gc.pq.cfg.defaultMaxRetries
 	selectQuery := fmt.Sprintf(`
 		SELECT id, payload, retry_count, metadata
@@ -481,13 +492,15 @@ func (gc *GarbageCollector) promoteExhaustedChannelMessages(
 		FOR UPDATE SKIP LOCKED
 	`, gc.pq.msgTable(tableName), MessageStatusProcessing, promoteExhaustedChannelMessagesPageSize)
 
+	var total int64
 	for {
 		promoted, err := gc.promoteExhaustedChannelPage(ctx, tableName, selectQuery, defaultMax)
 		if err != nil {
-			return err
+			return total, err
 		}
+		total += int64(promoted)
 		if promoted < promoteExhaustedChannelMessagesPageSize {
-			return nil // backlog exhausted
+			return total, nil // backlog exhausted
 		}
 	}
 }
@@ -585,7 +598,7 @@ const promoteExhaustedTopicSubscriptionsPageSize = 100
 func (gc *GarbageCollector) promoteExhaustedTopicSubscriptions(
 	ctx context.Context,
 	queue QueueMetadata,
-) error {
+) (int64, error) {
 	maxRetries := gc.pq.resolveMaxRetries(&queue)
 	tableName := queue.TableName
 	selectQuery := fmt.Sprintf(`
@@ -602,13 +615,15 @@ func (gc *GarbageCollector) promoteExhaustedTopicSubscriptions(
 	`, gc.pq.subTable(tableName), gc.pq.msgTable(tableName),
 		MessageStatusProcessing, promoteExhaustedTopicSubscriptionsPageSize)
 
+	var total int64
 	for {
 		promoted, err := gc.promoteExhaustedTopicPage(ctx, tableName, selectQuery, maxRetries)
 		if err != nil {
-			return err
+			return total, err
 		}
+		total += int64(promoted)
 		if promoted < promoteExhaustedTopicSubscriptionsPageSize {
-			return nil // backlog exhausted
+			return total, nil // backlog exhausted
 		}
 	}
 }
@@ -1158,27 +1173,37 @@ func (gc *GarbageCollector) purgeInactiveSubscriptions(
 	ctx context.Context,
 	queueName, tableName string,
 ) error {
+	// Paginated like reclaimOrphanTopicMessages (#3): select at most
+	// retentionPurgePageSize matching sub rows by id, lock them with FOR UPDATE
+	// OF s SKIP LOCKED so concurrent workers never block each other, and delete
+	// by those ids. The WHERE predicate is preserved exactly — only rows owned by
+	// an inactive subscriber, never a live-claim processing row whose
+	// visibility_timeout is still in the future.
+	//
 	// Table name derived from a queueNameRegex-validated queue name; injection-safe.
+	subTbl := gc.pq.subTable(tableName)
 	query := fmt.Sprintf(`
 		DELETE FROM %s
-		WHERE subscriber_id IN (
-			SELECT subscriber_id FROM %s
-			WHERE topic_name = $1 AND active = FALSE
+		WHERE id IN (
+			SELECT s.id FROM %s s
+			WHERE s.subscriber_id IN (
+				SELECT subscriber_id FROM %s
+				WHERE topic_name = $1 AND active = FALSE
+			)
+			AND NOT (s.status = '%s' AND s.visibility_timeout > NOW())
+			ORDER BY s.id
+			LIMIT %d
+			FOR UPDATE OF s SKIP LOCKED
 		)
-		AND NOT (status = '%s' AND visibility_timeout > NOW())
-	`, gc.pq.subTable(tableName), gc.pq.globalTable("pgqueue_subscribers"), MessageStatusProcessing)
+	`, subTbl, subTbl, gc.pq.globalTable("pgqueue_subscribers"),
+		MessageStatusProcessing, retentionPurgePageSize)
 
-	result, err := gc.pq.db.ExecContext(ctx, query, queueName)
+	total, err := gc.runPagedPurge(ctx, query, queueName)
 	if err != nil {
 		return fmt.Errorf("failed to purge inactive subscriptions: %w", err)
 	}
-
-	rows, raErr := rowsAffectedOrErr(result)
-	if raErr != nil {
-		gc.pq.logError("purge inactive subscriptions rows affected",
-			"table", tableName, "error", raErr)
-	} else if rows > 0 {
-		gc.pq.logInfo("purged inactive subscriptions", "count", rows, "table", tableName)
+	if total > 0 {
+		gc.pq.logInfo("purged inactive subscriptions", "count", total, "table", tableName)
 	}
 
 	return nil

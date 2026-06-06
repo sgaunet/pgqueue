@@ -56,7 +56,13 @@ func (pq *Queue) PublishBatch(
 		return nil, err
 	}
 
-	return pq.publishBatchResolved(ctx, queueMeta, messages)
+	ctx, span := pq.startSpan(ctx, "pgqueue.publish_batch", StringAttr("queue", queueName))
+	ids, err := pq.publishBatchResolved(ctx, queueMeta, messages)
+	pq.endSpan(span, err)
+	if err == nil {
+		pq.recordPublish(queueName, len(messages))
+	}
+	return ids, err
 }
 
 // publishBatchResolved publishes a batch once the queue metadata has been
@@ -69,12 +75,16 @@ func (pq *Queue) publishBatchResolved(
 	queueMeta *QueueMetadata,
 	messages []PublishMessage,
 ) ([]uuid.UUID, error) {
+	// Resolve the payload-size cap once for the whole batch rather than
+	// re-unmarshaling the queue config per message in the hot path.
+	maxMsgSize := pq.resolveMaxMessageSize(queueMeta)
+
 	// Validate all payloads upfront before any DB work.
 	for i := range messages {
 		if messages[i].Payload == nil {
 			return nil, ErrNilPayload
 		}
-		if err := pq.validatePayloadSize(queueMeta, messages[i].Payload); err != nil {
+		if err := checkPayloadSize(maxMsgSize, messages[i].Payload); err != nil {
 			return nil, err
 		}
 	}
@@ -148,7 +158,7 @@ func (pq *Queue) ackChannelBatch(
 		WHERE m.id = u.id
 		  AND m.claim_id = u.claim_id
 		  AND m.status = '%s'
-		RETURNING m.id
+		RETURNING m.id, m.claim_id
 	`, pq.msgTable(queueMeta.TableName), MessageStatusCompleted, MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimLiterals(receipts)
@@ -164,28 +174,40 @@ func (pq *Queue) ackChannelBatch(
 		})
 }
 
-// queryMatchedIDs runs an UPDATE ... RETURNING id (or a SELECT id) and collects
-// the returned message IDs into a set, used to learn which receipts a batch
-// statement actually matched.
+// matchKey identifies a receipt by the full (MessageID, ClaimID) pair. Keying
+// the matched set on the message ID alone would misclassify a stale receipt
+// (same message, older claim) as Succeeded when a live receipt for the same
+// message is also in the batch; both the ack UPDATE and the nack state JOIN
+// match on the full pair, so the matched set must too. Index 0 is the message
+// id, index 1 the claim id.
+type matchKey [2]uuid.UUID
+
+func receiptMatchKey(r Receipt) matchKey {
+	return matchKey{r.MessageID, r.ClaimID}
+}
+
+// queryMatchedIDs runs an UPDATE ... RETURNING id, claim_id (or a SELECT) and
+// collects the returned (id, claim_id) pairs into a set, used to learn which
+// receipts a batch statement actually matched.
 func queryMatchedIDs(
 	ctx context.Context,
 	tx *sql.Tx,
 	query string,
 	args ...any,
-) (map[uuid.UUID]bool, error) {
+) (map[matchKey]bool, error) {
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query matched ids: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	matched := make(map[uuid.UUID]bool)
+	matched := make(map[matchKey]bool)
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var id, claimID uuid.UUID
+		if err := rows.Scan(&id, &claimID); err != nil {
 			return nil, fmt.Errorf("failed to scan matched id: %w", err)
 		}
-		matched[id] = true
+		matched[matchKey{id, claimID}] = true
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate matched ids: %w", err)
@@ -193,21 +215,25 @@ func queryMatchedIDs(
 	return matched, nil
 }
 
-// finishBatch partitions receipts into Succeeded (those whose message ID is in
-// matched) and Failed (classified via classify), commits tx, and records the
-// skipped-receipt metric. Input order is preserved within Succeeded and Failed.
-// classify is invoked only when there are misses.
+// finishBatch partitions receipts into Succeeded (those whose (MessageID,
+// ClaimID) pair is in matched) and Failed (classified via classify), commits
+// tx, and records the skipped-receipt metric. Input order is preserved within
+// Succeeded and Failed. classify is invoked only when there are misses.
 func (pq *Queue) finishBatch(
 	tx *sql.Tx,
 	queueName string,
 	receipts []Receipt,
-	matched map[uuid.UUID]bool,
+	matched map[matchKey]bool,
 	classify func(misses []Receipt) ([]FailedReceipt, error),
 ) (BatchResult, error) {
 	var res BatchResult
 	var misses []Receipt
 	for _, r := range receipts {
-		if matched[r.MessageID] {
+		// Membership is keyed on the full (MessageID, ClaimID) pair so a stale
+		// receipt — same message, older claim, e.g. after a redelivery — falls
+		// through to the classify path and is reported ErrClaimExpired rather
+		// than Succeeded.
+		if matched[receiptMatchKey(r)] {
 			res.Succeeded = append(res.Succeeded, r)
 		} else {
 			misses = append(misses, r)
@@ -289,7 +315,7 @@ func (pq *Queue) ackTopicBatch(
 		  AND s.claim_id = u.claim_id
 		  AND s.subscriber_id = $3
 		  AND s.status = '%s'
-		RETURNING s.message_id
+		RETURNING s.message_id, s.claim_id
 	`, pq.subTable(queueMeta.TableName), MessageStatusAcked, MessageStatusProcessing)
 
 	ids, claims := receiptsToIDClaimLiterals(receipts)
@@ -358,9 +384,9 @@ func (pq *Queue) nackChannelBatch(
 		return BatchResult{}, err
 	}
 
-	matched := make(map[uuid.UUID]bool, len(states))
+	matched := make(map[matchKey]bool, len(states))
 	for _, s := range states {
-		matched[s.id] = true
+		matched[matchKey{s.id, s.claimID}] = true
 	}
 
 	msgTable := pq.msgTable(queueMeta.TableName)
@@ -426,9 +452,9 @@ func (pq *Queue) nackTopicBatch(
 		return BatchResult{}, err
 	}
 
-	matched := make(map[uuid.UUID]bool, len(states))
+	matched := make(map[matchKey]bool, len(states))
 	for _, s := range states {
-		matched[s.messageID] = true
+		matched[matchKey{s.messageID, s.claimID}] = true
 	}
 
 	subTable := pq.subTable(queueMeta.TableName)
@@ -531,14 +557,26 @@ func (pq *Queue) prepareBatchMessages(
 	ids := make([]uuid.UUID, len(messages))
 	metadataJSONs := make([][]byte, len(messages))
 
+	// Resolve the metadata-size cap once for the whole batch rather than
+	// re-unmarshaling the queue config per message in the hot path.
+	maxMetaSize := pq.resolveMaxMetadataSize(queueMeta)
+
 	for i := range messages {
-		id, err := NewUUIDv7()
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to generate message ID: %w", err)
+		// A caller-supplied ID is honored for publish-side dedup; uuid.Nil means
+		// auto-generate a UUIDv7. Duplicate IDs are rejected by the INSERT's
+		// ON CONFLICT (id) DO NOTHING + rowsAffected check (ErrDuplicateMessageID).
+		id := messages[i].ID
+		if id == uuid.Nil {
+			var err error
+			id, err = NewUUIDv7()
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to generate message ID: %w", err)
+			}
 		}
 		ids[i] = id
 
-		metadataJSONs[i], err = pq.marshalAndValidateMetadata(queueMeta, messages[i].Metadata)
+		var err error
+		metadataJSONs[i], err = marshalMetadataWithLimit(maxMetaSize, messages[i].Metadata)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -747,6 +785,7 @@ func (pq *Queue) insertSubscriptionRecords(
 
 type batchMessageState struct {
 	id           uuid.UUID
+	claimID      uuid.UUID
 	retryCount   int
 	maxRetries   sql.NullInt64
 	payload      []byte
@@ -770,7 +809,7 @@ func (pq *Queue) fetchBatchMessageStates(
 	// (the message was reclaimed by another consumer) is simply not returned.
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		SELECT m.id, m.retry_count, m.max_retries, m.payload, m.metadata
+		SELECT m.id, m.claim_id, m.retry_count, m.max_retries, m.payload, m.metadata
 		FROM %s AS m
 		JOIN unnest($1::text::uuid[], $2::text::uuid[]) AS u(id, claim_id)
 		  ON m.id = u.id AND m.claim_id = u.claim_id
@@ -789,7 +828,7 @@ func (pq *Queue) fetchBatchMessageStates(
 	for rows.Next() {
 		var s batchMessageState
 		if err := rows.Scan(
-			&s.id, &s.retryCount, &s.maxRetries,
+			&s.id, &s.claimID, &s.retryCount, &s.maxRetries,
 			&s.payload, &s.metadataJSON,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
@@ -890,6 +929,7 @@ func (pq *Queue) batchMoveToDLQ(
 
 type batchSubState struct {
 	messageID    uuid.UUID
+	claimID      uuid.UUID
 	retryCount   int
 	payload      []byte
 	metadataJSON sql.NullString
@@ -906,7 +946,7 @@ func (pq *Queue) fetchBatchSubStates(
 	// matches (the subscription was reclaimed) is simply not returned.
 	//nolint:gosec // G201: table name validated by queueNameRegex
 	query := fmt.Sprintf(`
-		SELECT s.message_id, s.retry_count, m.payload, m.metadata
+		SELECT s.message_id, s.claim_id, s.retry_count, m.payload, m.metadata
 		FROM %s s
 		JOIN %s m ON s.message_id = m.id
 		JOIN unnest($1::text::uuid[], $2::text::uuid[]) AS u(message_id, claim_id)
@@ -927,7 +967,7 @@ func (pq *Queue) fetchBatchSubStates(
 	for rows.Next() {
 		var s batchSubState
 		if err := rows.Scan(
-			&s.messageID, &s.retryCount,
+			&s.messageID, &s.claimID, &s.retryCount,
 			&s.payload, &s.metadataJSON,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan subscription: %w", err)

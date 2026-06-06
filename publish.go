@@ -46,7 +46,7 @@ func (pq *Queue) Publish(
 
 	ctx, span := pq.startSpan(ctx, "pgqueue.publish", StringAttr("queue", queueName))
 	id, err := pq.publishResolved(ctx, queueName, payload, o.messageID, o.metadata)
-	endSpan(span, err)
+	pq.endSpan(span, err)
 	if err == nil {
 		pq.recordPublish(queueName, 1)
 	}
@@ -129,10 +129,10 @@ func (pq *Queue) resolveQueueMetadata(
 	return &meta, nil
 }
 
-func (pq *Queue) validatePayloadSize(
-	queueMeta *QueueMetadata,
-	payload []byte,
-) error {
+// resolveMaxMessageSize returns the effective payload-size cap for a queue,
+// preferring the per-queue MaxMessageSize from its stored config and falling
+// back to the queue-wide cap.
+func (pq *Queue) resolveMaxMessageSize(queueMeta *QueueMetadata) int {
 	var config struct {
 		MaxMessageSize int `json:"MaxMessageSize"`
 	}
@@ -146,15 +146,25 @@ func (pq *Queue) validatePayloadSize(
 	if config.MaxMessageSize == 0 {
 		config.MaxMessageSize = pq.cfg.maxMessageSize
 	}
+	return config.MaxMessageSize
+}
 
-	if len(payload) > config.MaxMessageSize {
+// checkPayloadSize rejects a payload that exceeds the already-resolved cap.
+func checkPayloadSize(maxMessageSize int, payload []byte) error {
+	if len(payload) > maxMessageSize {
 		return fmt.Errorf(
 			"size %d exceeds limit %d: %w",
-			len(payload), config.MaxMessageSize, ErrMessageSizeExceeded,
+			len(payload), maxMessageSize, ErrMessageSizeExceeded,
 		)
 	}
-
 	return nil
+}
+
+func (pq *Queue) validatePayloadSize(
+	queueMeta *QueueMetadata,
+	payload []byte,
+) error {
+	return checkPayloadSize(pq.resolveMaxMessageSize(queueMeta), payload)
 }
 
 // resolveMaxMetadataSize returns the effective metadata-size cap for a queue,
@@ -183,11 +193,21 @@ func (pq *Queue) marshalAndValidateMetadata(
 	if metadata == nil {
 		return nil, nil
 	}
+	return marshalMetadataWithLimit(pq.resolveMaxMetadataSize(queueMeta), metadata)
+}
+
+// marshalMetadataWithLimit marshals metadata to JSON and rejects it against an
+// already-resolved cap (limit <= 0 disables the check). A nil metadata map
+// returns (nil, nil). Batch callers resolve the cap once and reuse it across
+// every message rather than re-unmarshaling the queue config per message.
+func marshalMetadataWithLimit(limit int, metadata map[string]any) ([]byte, error) {
+	if metadata == nil {
+		return nil, nil
+	}
 	metadataJSON, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal metadata: %w", err)
 	}
-	limit := pq.resolveMaxMetadataSize(queueMeta)
 	if limit > 0 && len(metadataJSON) > limit {
 		return nil, fmt.Errorf(
 			"size %d exceeds limit %d: %w",

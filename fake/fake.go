@@ -3,9 +3,27 @@
 // so code that depends on pgqueue can be unit-tested without a PostgreSQL
 // database or Docker (FR-021).
 //
-// fake.Queue reproduces the documented queue semantics — publish, single-shot
-// and handler-based consume, ack/nack, retry with DLQ promotion at exactly
-// max-retries, fan-out per subscriber, and pause/resume.
+// fake.Queue reproduces the documented queue semantics — publish (including
+// WithMessageID publish-side dedup and WithMessageMetadata propagation),
+// single-shot and handler-based consume, ack/nack, retry with DLQ promotion at
+// exactly max-retries, fan-out per subscriber, and pause/resume.
+//
+// One narrow dedup divergence: the fake tracks live messages (pending, claimed,
+// DLQ) rather than a persistent message table, so a duplicate WithMessageID is
+// rejected with ErrDuplicateMessageID only while the original is still present.
+// Re-publishing the same ID after it was acked and removed succeeds against the
+// fake, whereas the real Queue keeps rejecting it until the row is garbage
+// collected. Tests that depend on that long-lived rejection should use the real
+// Queue (see the internal/integration suite). For topics the fake derives this
+// dedup from per-subscriber delivery state rather than a topic-level message
+// table, so a duplicate publish to a topic that currently has no subscribers is
+// never rejected (there is no subscriber state to check against), whereas the
+// real Queue would reject it against the persistent message table.
+//
+// The fake also applies a single global retry cap (WithMaxRetries) to every
+// channel and topic. It cannot reproduce the real Queue's per-queue
+// WithQueueMaxRetries override, and the reported Message.MaxRetries always
+// reflects the global cap rather than a per-queue value.
 //
 // It deliberately does NOT model visibility-timeout reclamation on a wall
 // clock: a claimed message stays claimed until it is explicitly acked or
@@ -74,6 +92,29 @@ type channel struct {
 
 func newChannel() *channel {
 	return &channel{claimed: make(map[uuid.UUID]*entry)}
+}
+
+// hasMessage reports whether an entry with id currently lives in this channel's
+// pending, claimed, or DLQ state. It backs the fake's publish-side dedup, which
+// mirrors the real Queue's ON CONFLICT (id) DO NOTHING rejection. Like the real
+// message table it only sees messages still present: an entry that was acked and
+// removed is no longer tracked, so a same-ID re-publish after full consumption is
+// not detected — a deliberate divergence noted in the package doc.
+func (c *channel) hasMessage(id uuid.UUID) bool {
+	for _, e := range c.pending {
+		if e.id == id {
+			return true
+		}
+	}
+	if _, ok := c.claimed[id]; ok {
+		return true
+	}
+	for _, e := range c.dlq {
+		if e.id == id {
+			return true
+		}
+	}
+	return false
 }
 
 // topic is an in-memory pub/sub topic: one payload store, fan-out per subscriber.
@@ -161,29 +202,51 @@ func (q *Queue) Subscribe(_ context.Context, topicName, subscriberID string) err
 // copy in each current subscriber's queue; any other name is treated as a
 // channel and created on first use.
 func (q *Queue) Publish(
-	_ context.Context, name string, payload []byte, _ ...pgqueue.PublishOption,
+	_ context.Context, name string, payload []byte, opts ...pgqueue.PublishOption,
 ) (uuid.UUID, error) {
 	if payload == nil {
 		return uuid.UUID{}, pgqueue.ErrNilPayload
 	}
-	// Mirror the production schema, which stamps message IDs with uuidv7() so
-	// "ORDER BY id" reflects insertion order; v4 would break that contract
-	// for any consumer that exercises ordering against the fake.
-	id, err := pgqueue.NewUUIDv7()
-	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("fake: generate message id: %w", err)
+	// Honor WithMessageID / WithMessageMetadata exactly as the real Queue does:
+	// resolve them through the library's own resolver so the fake cannot silently
+	// diverge from publish-side dedup and metadata propagation.
+	id, meta := pgqueue.ResolvePublishOptions(opts...)
+	if id == uuid.Nil {
+		// No caller-supplied ID: mint a uuidv7() like the production schema so
+		// "ORDER BY id" reflects insertion order; v4 would break that contract
+		// for any consumer that exercises ordering against the fake.
+		var err error
+		id, err = pgqueue.NewUUIDv7()
+		if err != nil {
+			return uuid.UUID{}, fmt.Errorf("fake: generate message id: %w", err)
+		}
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if t, ok := q.topics[name]; ok {
+		// The real Queue dedups against the topic's single persistent message
+		// table. The fake has no such table, so it derives dedup from per-
+		// subscriber delivery state: a duplicate ID is rejected if any current
+		// subscriber still holds it (pending, claimed, or DLQ). Check every
+		// subscriber and reject before mutating any. Two known divergences follow
+		// from this (both noted in the package doc): a re-publish after every
+		// subscriber has acked the original succeeds, and a duplicate publish to a
+		// subscriber-less topic is never rejected.
 		for _, sub := range t.subs {
-			// Each subscriber gets an independent copy of the payload so a consumer
-			// mutating one delivered message cannot corrupt a fan-out sibling (R-16).
+			if sub.hasMessage(id) {
+				return uuid.UUID{}, fmt.Errorf("%s: %w", id, pgqueue.ErrDuplicateMessageID)
+			}
+		}
+		for _, sub := range t.subs {
+			// Each subscriber gets an independent copy of the payload and metadata
+			// so a consumer mutating one delivered message cannot corrupt a fan-out
+			// sibling (R-16).
 			sub.pending = append(sub.pending, &entry{
-				id:      id,
-				payload: cloneBytes(payload),
-				status:  pgqueue.MessageStatusPending,
+				id:       id,
+				payload:  cloneBytes(payload),
+				metadata: cloneMetadata(meta),
+				status:   pgqueue.MessageStatusPending,
 			})
 		}
 		return id, nil
@@ -194,10 +257,14 @@ func (q *Queue) Publish(
 		ch = newChannel()
 		q.channels[name] = ch
 	}
+	if ch.hasMessage(id) {
+		return uuid.UUID{}, fmt.Errorf("%s: %w", id, pgqueue.ErrDuplicateMessageID)
+	}
 	ch.pending = append(ch.pending, &entry{
-		id:      id,
-		payload: cloneBytes(payload),
-		status:  pgqueue.MessageStatusPending,
+		id:       id,
+		payload:  cloneBytes(payload),
+		metadata: cloneMetadata(meta),
+		status:   pgqueue.MessageStatusPending,
 	})
 	return id, nil
 }
@@ -286,8 +353,38 @@ func (q *Queue) Nack(
 	e.retryCount++
 	e.claimID = uuid.UUID{}
 	e.status = pgqueue.MessageStatusPending
-	ch.pending = append(ch.pending, e)
+	// The real Queue re-selects pending rows with ORDER BY id (UUIDv7,
+	// chronological), and a nacked message keeps its original id, so it sorts
+	// back to its original position ahead of later-published messages. Mirror
+	// that by inserting into ch.pending sorted by id rather than tail-appending;
+	// the head-claim in claim() then still pops the oldest pending entry.
+	insertSortedByID(ch, e)
 	return nil
+}
+
+// insertSortedByID inserts e into ch.pending keeping the slice ordered by id,
+// placing e before the first existing entry whose id is greater. This mirrors
+// the real Queue's ORDER BY id selection so a redelivered (nacked) message
+// keeps its chronological position relative to later-published messages.
+func insertSortedByID(ch *channel, e *entry) {
+	i := 0
+	for i < len(ch.pending) && bytesLess(ch.pending[i].id, e.id) {
+		i++
+	}
+	ch.pending = append(ch.pending, nil)
+	copy(ch.pending[i+1:], ch.pending[i:])
+	ch.pending[i] = e
+}
+
+// bytesLess reports whether UUID a sorts before UUID b in byte order, matching
+// PostgreSQL's ordering of the uuid type (and therefore ORDER BY id).
+func bytesLess(a, b uuid.UUID) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
 }
 
 // ConsumeChannel runs a handler-driven loop over a channel: it fetches each

@@ -115,6 +115,21 @@ func applyPublishOptions(opts []PublishOption) publishOpts {
 	return o
 }
 
+// ResolvePublishOptions resolves a slice of PublishOption into the concrete
+// message ID and metadata they specify. It returns the message ID first and the
+// metadata second: a zero message ID (uuid.Nil) means no WithMessageID was
+// supplied and the caller should generate a UUIDv7, and a nil metadata map means
+// no WithMessageMetadata was supplied.
+//
+// Publish applies these options internally; ResolvePublishOptions is exported
+// chiefly so in-memory test doubles (the fake package) can honor WithMessageID
+// and WithMessageMetadata with the same semantics as the real Queue, rather than
+// silently discarding them.
+func ResolvePublishOptions(opts ...PublishOption) (uuid.UUID, map[string]any) {
+	o := applyPublishOptions(opts)
+	return o.messageID, o.metadata
+}
+
 // ConsumeOption is a per-consume option applied to Receive*/Consume* calls.
 type ConsumeOption func(*consumeOpts)
 

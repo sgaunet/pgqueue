@@ -439,10 +439,17 @@ func TestAckChannelBatchTooLarge(t *testing.T) {
 	}
 
 	// Every receipt carries the same channel binding so AckBatch groups them
-	// into a single over-limit batch and reaches the size guard.
+	// into a single over-limit batch and reaches the size guard. The message IDs
+	// must be distinct: AckBatch collapses exact-duplicate receipts before the
+	// size check, so identical receipts would dedup down to one and never reach
+	// the guard.
 	receipts := make([]pgqueue.Receipt, pgqueue.MaxBatchSize+1)
 	for i := range receipts {
-		receipts[i] = pgqueue.Receipt{QueueName: "ack-large", QueueType: pgqueue.QueueTypeChannel}
+		receipts[i] = pgqueue.Receipt{
+			MessageID: uuid.New(),
+			QueueName: "ack-large",
+			QueueType: pgqueue.QueueTypeChannel,
+		}
 	}
 
 	_, err = pq.AckBatch(ctx, receipts)
@@ -665,6 +672,56 @@ func TestNackChannelBatchMixedRetryAndDLQ(t *testing.T) {
 	}
 	if stats.DLQCount != 3 {
 		t.Errorf("expected 3 in DLQ, got %d", stats.DLQCount)
+	}
+	if stats.PendingCount != 0 {
+		t.Errorf("expected 0 pending, got %d", stats.PendingCount)
+	}
+}
+
+// TestNackBatchDuplicateReceiptSingleDLQ is the regression for the duplicate-
+// receipt DLQ-doubling bug: passing the same receipt twice in one NackBatch must
+// move the message to the DLQ exactly once. Before the fix the duplicated
+// (id, claim_id) pair unnest-joined to two state rows for the single locked
+// message and the row-by-row DLQ insert wrote it twice.
+func TestNackBatchDuplicateReceiptSingleDLQ(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// maxRetries 0 → a single nack dead-letters immediately.
+	err := pq.CreateChannel(ctx, "nack-dup",
+		pgqueue.WithQueueMaxMessageSize(testMaxMessageSize), pgqueue.WithQueueMaxRetries(0))
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	if _, err := pq.PublishBatch(ctx, "nack-dup",
+		[]pgqueue.PublishMessage{{Payload: []byte("poison")}}); err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+
+	msg, err := pq.ReceiveChannel(ctx, "nack-dup", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if err != nil {
+		t.Fatalf("ReceiveChannel failed: %v", err)
+	}
+
+	// Same receipt twice in one batch — a caller mistake the batch must tolerate.
+	res, err := pq.NackBatch(ctx, []pgqueue.Receipt{msg.Receipt(), msg.Receipt()}, "poison")
+	if err != nil {
+		t.Fatalf("NackBatch failed: %v", err)
+	}
+	if len(res.Succeeded) != 1 || len(res.Failed) != 0 {
+		t.Fatalf("NackBatch result = %d succeeded, %d failed; want 1, 0 (duplicate collapsed)",
+			len(res.Succeeded), len(res.Failed))
+	}
+
+	stats, err := pq.Stats(ctx, "nack-dup", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("Stats failed: %v", err)
+	}
+	if stats.DLQCount != 1 {
+		t.Errorf("expected exactly 1 message in DLQ, got %d", stats.DLQCount)
 	}
 	if stats.PendingCount != 0 {
 		t.Errorf("expected 0 pending, got %d", stats.PendingCount)

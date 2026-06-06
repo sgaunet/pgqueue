@@ -74,12 +74,33 @@ const findInvalidIndexesSQL = `
 //
 // Note that recreating an index takes the same locks as the original CREATE
 // INDEX, briefly blocking writes to that one table while it rebuilds.
+//
+// Like InitSchema's automatic repair pass, this serializes on the migration
+// advisory lock held over a dedicated connection, so a concurrent RepairIndexes
+// (or a concurrent InitSchema repair) cannot drop a peer's freshly recreated
+// index or collide on the recreate (42P07).
 func (pq *Queue) RepairIndexes(ctx context.Context) (RepairResult, error) {
 	if err := pq.checkClosed(); err != nil {
 		return RepairResult{}, err
 	}
 
-	return repairInvalidIndexes(ctx, pq.db, pq.cfg.schemaName, pq.logger)
+	// A pooled handle would let concurrent repairs race on the drop/recreate, so
+	// take the same session-level advisory lock the migration path uses, held on
+	// a dedicated connection for the duration of the repair. The lock is released
+	// (and the connection returned to the pool) on every return path below.
+	conn, err := pq.db.Conn(ctx)
+	if err != nil {
+		return RepairResult{}, fmt.Errorf("failed to acquire repair connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	releaseLock, err := acquireMigrationLock(ctx, conn, pq.logger)
+	if err != nil {
+		return RepairResult{}, err
+	}
+	defer releaseLock()
+
+	return repairInvalidIndexes(ctx, conn, pq.cfg.schemaName, pq.logger)
 }
 
 // repairIndexesAfterMigrations runs the index-repair pass on the advisory-locked

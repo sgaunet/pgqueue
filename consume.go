@@ -165,7 +165,7 @@ func (pq *Queue) ackReceipt(ctx context.Context, r Receipt) error {
 		err = ErrReceiptMissingQueueType
 	}
 
-	endSpan(span, err)
+	pq.endSpan(span, err)
 	if err == nil {
 		pq.recordAck(r.QueueName, true)
 	}
@@ -212,7 +212,7 @@ func (pq *Queue) nackReceipt(
 		err = ErrReceiptMissingQueueType
 	}
 
-	endSpan(span, err)
+	pq.endSpan(span, err)
 	if err == nil {
 		pq.recordAck(r.QueueName, false)
 	}
@@ -235,10 +235,23 @@ type receiptGroupKey struct {
 // un-acked, to be needlessly redelivered after the visibility timeout).
 func groupReceiptsByQueue(rs []Receipt) (map[receiptGroupKey][]Receipt, error) {
 	groups := make(map[receiptGroupKey][]Receipt)
+	// Collapse exact-duplicate receipts so a caller that passes the same receipt
+	// twice does not drive its message through the batch twice. A duplicated
+	// receipt in a Nack batch otherwise unnest-joins to two state rows for the one
+	// locked message and moves it to the DLQ more than once — the set-based Ack and
+	// retry UPDATEs touch each target row once and are immune, but the row-by-row
+	// DLQ insert is not. BatchResult already documents receipts as unique within a
+	// batch, so collapsing duplicates here honors that contract rather than
+	// changing it. Receipt is fully comparable, so its value is the dedup key.
+	seen := make(map[Receipt]bool, len(rs))
 	for _, r := range rs {
 		if r.QueueType != QueueTypeChannel && r.QueueType != QueueTypePubSub {
 			return nil, ErrReceiptMissingQueueType
 		}
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
 		k := receiptGroupKey{qt: r.QueueType, queueName: r.QueueName, subscriberID: r.SubscriberID}
 		groups[k] = append(groups[k], r)
 	}
@@ -689,7 +702,7 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	herr := pq.callHandler(ctx, h, msg)
 	pq.recordHandle(receipt.QueueName, time.Since(start))
 	pq.recordDeliveryLatency(receipt.QueueName, msg.CreatedAt, start)
-	endSpan(span, herr)
+	pq.endSpan(span, herr)
 
 	// Detach from cancellation so a handler that finished as shutdown began
 	// still records its result, but cap the wait: an uncancellable, unbounded

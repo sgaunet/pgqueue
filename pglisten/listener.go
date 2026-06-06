@@ -589,32 +589,56 @@ func (l *Listener) reconnect() bool {
 		// any queued UNLISTENs are moot (#52).
 		l.confirmed = make(map[string]bool)
 		l.unpending = nil
-		// Re-LISTEN every channel still in the active set. Carry over the done
-		// channel of any request still waiting for confirmation so its Listen
-		// caller is signalled once the re-LISTEN lands instead of blocking
-		// until its ctx fires; channels with no waiter re-LISTEN with nil done.
-		waiters := make(map[string]chan error, len(l.pending))
-		for _, req := range l.pending {
-			if req.done != nil {
-				waiters[req.channel] = req.done
-			}
-		}
-		l.pending = make([]listenReq, 0, len(l.channels))
-		for ch := range l.channels {
-			l.pending = append(l.pending, listenReq{channel: ch, done: waiters[ch]})
-			delete(waiters, ch)
-		}
-		// Any leftover waiter is for a channel no longer in the active set
-		// (concurrently Unlistened); signal it so the caller unblocks.
-		for _, done := range waiters {
-			done <- nil
-		}
+		l.rebuildPendingForReconnect()
 		l.mu.Unlock()
 		// Notify the hook after releasing the lock so the callback never
 		// blocks while holding l.mu. onReconnect is never nil (New defaults it
 		// to a no-op).
 		l.onReconnect(attempt + 1)
 		return true
+	}
+}
+
+// rebuildPendingForReconnect re-queues a LISTEN request for every channel still
+// in the active set after a fresh connection, carrying over the done channels of
+// any requests still waiting for confirmation so their Listen callers are
+// signalled once the re-LISTEN lands instead of blocking until their ctx fires.
+// Channels with no waiter re-LISTEN with a nil done.
+//
+// A single channel may have more than one waiter: concurrent Listen calls for
+// the same channel each queue a distinct request (Listen does not dedup
+// in-flight requests). Every waiter must be carried over — keying by channel and
+// keeping only the last would strand the other callers indefinitely, since the
+// steady-state drainPending signals one done per request and the reconnect path
+// must match that. Each waiter rides its own re-LISTEN request; the duplicate
+// LISTEN is a harmless no-op on the server.
+//
+// The caller must hold l.mu.
+func (l *Listener) rebuildPendingForReconnect() {
+	waiters := make(map[string][]chan error, len(l.pending))
+	for _, req := range l.pending {
+		if req.done != nil {
+			waiters[req.channel] = append(waiters[req.channel], req.done)
+		}
+	}
+	l.pending = make([]listenReq, 0, len(l.channels))
+	for ch := range l.channels {
+		dones := waiters[ch]
+		delete(waiters, ch)
+		if len(dones) == 0 {
+			l.pending = append(l.pending, listenReq{channel: ch})
+			continue
+		}
+		for _, done := range dones {
+			l.pending = append(l.pending, listenReq{channel: ch, done: done})
+		}
+	}
+	// Any leftover waiters are for channels no longer in the active set
+	// (concurrently Unlistened); signal each so its caller unblocks.
+	for _, dones := range waiters {
+		for _, done := range dones {
+			done <- nil
+		}
 	}
 }
 
