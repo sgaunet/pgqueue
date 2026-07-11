@@ -145,6 +145,51 @@ func (pq *Queue) ackChannel(
 	})
 }
 
+// extendChannelVisibility resets an in-flight channel message's visibility lease
+// to d from now, fenced on the caller's claim. It mirrors ackChannel: the UPDATE
+// touches only visibility_timeout (never status/retry_count/claim_id), so it is
+// not a delivery attempt and leaves the caller's receipt valid. A miss is
+// classified in the same transaction so a concurrent reclaim cannot flip the
+// error type (R-09) — a lapsed/reclaimed claim yields ErrClaimExpired.
+func (pq *Queue) extendChannelVisibility(
+	ctx context.Context,
+	channelName string,
+	r Receipt,
+	d time.Duration,
+) error {
+	tableName, err := pq.cachedTableName(ctx, string(QueueTypeChannel), channelName)
+	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("channel/%s: %w", channelName, ErrQueueNotFound)
+		}
+		return fmt.Errorf("failed to get channel metadata: %w", err)
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		UPDATE %s
+		SET visibility_timeout = NOW() + make_interval(secs => $3)
+		WHERE id = $1 AND claim_id = $2 AND status = '%s'
+	`, pq.msgTable(tableName), MessageStatusProcessing)
+
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, query, r.MessageID, r.ClaimID, d.Seconds())
+		if err != nil {
+			return fmt.Errorf("failed to extend visibility timeout: %w", err)
+		}
+
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+		if rows == 0 {
+			return classifyChannelAckMiss(ctx, tx, pq.msgTable(tableName), r)
+		}
+
+		return nil
+	})
+}
+
 // nackChannelWithOpts is the option-aware nack used by the queue-agnostic Nack.
 // WithRetryDelay overrides the computed backoff delay (FR-023).
 func (pq *Queue) nackChannelWithOpts(
@@ -327,10 +372,12 @@ func scanChannelCandidate(scanner interface{ Scan(dest ...any) error }, c *chann
 //   - reclaimQuery selects a still-'processing' message whose visibility timeout
 //     has expired (the previous consumer crashed or never acked).
 //
-// Both order by id and LIMIT 1 FOR UPDATE SKIP LOCKED, and both carry the same
-// optional ttl cutoff so a message past its TTL is delivered by neither probe —
-// exactly the semantics of the previous combined query, whose trailing ttl
-// clause was ANDed with both OR branches.
+// The pending probe orders by (available_at, id) and the reclaim probe by
+// (visibility_timeout, id); each ordering matches its partial index's leading
+// range key (#11), so the eligibility predicate is a scan boundary rather than a
+// Filter and ineligible (backoff-sleeping / still-in-flight) rows are never
+// visited. Both LIMIT 1 FOR UPDATE SKIP LOCKED, and both carry the same optional
+// ttl cutoff so a message past its TTL is delivered by neither probe.
 func channelConsumeQueries(msgTable string, ttl time.Duration) (string, string, []any) {
 	args := []any{}
 	ttlClause := ""
@@ -347,7 +394,7 @@ func channelConsumeQueries(msgTable string, ttl time.Duration) (string, string, 
 		FROM %s
 		WHERE status = '%s' AND available_at <= NOW()
 		  %s
-		ORDER BY id
+		ORDER BY available_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
 	`, cols, msgTable, MessageStatusPending, ttlClause)
@@ -357,7 +404,7 @@ func channelConsumeQueries(msgTable string, ttl time.Duration) (string, string, 
 		FROM %s
 		WHERE status = '%s' AND visibility_timeout < NOW()
 		  %s
-		ORDER BY id
+		ORDER BY visibility_timeout, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
 	`, cols, msgTable, MessageStatusProcessing, ttlClause)

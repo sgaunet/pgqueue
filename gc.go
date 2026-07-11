@@ -1149,13 +1149,16 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	msgTbl := gc.pq.msgTable(tableName)
 	// The table name comes from a queueNameRegex-validated queue name, so this
 	// interpolation is injection-safe. Paginated (M3): each page resets at most
-	// retentionPurgePageSize timed-out rows via ORDER BY id LIMIT + FOR UPDATE
-	// SKIP LOCKED, bounding the lock window and WAL footprint of a huge
-	// crash-reclaim backlog per statement while concurrent workers never block
-	// each other. A reset row flips to 'pending' and no longer matches the
-	// status='processing' predicate, so a fresh page never re-sees it — the same
-	// paging invariant runPagedPurge relies on (and it propagates a RowsAffected
-	// error rather than silently reporting nothing reclaimed, #67).
+	// retentionPurgePageSize timed-out rows via ORDER BY visibility_timeout, id
+	// LIMIT + FOR UPDATE SKIP LOCKED, bounding the lock window and WAL footprint of
+	// a huge crash-reclaim backlog per statement while concurrent workers never
+	// block each other. Ordering by (visibility_timeout, id) matches the
+	// _consumable_timeout index's leading range key (#11), so still-in-flight rows
+	// (visibility_timeout > NOW()) are never scanned. A reset row flips to
+	// 'pending' and no longer matches the status='processing' predicate, so a fresh
+	// page never re-sees it — the same paging invariant runPagedPurge relies on
+	// (and it propagates a RowsAffected error rather than silently reporting
+	// nothing reclaimed, #67).
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -1167,7 +1170,7 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 			WHERE status = '%s'
 			  AND visibility_timeout IS NOT NULL
 			  AND visibility_timeout < NOW()
-			ORDER BY id
+			ORDER BY visibility_timeout, id
 			LIMIT %d
 			FOR UPDATE SKIP LOCKED
 		)

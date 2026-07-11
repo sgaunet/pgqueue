@@ -18,7 +18,7 @@ func topicPendingProbeSQL(subTable, msgTable string) string {
 		JOIN %s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
 		  AND s.status = 'pending' AND s.available_at <= NOW()
-		ORDER BY m.id
+		ORDER BY s.available_at, s.message_id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED`, subTable, msgTable)
 }

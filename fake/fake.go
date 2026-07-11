@@ -330,6 +330,29 @@ func (q *Queue) Ack(_ context.Context, r pgqueue.Receipt) error {
 	return nil
 }
 
+// ExtendVisibility resets an in-flight message's visibility lease. The fake
+// models claims explicitly rather than by wall-clock expiry, so a held claim has
+// no timer to reset: it validates the duration bound and claim ownership, then
+// returns nil (or ErrClaimExpired if the claim is no longer held). This preserves
+// the observable contract — invalid durations and stale claims still error — so
+// handler code exercising ExtendVisibility can be unit-tested against the fake.
+func (q *Queue) ExtendVisibility(_ context.Context, r pgqueue.Receipt, d time.Duration) error {
+	if d < time.Millisecond || d > 24*time.Hour {
+		return pgqueue.ErrInvalidVisibilityTimeout
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	ch, err := q.resolve(r)
+	if err != nil {
+		return err
+	}
+	e, ok := ch.claimed[r.MessageID]
+	if !ok || e.claimID != r.ClaimID {
+		return pgqueue.ErrClaimExpired
+	}
+	return nil
+}
+
 // Nack negatively acknowledges a message: it is retried, or moved to the DLQ
 // once retryCount+1 exceeds the retry limit. A stale claim resolves to
 // ErrClaimExpired.

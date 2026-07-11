@@ -16,7 +16,7 @@ func channelPendingProbeSQL(msgTable string) string {
 		       metadata, processed_at, error_message
 		FROM %s
 		WHERE status = 'pending' AND available_at <= NOW()
-		ORDER BY id
+		ORDER BY available_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`, msgTable)
 }
@@ -29,7 +29,7 @@ func channelReclaimProbeSQL(msgTable string) string {
 		       metadata, processed_at, error_message
 		FROM %s
 		WHERE status = 'processing' AND visibility_timeout < NOW()
-		ORDER BY id
+		ORDER BY visibility_timeout, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED`, msgTable)
 }

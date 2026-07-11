@@ -83,6 +83,10 @@ func transientBackoff(attempt int) time.Duration {
 // Close blocks until every in-flight handler returns (it joins the worker
 // loops). A handler that ignores ctx cancellation therefore delays Close by up
 // to its own remaining run time, so long-running handlers should honor ctx (L2).
+//
+// A handler whose processing can legitimately exceed the visibility timeout
+// should call Queue.ExtendVisibility with msg.Receipt() to renew the lease and
+// avoid concurrent redelivery to another consumer.
 type Handler func(ctx context.Context, msg *Message) error
 
 // ReceiveChannel retrieves the next available message from a point-to-point
@@ -249,6 +253,53 @@ func (pq *Queue) nackReceipt(
 		return nil
 	}
 	return receiptError(r, err)
+}
+
+// ExtendVisibility resets the visibility lease of an in-flight message to d from
+// now, so a long-running handler's message is not redelivered to another consumer
+// while it is still being processed. Pass the Receipt from ReceiveChannel or
+// ReceiveTopic (or msg.Receipt()); call it from within the handler while still
+// holding the claim, before Ack.
+//
+// d is a fresh lease measured from the database clock at call time — it is NOT
+// added to the remaining lease — bounded to 1ms–24h (ErrInvalidVisibilityTimeout
+// otherwise). The claim token is unchanged, so the same Receipt remains valid for
+// a later Ack/Nack, and extending never counts as a delivery attempt (retry_count
+// is untouched).
+//
+// Returns ErrClaimExpired if the claim already lapsed — the visibility timeout
+// expired and the message was reclaimed/redelivered or reset by the garbage
+// collector — so the caller no longer owns the message and should stop processing
+// it. Returns ErrMessageAlreadyAcked if it was already acked, ErrMessageNotFound
+// if it is gone, ErrReceiptMissingQueueType for an unbound receipt, and
+// ErrQueueClosed if the queue is closing.
+func (pq *Queue) ExtendVisibility(ctx context.Context, r Receipt, d time.Duration) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
+	if err := validateVisibilityTimeout(d); err != nil {
+		return err
+	}
+
+	ctx, span := pq.startSpan(ctx, "pgqueue.extend",
+		StringAttr("queue", r.QueueName),
+		StringAttr("message_id", r.MessageID.String()))
+
+	var err error
+	switch r.QueueType {
+	case QueueTypeChannel:
+		err = pq.extendChannelVisibility(ctx, r.QueueName, r, d)
+	case QueueTypePubSub:
+		err = pq.extendTopicVisibility(ctx, r.QueueName, r.SubscriberID, r, d)
+	default:
+		err = ErrReceiptMissingQueueType
+	}
+
+	pq.endSpan(span, err)
+	if err != nil {
+		return receiptError(r, err)
+	}
+	return nil
 }
 
 // receiptError enriches a single-receipt Ack/Nack failure with the queue,

@@ -202,6 +202,62 @@ func (pq *Queue) ackTopic(
 	})
 }
 
+// extendTopicVisibility resets an in-flight subscription's visibility lease to d
+// from now, fenced on the caller's claim. Mirrors ackTopic; the UPDATE touches
+// only visibility_timeout (never status/retry_count/claim_id). See
+// extendChannelVisibility for the shared semantics.
+func (pq *Queue) extendTopicVisibility(
+	ctx context.Context,
+	topicName, subscriberID string,
+	r Receipt,
+	d time.Duration,
+) error {
+	if err := validateSubscriberID(subscriberID); err != nil {
+		return err
+	}
+
+	queueMeta, err := pq.getQueueMetadata(
+		ctx, string(QueueTypePubSub), topicName,
+	)
+	if err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
+		return fmt.Errorf("failed to get topic metadata: %w", err)
+	}
+
+	//nolint:gosec // G201: table name validated by queueNameRegex
+	query := fmt.Sprintf(`
+		UPDATE %s
+		SET visibility_timeout = NOW() + make_interval(secs => $4)
+		WHERE message_id = $1
+		  AND subscriber_id = $2
+		  AND claim_id = $3
+		  AND status = '%s'
+	`, pq.subTable(queueMeta.TableName), MessageStatusProcessing)
+
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(
+			ctx, query, r.MessageID, subscriberID, r.ClaimID, d.Seconds(),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to extend visibility timeout: %w", err)
+		}
+
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+		if rows == 0 {
+			return classifyTopicAckMiss(
+				ctx, tx, pq.subTable(queueMeta.TableName), subscriberID, r,
+			)
+		}
+
+		return nil
+	})
+}
+
 // nackTopicWithOpts is the option-aware topic nack used by the queue-agnostic
 // Nack. WithRetryDelay overrides the computed backoff delay (FR-023).
 func (pq *Queue) nackTopicWithOpts(
@@ -489,9 +545,14 @@ func scanTopicCandidate(scanner interface{ Scan(dest ...any) error }, c *topicCa
 //   - reclaimQuery selects a still-'processing' subscription whose visibility
 //     timeout has expired.
 //
-// Both order by m.id and LIMIT 1 FOR UPDATE OF s SKIP LOCKED, and both carry the
-// same optional ttl cutoff (bound as $2) so a message past its TTL is delivered
-// by neither probe — the semantics of the previous combined query.
+// The pending probe orders by (s.available_at, s.message_id) and the reclaim
+// probe by (s.visibility_timeout, s.message_id); each ordering matches its
+// partial index's leading range key (#11), so the eligibility predicate is a
+// scan boundary rather than a Filter and a subscriber's ineligible rows are
+// never visited (s.message_id == m.id via the join, preserving the chronological
+// tie-break). Both LIMIT 1 FOR UPDATE OF s SKIP LOCKED, and both carry the same
+// optional ttl cutoff (bound as $2) so a message past its TTL is delivered by
+// neither probe.
 func topicConsumeQueries(
 	subTable, msgTable, subscriberID string, ttl time.Duration,
 ) (string, string, []any) {
@@ -512,7 +573,7 @@ func topicConsumeQueries(
 		WHERE s.subscriber_id = $1
 		  AND s.status = '%s' AND s.available_at <= NOW()
 		  %s
-		ORDER BY m.id
+		ORDER BY s.available_at, s.message_id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED
 	`, cols, subTable, msgTable, MessageStatusPending, ttlClause)
@@ -524,7 +585,7 @@ func topicConsumeQueries(
 		WHERE s.subscriber_id = $1
 		  AND s.status = '%s' AND s.visibility_timeout < NOW()
 		  %s
-		ORDER BY m.id
+		ORDER BY s.visibility_timeout, s.message_id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED
 	`, cols, subTable, msgTable, MessageStatusProcessing, ttlClause)

@@ -20,8 +20,8 @@ func consumableTimeoutIndexName(table string) string {
 }
 
 // filterDropOf sums "Rows Removed by Filter" across every node in an ANALYZE
-// plan, for diagnostic logging only (see TestConsumePlanRetryStormStillUsesIndex
-// for why this is logged rather than asserted).
+// plan, for diagnostic logging alongside the assertNoLargeFilterDrop assertions
+// in TestConsumePlanRetryStormStillUsesIndex.
 func filterDropOf(qp queryPlan) float64 {
 	var total float64
 	for _, n := range qp.nodes {
@@ -30,33 +30,25 @@ func filterDropOf(qp queryPlan) float64 {
 	return total
 }
 
-// planHasNodeType reports whether any node in the plan has the given
-// PostgreSQL EXPLAIN "Node Type" (e.g. "Index Only Scan").
-func planHasNodeType(qp queryPlan, nodeType string) bool {
-	for _, n := range qp.nodes {
-		if n.NodeType == nodeType {
-			return true
-		}
-	}
-	return false
-}
-
-// TestConsumableIndexIncludeColumnsPresent confirms PostgreSQL 18 accepts
-// INCLUDE on a partial btree index for every shape pgqueue emits -- the
-// single-key-column channel message indexes and the composite-key pub/sub
-// subscription indexes (#11) -- and that the resulting catalog definition
-// actually carries the INCLUDE clause. CREATE INDEX IF NOT EXISTS silently
-// no-ops against a pre-existing index of the same name, so this reads the
-// definition back with pg_get_indexdef rather than only checking that the DDL
-// ran without error.
-func TestConsumableIndexIncludeColumnsPresent(t *testing.T) {
+// TestConsumableIndexKeyColumns confirms the consume partial indexes lead with
+// the eligibility timestamp as their leading key (#11) -- the shape that turns
+// available_at <= NOW() / visibility_timeout < NOW() into a btree range boundary
+// rather than a Filter -- for every shape pgqueue emits: the channel message
+// indexes keyed (available_at, id) / (visibility_timeout, id) and the pub/sub
+// subscription indexes keyed (subscriber_id, available_at, message_id) /
+// (subscriber_id, visibility_timeout, message_id). CREATE INDEX IF NOT EXISTS
+// silently no-ops against a pre-existing index of the same name, so this reads
+// the definition back with pg_get_indexdef. It also asserts the former INCLUDE
+// clause is gone -- an INCLUDE column may not also be a key column, and the range
+// key, not INCLUDE, is what fixes the sleeping-row scan.
+func TestConsumableIndexKeyColumns(t *testing.T) {
 	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
 	ctx := context.Background()
 
 	const (
-		channel = "incddlchan"
-		topic   = "incddltop"
+		channel = "keycolchan"
+		topic   = "keycoltop"
 	)
 	if err := pq.CreateChannel(ctx, channel); err != nil {
 		t.Fatalf("CreateChannel: %v", err)
@@ -69,40 +61,40 @@ func TestConsumableIndexIncludeColumnsPresent(t *testing.T) {
 	topicTable := queueTableName(t, db, topic)
 
 	cases := []struct {
-		index   string
-		include string
+		index string
+		key   string
 	}{
-		{consumableNullIndexName(chanTable), "INCLUDE (available_at)"},
-		{consumableTimeoutIndexName(chanTable), "INCLUDE (visibility_timeout)"},
-		{"idx_pgqueue_sub_" + topicTable + "_consumable_null", "INCLUDE (available_at)"},
-		{"idx_pgqueue_sub_" + topicTable + "_consumable_timeout", "INCLUDE (visibility_timeout)"},
+		{consumableNullIndexName(chanTable), "(available_at, id)"},
+		{consumableTimeoutIndexName(chanTable), "(visibility_timeout, id)"},
+		{"idx_pgqueue_sub_" + topicTable + "_consumable_null", "(subscriber_id, available_at, message_id)"},
+		{"idx_pgqueue_sub_" + topicTable + "_consumable_timeout", "(subscriber_id, visibility_timeout, message_id)"},
 	}
 	for _, c := range cases {
 		def := indexDef(t, db, c.index)
-		if !strings.Contains(def, c.include) {
-			t.Errorf("index %s definition = %q, want it to contain %q", c.index, def, c.include)
+		if !strings.Contains(def, c.key) {
+			t.Errorf("index %s definition = %q, want it to contain key %q", c.index, def, c.key)
+		}
+		if strings.Contains(def, "INCLUDE") {
+			t.Errorf("index %s definition = %q, want no INCLUDE clause "+
+				"(key columns cannot be INCLUDEd)", c.index, def)
 		}
 	}
 }
 
-// TestConsumePlanRetryStormStillUsesIndex is the direct regression guard for
-// the #11 DDL change: adding INCLUDE (available_at) / INCLUDE
-// (visibility_timeout) to the consumable partial indexes must not change which
-// index the planner selects, and a channel must still correctly deliver a
-// ready message and reclaim a timed-out one when each sits behind a large
-// storm of not-yet-actionable rows -- the shape a crash-looping consumer with
-// a configured BackoffPolicy produces: a retried message keeps its original
-// (low) id but has its available_at pushed into the future, so it sits ahead
-// of newer, genuinely-ready messages in the id-ordered scan; an in-flight
-// message under a live claim sits ahead of an older message whose claim
-// actually timed out.
+// TestConsumePlanRetryStormStillUsesIndex is the direct acceptance test for the
+// #11 fix: a channel must deliver a ready message and reclaim a timed-out one
+// cheaply even when each sits behind a large storm of not-yet-actionable rows --
+// the shape a crash-looping consumer with a configured BackoffPolicy produces. A
+// retried message keeps its original (low) id but has its available_at pushed
+// into the future, and an in-flight message under a live claim has a future
+// visibility_timeout; with the eligibility timestamp as the leading index key,
+// both storms sort past the probe's range boundary and are never scanned.
 //
-// It deliberately does not assert "Rows Removed by Filter" is small: that
-// filter drop is expected to scale with the storm size today (logged, not
-// asserted -- see TestConsumableIndexIncludeGroundwork for why), because both
-// probes carry FOR UPDATE SKIP LOCKED. This test only guards that the index is
-// still selected, the plan never degrades to a sequential scan, and delivery
-// stays correct.
+// Beyond "the index is still selected and never a seq scan", this asserts the
+// probes drop essentially no rows to a Filter (assertNoLargeFilterDrop): the old
+// (id)-keyed shape walked and heap-fetched every sleeping/in-flight row ahead of
+// the target, which is exactly the O(storm) cost #11 removes. If a future change
+// regresses the index key back to (id), the filter-drop assertions fail here.
 func TestConsumePlanRetryStormStillUsesIndex(t *testing.T) {
 	pq, db, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -158,6 +150,12 @@ func TestConsumePlanRetryStormStillUsesIndex(t *testing.T) {
 	t.Logf("reclaim probe: rows removed by filter=%.0f, shared blocks=%.0f",
 		filterDropOf(reclaimPlan), reclaimPlan.maxSharedBlocks())
 
+	// The core #11 guarantee: neither probe walks its 20000 / 5000 ineligible
+	// rows. The leading range key stops the scan at the eligibility boundary, so
+	// almost nothing is read only to be discarded by a Filter.
+	assertNoLargeFilterDrop(t, pendingPlan, 100)
+	assertNoLargeFilterDrop(t, reclaimPlan, 100)
+
 	// Behavioral proof: both the ready message and the reclaimed timed-out
 	// message are still delivered correctly despite their respective storms
 	// (pending-first tie-break: probe A wins the first ReceiveChannel call).
@@ -175,95 +173,5 @@ func TestConsumePlanRetryStormStillUsesIndex(t *testing.T) {
 	}
 	if reclaimed == nil {
 		t.Fatal("ReceiveChannel (reclaim) = nil, want the reclaimed timed-out message")
-	}
-}
-
-// TestConsumableIndexIncludeGroundwork pins down *why* the retry-storm probes
-// above still pay a heap fetch for every not-yet-ready candidate despite the
-// INCLUDE (available_at) index (#11): PostgreSQL's planner never produces an
-// Index Only Scan under a row-locking clause (FOR UPDATE / FOR UPDATE SKIP
-// LOCKED) on the locked relation -- taking the lock, and SKIP LOCKED's
-// already-locked check, both require the heap tuple, which is exactly what a
-// plain Index Only Scan uses the visibility map to skip. The two-probe
-// consume path (channelConsumeQueries in channel.go) and the GC's bulk
-// reclaim (resetTimedOutMessages / resetTimedOutSubscriptions in gc.go) both
-// require FOR UPDATE ... SKIP LOCKED for correctness -- it is what lets two
-// consumers, or a consumer and the GC, race for the same row without
-// double-claiming it -- so neither can benefit from the INCLUDE columns as
-// written today.
-//
-// This test proves both halves of that claim against the real index
-// PostgreSQL 18 builds for a channel, using a query that selects only id (the
-// sole column consumableNull's key + INCLUDE actually cover) so any plan-shape
-// difference is attributable to the locking clause alone, never to needing
-// payload/metadata/etc.
-//
-// If a future PostgreSQL release changes this and the "want an Index Only
-// Scan" branch below starts failing on the *locked* query, the #11 finding
-// becomes fixable purely at the DDL level and the limitation notes in
-// pgqueue.go's createChannelIndexes/createPubSubIndexes should be revisited.
-func TestConsumableIndexIncludeGroundwork(t *testing.T) {
-	pq, db, cleanup := setupTestDB(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	const channel = "includemech"
-	if err := pq.CreateChannel(ctx, channel); err != nil {
-		t.Fatalf("CreateChannel: %v", err)
-	}
-
-	// A storm of backoff-sleeping pending rows behind a deep non-pending
-	// history, so the partial index is selective enough to be chosen over a
-	// sequential scan (an unselective partial index -- e.g. every row pending
-	// -- is cheaper to seq scan, which would defeat this comparison).
-	seedChannelMessages(t, db, channel, channelSeed{
-		PendingFuture: 5000,
-		CompletedOld:  20000,
-	})
-
-	table := queueTableName(t, db, channel)
-	msgTable := "pgqueue_msg_" + table
-	consumableNull := consumableNullIndexName(table)
-
-	// VACUUM sets the visibility map bit an Index Only Scan relies on to skip
-	// the heap. Production relies on the aggressive per-table autovacuum
-	// (highChurnStorageParams) for the same effect; this VACUUM mirrors that
-	// steady state rather than a freshly bulk-loaded, not-yet-vacuumed table.
-	if _, err := db.ExecContext(ctx, "VACUUM (ANALYZE) "+msgTable); err != nil {
-		t.Fatalf("VACUUM: %v", err)
-	}
-
-	pendingProbe := fmt.Sprintf(`
-		SELECT id FROM %s
-		WHERE status = 'pending' AND available_at <= NOW()
-		ORDER BY id
-		LIMIT 1`, msgTable)
-	pendingProbeLocked := pendingProbe + "\n\t\tFOR UPDATE SKIP LOCKED"
-
-	withoutLock := explainAnalyzePlan(t, db, pendingProbe)
-	assertPlanUsesIndex(t, withoutLock, consumableNull)
-	if !planHasNodeType(withoutLock, "Index Only Scan") {
-		t.Fatalf("without a row-locking clause, want an Index Only Scan; node types: %v",
-			withoutLock.nodeTypes())
-	}
-
-	withLock := explainAnalyzePlan(t, db, pendingProbeLocked)
-	assertPlanUsesIndex(t, withLock, consumableNull)
-	if planHasNodeType(withLock, "Index Only Scan") {
-		t.Fatalf("FOR UPDATE SKIP LOCKED unexpectedly produced an Index Only Scan "+
-			"(PostgreSQL is expected to never do this: locking requires the heap "+
-			"tuple); node types: %v -- if this now passes, the #11 finding may be "+
-			"fixable purely via INCLUDE after all",
-			withLock.nodeTypes())
-	}
-
-	// The locked scan pays for every candidate the unlocked scan skipped via
-	// the visibility map: it must touch materially more shared buffers for the
-	// identical predicate over the identical storm.
-	if withLock.maxSharedBlocks() <= withoutLock.maxSharedBlocks() {
-		t.Fatalf("FOR UPDATE SKIP LOCKED scan touched %.0f shared blocks, want more "+
-			"than the unlocked Index Only Scan's %.0f (it should pay a heap fetch per "+
-			"candidate the unlocked scan did not)",
-			withLock.maxSharedBlocks(), withoutLock.maxSharedBlocks())
 	}
 }

@@ -2,6 +2,7 @@ package pgqueue
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -21,6 +22,7 @@ type ChannelConsumer interface {
 	ReceiveChannel(ctx context.Context, name string, opts ...ConsumeOption) (*Message, error)
 	Ack(ctx context.Context, r Receipt) error
 	Nack(ctx context.Context, r Receipt, reason string, opts ...NackOption) error
+	ExtendVisibility(ctx context.Context, r Receipt, d time.Duration) error
 }
 
 // TopicConsumer is the interface for consuming messages from a pub/sub topic.
@@ -30,6 +32,7 @@ type TopicConsumer interface {
 	ReceiveTopic(ctx context.Context, name, subscriberID string, opts ...ConsumeOption) (*Message, error)
 	Ack(ctx context.Context, r Receipt) error
 	Nack(ctx context.Context, r Receipt, reason string, opts ...NackOption) error
+	ExtendVisibility(ctx context.Context, r Receipt, d time.Duration) error
 }
 
 // Compile-time assertions: *Queue must satisfy every published interface
