@@ -31,10 +31,18 @@ CREATE TABLE IF NOT EXISTS pgqueue_metadata (
     -- UNIQUE(table_name) closes a collision where queue names differing only by
     -- dash vs. underscore (e.g. "a-b" and "a_b") sanitize to the same physical
     -- table name. Its index also serves table_name lookups.
-    UNIQUE(table_name)
+    UNIQUE(table_name),
+    -- table_name is interpolated directly into per-queue DDL/DML after being read
+    -- back from this column, and is only ever written via sanitizeTableName
+    -- ([a-z0-9_]+). Enforce that charset structurally as defense in depth against
+    -- a future in-tree bug or direct-SQL tampering planting an injection-bearing
+    -- value. Folds the former v8 migration into the baseline.
+    CONSTRAINT pgqueue_metadata_table_name_charset CHECK (table_name ~ '^[a-z0-9_]+$')
 );
 
-CREATE INDEX IF NOT EXISTS idx_pgqueue_metadata_type_name ON pgqueue_metadata(queue_type, queue_name);
+-- The UNIQUE(queue_type, queue_name) constraint above already builds the btree
+-- that queue-by-type-and-name lookups use, so no separate index is created here
+-- (the former idx_pgqueue_metadata_type_name was a duplicate, L11).
 
 -- Subscribers table for pub/sub topics
 CREATE TABLE IF NOT EXISTS pgqueue_subscribers (
@@ -63,6 +71,23 @@ CREATE TABLE IF NOT EXISTS pgqueue_replay_log (
 CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_queue ON pgqueue_replay_log(queue_type, queue_name);
 CREATE INDEX IF NOT EXISTS idx_pgqueue_replay_log_created_at ON pgqueue_replay_log(created_at);
 `
+
+// highChurnStorageParams tunes autovacuum/autoanalyze for the per-queue message
+// and subscription tables. Those tables see heavy insert + status-update + delete
+// churn that HOT updates cannot fully absorb, so the 20%/10% default scale
+// factors let dead tuples accumulate long enough to bloat the table and skew the
+// planner statistics the consume plans depend on. The lower scale factors trigger
+// vacuum/analyze far sooner, cost_delay=0 lets vacuum keep up under load, and the
+// insert scale factor bounds growth on append-heavy tables. Values are a
+// validated starting point (H1) and can be overridden per deployment with
+// ALTER TABLE ... SET (...). The clause is appended verbatim to the CREATE TABLE
+// statements below; it carries no interpolated input.
+const highChurnStorageParams = ` WITH (
+	autovacuum_vacuum_scale_factor = 0.02,
+	autovacuum_vacuum_insert_scale_factor = 0.02,
+	autovacuum_vacuum_cost_delay = 0,
+	autovacuum_analyze_scale_factor = 0.05
+)`
 
 // DB is the database handle pgqueue operates on. *sql.DB satisfies it, so an
 // existing *sql.DB caller passes it unchanged; the interface lets consumers
@@ -105,11 +130,6 @@ type Queue struct {
 	gcs      []*GarbageCollector // GCs created via NewGarbageCollector for this Queue
 	workerWG sync.WaitGroup      // joins handler-based consume loops owned by this Queue
 }
-
-// PGQueue is a backward-compatible alias for Queue.
-//
-// Deprecated: Use Queue instead.
-type PGQueue = Queue
 
 // queueNameRegex validates queue names (alphanumeric, underscore, dash).
 var queueNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -571,27 +591,6 @@ func (pq *Queue) Close() error {
 	return nil
 }
 
-// PauseQueue prevents new messages from being consumed from the specified queue.
-// Publishing is still allowed while paused.
-//
-// Deprecated: Use PauseChannel or PauseTopic instead.
-func (pq *Queue) PauseQueue(ctx context.Context, queueName string, queueType QueueType) error {
-	if err := pq.checkClosed(); err != nil {
-		return err
-	}
-	return pq.setQueuePaused(ctx, queueName, queueType, true)
-}
-
-// ResumeQueue allows message consumption again for the specified queue.
-//
-// Deprecated: Use ResumeChannel or ResumeTopic instead.
-func (pq *Queue) ResumeQueue(ctx context.Context, queueName string, queueType QueueType) error {
-	if err := pq.checkClosed(); err != nil {
-		return err
-	}
-	return pq.setQueuePaused(ctx, queueName, queueType, false)
-}
-
 // PauseChannel pauses a point-to-point channel, preventing new messages from
 // being consumed. Publishing is still allowed while paused.
 func (pq *Queue) PauseChannel(ctx context.Context, name string) error {
@@ -929,9 +928,13 @@ func (pq *Queue) deleteQueue(
 		return err
 	}
 
-	if pq.mdcache != nil {
-		pq.mdcache.invalidate(string(queueType), name)
-	}
+	// Re-run the full invalidation after commit, not just the metadata cache: a
+	// concurrent consumer's wakeChan can repopulate the notifier waker and
+	// re-issue LISTEN in the same in-process window that repopulates the metadata
+	// cache (#63), so forgetting only the cache leaks a waker + server-side LISTEN
+	// for the deleted queue (#52). Use a cancellation-detached context so a
+	// near-cancelled request ctx cannot abort the best-effort Unlisten.
+	pq.invalidateQueueCaches(context.WithoutCancel(ctx), queueType, name, metadata.TableName)
 
 	return nil
 }
@@ -1044,31 +1047,42 @@ func (pq *Queue) checkQueueNotExists(
 }
 
 // createPubSubTables creates message and subscription tables for a pub/sub topic.
-func (pq *Queue) createPubSubTables(
+// createPubSubMessageTable creates the append-only pub/sub message table and its
+// created_at index (which serves the default GC completed-message purge — pub/sub
+// deletes fully-acked message rows past their retention cutoff on created_at, the
+// analogue of the channel _completed index).
+func (pq *Queue) createPubSubMessageTable(
 	ctx context.Context,
 	tx *sql.Tx,
 	tableName string,
 ) error {
-	// Create message table
 	messageTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			id UUID PRIMARY KEY,
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			metadata JSONB DEFAULT '{}'::jsonb
-		)`, pq.msgTable(tableName))
-
+		)%s`, pq.msgTable(tableName), highChurnStorageParams)
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
 		return fmt.Errorf("failed to create message table: %w", err)
 	}
 
-	// Create indexes
 	createIndex := fmt.Sprintf(`
 		CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_created_at
 		ON %s(created_at)`, tableName, pq.msgTable(tableName))
-
 	if _, err := tx.ExecContext(ctx, createIndex); err != nil {
 		return fmt.Errorf("failed to create message index: %w", err)
+	}
+	return nil
+}
+
+func (pq *Queue) createPubSubTables(
+	ctx context.Context,
+	tx *sql.Tx,
+	tableName string,
+) error {
+	if err := pq.createPubSubMessageTable(ctx, tx, tableName); err != nil {
+		return err
 	}
 
 	// Create subscription table
@@ -1078,7 +1092,8 @@ func (pq *Queue) createPubSubTables(
 			id UUID PRIMARY KEY DEFAULT uuidv7(),
 			message_id UUID NOT NULL,
 			subscriber_id TEXT NOT NULL,
-			status TEXT NOT NULL DEFAULT '%s',
+			status TEXT NOT NULL DEFAULT '%s'
+				CHECK (status IN ('%s', '%s', '%s')),
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			acked_at TIMESTAMPTZ,
 			visibility_timeout TIMESTAMPTZ,
@@ -1089,7 +1104,9 @@ func (pq *Queue) createPubSubTables(
 			UNIQUE(message_id, subscriber_id),
 			FOREIGN KEY (message_id)
 				REFERENCES %s(id) ON DELETE CASCADE
-		)`, pq.subTable(tableName), MessageStatusPending, pq.msgTable(tableName))
+		)%s`, pq.subTable(tableName), MessageStatusPending,
+		MessageStatusPending, MessageStatusProcessing, MessageStatusAcked,
+		pq.msgTable(tableName), highChurnStorageParams)
 
 	if _, err := tx.ExecContext(ctx, subscriptionTable); err != nil {
 		return fmt.Errorf("failed to create subscription table: %w", err)
@@ -1156,30 +1173,27 @@ func (pq *Queue) createPubSubIndexes(
 			 ON %s(status) WHERE status = '%s'`,
 			tableName, subTbl, MessageStatusPending,
 		),
-		// Consumption-optimized indexes: split the OR condition on
-		// visibility_timeout into two partial indexes for efficient
-		// subscriber message fetching.
+		// Consume probe A (pending): predicate is exactly status='pending' so the
+		// planner can select it for a subscriber's pending consume probe. The
+		// phantom "AND visibility_timeout IS NULL" clause was dropped for the same
+		// reason as the channel table — it only made the index unselectable for a
+		// query that does not mention visibility_timeout, forcing a scan across a
+		// subscriber's delivered history (C1). Keyed (subscriber_id, message_id) so
+		// the probe's ORDER BY message_id is served in order per subscriber.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_null
 			 ON %s(subscriber_id, message_id)
-			 WHERE status = '%s' AND visibility_timeout IS NULL`,
-			tableName, subTbl, MessageStatusPending,
-		),
-		// Reclaim-optimized index: covers timed-out 'processing' subscriptions
-		// that consumeFromTopic redelivers once their visibility timeout expires.
-		fmt.Sprintf(
-			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
-			 ON %s(subscriber_id, visibility_timeout, message_id)
-			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
-			tableName, subTbl, MessageStatusProcessing,
-		),
-		// Backoff-optimized index: covers pending subscriptions awaiting
-		// their scheduled redelivery time (available_at).
-		fmt.Sprintf(
-			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_available
-			 ON %s(available_at)
 			 WHERE status = '%s'`,
 			tableName, subTbl, MessageStatusPending,
+		),
+		// Consume probe B (timed-out reclaim): covers 'processing' subscriptions
+		// whose visibility timeout has expired. Keyed (subscriber_id, message_id)
+		// so the reclaim probe's ORDER BY message_id is served without a sort (C1).
+		fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
+			 ON %s(subscriber_id, message_id)
+			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
+			tableName, subTbl, MessageStatusProcessing,
 		),
 	}
 
@@ -1204,7 +1218,8 @@ func (pq *Queue) createChannelTables(
 			id UUID PRIMARY KEY,
 			payload BYTEA NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			status TEXT NOT NULL DEFAULT '%s',
+			status TEXT NOT NULL DEFAULT '%s'
+				CHECK (status IN ('%s', '%s', '%s')),
 			retry_count BIGINT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
 			max_retries BIGINT NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
 			visibility_timeout TIMESTAMPTZ,
@@ -1213,7 +1228,9 @@ func (pq *Queue) createChannelTables(
 			processed_at TIMESTAMPTZ,
 			error_message TEXT,
 			metadata JSONB DEFAULT '{}'::jsonb
-		)`, pq.msgTable(tableName), MessageStatusPending)
+		)%s`, pq.msgTable(tableName), MessageStatusPending,
+		MessageStatusPending, MessageStatusProcessing, MessageStatusCompleted,
+		highChurnStorageParams)
 
 	if _, err := tx.ExecContext(ctx, messageTable); err != nil {
 		return fmt.Errorf("failed to create message table: %w", err)
@@ -1234,42 +1251,45 @@ func (pq *Queue) createChannelIndexes(
 ) error {
 	msgTbl := pq.msgTable(tableName)
 	indexes := []string{
+		// Pending-age purge (GC purgeOldPendingMessages) filters status='pending'
+		// on a created_at range; this partial index serves that cutoff.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_status_created
 			 ON %s(status, created_at)
 			 WHERE status = '%s'`,
 			tableName, msgTbl, MessageStatusPending,
 		),
-		fmt.Sprintf(
-			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_visibility
-			 ON %s(visibility_timeout)
-			 WHERE visibility_timeout IS NOT NULL`,
-			tableName, msgTbl,
-		),
-		// Consumption-optimized indexes: split the OR condition on
-		// visibility_timeout into two partial indexes so PostgreSQL
-		// can use an efficient index scan for each branch.
+		// Consume probe A (pending): the predicate is exactly status='pending' so
+		// the planner can select this index for the pending consume probe, which
+		// orders by id (LIMIT 1). The phantom "AND visibility_timeout IS NULL"
+		// clause was dropped: a pending row always has a NULL visibility_timeout,
+		// so it never changed which rows the index covered — it only made the
+		// index unselectable for a query that (correctly) does not mention
+		// visibility_timeout, forcing a primary-key scan across history rows (C1).
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_null
 			 ON %s(id)
-			 WHERE status = '%s' AND visibility_timeout IS NULL`,
+			 WHERE status = '%s'`,
 			tableName, msgTbl, MessageStatusPending,
 		),
-		// Reclaim-optimized index: covers timed-out 'processing' messages that
-		// consumeFromChannel redelivers once their visibility timeout expires.
+		// Consume probe B (timed-out reclaim): covers 'processing' messages whose
+		// visibility timeout has expired. Keyed on id so the reclaim probe's
+		// ORDER BY id LIMIT 1 is served directly without a sort (C1).
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_timeout
-			 ON %s(visibility_timeout, id)
+			 ON %s(id)
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
 			tableName, msgTbl, MessageStatusProcessing,
 		),
-		// Backoff-optimized index: covers pending messages awaiting their
-		// scheduled redelivery time (available_at).
+		// Completed-purge index: serves the default GC completed-message purge,
+		// which deletes status='completed' rows past their retention cutoff on
+		// processed_at. Without it that purge sequential-scans the whole message
+		// table on every run (C2).
 		fmt.Sprintf(
-			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_available
-			 ON %s(available_at)
+			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_completed
+			 ON %s(processed_at)
 			 WHERE status = '%s'`,
-			tableName, msgTbl, MessageStatusPending,
+			tableName, msgTbl, MessageStatusCompleted,
 		),
 	}
 
@@ -1334,15 +1354,15 @@ func (pq *Queue) createDLQTable(
 func (pq *Queue) listQueues(
 	ctx context.Context,
 	queueType QueueType,
-) ([]QueueMetadata, error) {
+) ([]queueMetadata, error) {
 	rows, err := pq.listQueuesRaw(ctx, string(queueType))
 	if err != nil {
 		return nil, fmt.Errorf("failed to list queues: %w", err)
 	}
 
-	result := make([]QueueMetadata, 0, len(rows))
+	result := make([]queueMetadata, 0, len(rows))
 	for _, row := range rows {
-		result = append(result, QueueMetadata{
+		result = append(result, queueMetadata{
 			ID:        row.ID,
 			QueueType: row.QueueType,
 			QueueName: row.QueueName,

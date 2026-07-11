@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -234,11 +235,14 @@ func validateReplayOpts(opts ReplayOptions) error {
 		return ErrInvalidConfig
 	}
 	// PerformedBy is stored verbatim in pgqueue_replay_log; reject anything that
-	// would either bloat the table or break later inspection via psql/grep.
+	// would either bloat the table or break later inspection via psql/grep. It is
+	// bound as a parameter when written, so this is not an injection guard — it
+	// rejects every control character (NUL, CR, LF, tab, ESC, and other C0/C1
+	// controls) so terminal escape sequences cannot corrupt log/audit output.
 	if len(opts.PerformedBy) > MaxPerformedByLen {
 		return ErrInvalidPerformedBy
 	}
-	if strings.ContainsAny(opts.PerformedBy, "\x00\r\n") {
+	if strings.ContainsFunc(opts.PerformedBy, unicode.IsControl) {
 		return ErrInvalidPerformedBy
 	}
 
@@ -249,7 +253,7 @@ func (pq *Queue) getReplayQueueMetadata(
 	ctx context.Context,
 	queueType QueueType,
 	queueName string,
-) (*QueueMetadata, error) {
+) (*queueMetadata, error) {
 	metadata, err := pq.getQueueMetadata(
 		ctx, string(queueType), queueName,
 	)
@@ -1075,7 +1079,7 @@ func (pq *Queue) resolvePubSubDLQRecords(
 	queueName string,
 	dlqMessages []dlqRow,
 ) ([]subRecord, []uuid.UUID, error) {
-	var legacySubscribers []Subscriber
+	var legacySubscribers []subscriber
 	legacyLoaded := false
 
 	// seen deduplicates subscription records: two DLQ entries can describe the

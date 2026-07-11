@@ -260,7 +260,7 @@ func classifyTopicBatchMisses(
 func (pq *Queue) getQueueMetadata(
 	ctx context.Context,
 	queueType, queueName string,
-) (*QueueMetadata, error) {
+) (*queueMetadata, error) {
 	// The table name is a schema-qualified internal identifier, not user input,
 	// so this interpolation is injection-safe.
 	query := fmt.Sprintf(`
@@ -270,7 +270,7 @@ func (pq *Queue) getQueueMetadata(
 		LIMIT 1
 	`, pq.globalTable("pgqueue_metadata"))
 
-	var meta QueueMetadata
+	var meta queueMetadata
 	err := pq.db.QueryRowContext(ctx, query, queueType, queueName).Scan(
 		&meta.ID,
 		&meta.QueueType,
@@ -320,7 +320,7 @@ func (pq *Queue) createQueueMetadata(
 	tx *sql.Tx,
 	queueType, queueName, tableName string,
 	config []byte,
-) (*QueueMetadata, error) {
+) (*queueMetadata, error) {
 	//nolint:gosec // G201: schema-qualified internal table name, not user input
 	query := fmt.Sprintf(`
 		INSERT INTO %s (queue_type, queue_name, table_name, config)
@@ -328,7 +328,7 @@ func (pq *Queue) createQueueMetadata(
 		RETURNING id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
 	`, pq.globalTable("pgqueue_metadata"))
 
-	var meta QueueMetadata
+	var meta queueMetadata
 	err := tx.QueryRowContext(ctx, query, queueType, queueName, tableName, config).Scan(
 		&meta.ID,
 		&meta.QueueType,
@@ -469,7 +469,7 @@ const listQueuesPageSize = 1000
 func (pq *Queue) listQueuesRaw(
 	ctx context.Context,
 	queueType string,
-) ([]QueueMetadata, error) {
+) ([]queueMetadata, error) {
 	query := fmt.Sprintf(`
 		SELECT id, queue_type, queue_name, table_name, config, paused, created_at, updated_at
 		FROM %s
@@ -479,7 +479,7 @@ func (pq *Queue) listQueuesRaw(
 		LIMIT $3
 	`, pq.globalTable("pgqueue_metadata"))
 
-	items := []QueueMetadata{}
+	items := []queueMetadata{}
 	var afterID any
 	for {
 		pageStart := len(items)
@@ -503,7 +503,7 @@ func (pq *Queue) fetchQueueMetadataPage(
 	ctx context.Context,
 	query, queueType string,
 	afterID any,
-	items *[]QueueMetadata,
+	items *[]queueMetadata,
 ) error {
 	rows, err := pq.db.QueryContext(ctx, query, queueType, afterID, listQueuesPageSize)
 	if err != nil {
@@ -511,7 +511,7 @@ func (pq *Queue) fetchQueueMetadataPage(
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
-		var meta QueueMetadata
+		var meta queueMetadata
 		if err := rows.Scan(
 			&meta.ID,
 			&meta.QueueType,
@@ -532,12 +532,12 @@ func (pq *Queue) fetchQueueMetadataPage(
 	return nil
 }
 
-// Subscriber query methods
+// subscriber query methods
 
 func (pq *Queue) registerSubscriber(
 	ctx context.Context,
 	topicName, subscriberID string,
-) (*Subscriber, error) {
+) (*subscriber, error) {
 	// Schema-qualified internal table name, not user input; injection-safe.
 	query := fmt.Sprintf(`
 		INSERT INTO %s (topic_name, subscriber_id)
@@ -547,7 +547,7 @@ func (pq *Queue) registerSubscriber(
 		RETURNING id, topic_name, subscriber_id, created_at, active
 	`, pq.globalTable("pgqueue_subscribers"))
 
-	var sub Subscriber
+	var sub subscriber
 	err := pq.db.QueryRowContext(ctx, query, topicName, subscriberID).Scan(
 		&sub.ID,
 		&sub.TopicName,
@@ -593,7 +593,7 @@ func (pq *Queue) getActiveSubscribers(
 	ctx context.Context,
 	tx *sql.Tx,
 	topicName string,
-) ([]Subscriber, error) {
+) ([]subscriber, error) {
 	//nolint:gosec // G201: schema-qualified internal table name, not user input
 	query := fmt.Sprintf(`
 		SELECT id, topic_name, subscriber_id, created_at, active
@@ -615,9 +615,9 @@ func (pq *Queue) getActiveSubscribers(
 	}
 	defer func() { _ = rows.Close() }()
 
-	items := []Subscriber{}
+	items := []subscriber{}
 	for rows.Next() {
-		var sub Subscriber
+		var sub subscriber
 		if err := rows.Scan(
 			&sub.ID,
 			&sub.TopicName,

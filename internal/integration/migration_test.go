@@ -245,70 +245,8 @@ func TestRetryCounterColumnsAreBigint(t *testing.T) {
 	assertColumnIsBigint(t, db, "pgqueue_dlq_biginttopic", "retry_count")
 }
 
-// TestMigrateBigintRetryCounts verifies the v4 migration widens the retry
-// counters of pre-existing per-queue tables. It simulates a database created
-// before v4 by reverting the columns to INT and deleting the v4-and-later rows
-// from pgqueue_schema_version, then re-runs InitSchema and asserts every counter
-// is BIGINT again.
-func TestMigrateBigintRetryCounts(t *testing.T) {
-	pq, db, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	if err := pq.CreateChannel(ctx, "bigintmig"); err != nil {
-		t.Fatalf("CreateChannel failed: %v", err)
-	}
-	if err := pq.CreateTopic(ctx, "bigintmigtopic"); err != nil {
-		t.Fatalf("CreateTopic failed: %v", err)
-	}
-	if err := pq.Subscribe(ctx, "bigintmigtopic", "sub1"); err != nil {
-		t.Fatalf("Subscribe failed: %v", err)
-	}
-
-	// Roll the per-queue counters back to INT to mimic a pre-v4 schema. ALTER
-	// TYPE keeps the v3 _nonneg CHECK constraint and the column default.
-	revertToInt := []struct{ table, column string }{
-		{"pgqueue_msg_bigintmig", "retry_count"},
-		{"pgqueue_msg_bigintmig", "max_retries"},
-		{"pgqueue_dlq_bigintmig", "retry_count"},
-		{"pgqueue_sub_bigintmigtopic", "retry_count"},
-		{"pgqueue_dlq_bigintmigtopic", "retry_count"},
-	}
-	for _, c := range revertToInt {
-		// #nosec G201 -- table/column are fixed test literals, not user input.
-		stmt := "ALTER TABLE " + c.table + " ALTER COLUMN " + c.column + " TYPE INTEGER"
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			t.Fatalf("revert %s.%s to INTEGER: %v", c.table, c.column, err)
-		}
-	}
-
-	// Drop v4 and every later recorded version so the forward-only runner (which
-	// keys off MAX(version)) treats the database as pre-v4 and re-applies v4
-	// onward. Deleting only the v4 row would leave MAX(version) at the latest
-	// schema, and the runner would skip v4 as already applied.
-	if _, err := db.ExecContext(ctx,
-		`DELETE FROM pgqueue_schema_version WHERE version >= 4`); err != nil {
-		t.Fatalf("delete v4+ schema_version rows: %v", err)
-	}
-
-	// Re-run the migration runner; it must re-apply v4 and widen the columns.
-	if err := pgqueue.InitSchema(ctx, db); err != nil {
-		t.Fatalf("re-run InitSchema failed: %v", err)
-	}
-
-	for _, c := range revertToInt {
-		assertColumnIsBigint(t, db, c.table, c.column)
-	}
-
-	// The v4 row is recorded again and InitSchema is back at the latest version.
-	var maxVersion int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(version), 0) FROM pgqueue_schema_version`).Scan(&maxVersion); err != nil {
-		t.Fatalf("read schema version: %v", err)
-	}
-	if maxVersion != pgqueue.SchemaVersion {
-		t.Errorf("expected schema version %d after re-migration, got %d",
-			pgqueue.SchemaVersion, maxVersion)
-	}
-}
+// Note: the pre-release v4 migration that widened retry counters from INT to
+// BIGINT on pre-existing tables was removed by the v1 baseline squash. Fresh
+// installs emit BIGINT directly (TestRetryCounterColumnsAreBigint), and the
+// schema-parity test asserts the folded final shape, so there is no longer a
+// widening migration to exercise.

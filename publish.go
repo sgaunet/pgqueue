@@ -95,9 +95,9 @@ func (pq *Queue) publishResolved(
 func (pq *Queue) resolveQueueMetadata(
 	ctx context.Context,
 	queueName string,
-) (*QueueMetadata, error) {
+) (*queueMetadata, error) {
 	// Type-agnostic lookup: Publish/PublishBatch does not know up-front whether
-	// queueName is a channel or a topic — the returned QueueMetadata carries the
+	// queueName is a channel or a topic — the returned queueMetadata carries the
 	// resolved type and the caller dispatches on it. No queue_type filter is
 	// added here because the caller has no expected type to filter on.
 	//
@@ -112,7 +112,7 @@ func (pq *Queue) resolveQueueMetadata(
 		FROM %s
 		WHERE queue_name = $1
 	`, pq.globalTable("pgqueue_metadata"))
-	var meta QueueMetadata
+	var meta queueMetadata
 	err := pq.db.QueryRowContext(ctx, query, queueName).Scan(
 		&meta.ID, &meta.QueueType, &meta.QueueName,
 		&meta.TableName, &meta.Config, &meta.Paused,
@@ -132,7 +132,7 @@ func (pq *Queue) resolveQueueMetadata(
 // resolveMaxMessageSize returns the effective payload-size cap for a queue,
 // preferring the per-queue MaxMessageSize from its stored config and falling
 // back to the queue-wide cap.
-func (pq *Queue) resolveMaxMessageSize(queueMeta *QueueMetadata) int {
+func (pq *Queue) resolveMaxMessageSize(queueMeta *queueMetadata) int {
 	var config struct {
 		MaxMessageSize int `json:"MaxMessageSize"`
 	}
@@ -161,7 +161,7 @@ func checkPayloadSize(maxMessageSize int, payload []byte) error {
 }
 
 func (pq *Queue) validatePayloadSize(
-	queueMeta *QueueMetadata,
+	queueMeta *queueMetadata,
 	payload []byte,
 ) error {
 	return checkPayloadSize(pq.resolveMaxMessageSize(queueMeta), payload)
@@ -170,7 +170,7 @@ func (pq *Queue) validatePayloadSize(
 // resolveMaxMetadataSize returns the effective metadata-size cap for a queue,
 // preferring the per-queue MaxMetadataSize from its stored config and falling
 // back to the queue-wide cap.
-func (pq *Queue) resolveMaxMetadataSize(queueMeta *QueueMetadata) int {
+func (pq *Queue) resolveMaxMetadataSize(queueMeta *queueMetadata) int {
 	var config struct {
 		MaxMetadataSize int `json:"MaxMetadataSize"`
 	}
@@ -187,7 +187,7 @@ func (pq *Queue) resolveMaxMetadataSize(queueMeta *QueueMetadata) int {
 // if the result exceeds the per-queue or queue-wide cap. A nil metadata map
 // returns (nil, nil); the caller stores no JSONB value in that case.
 func (pq *Queue) marshalAndValidateMetadata(
-	queueMeta *QueueMetadata,
+	queueMeta *queueMetadata,
 	metadata map[string]any,
 ) ([]byte, error) {
 	if metadata == nil {
@@ -226,7 +226,7 @@ func marshalMetadataWithLimit(limit int, metadata map[string]any) ([]byte, error
 // MaxRetries was an explicit cap and a zero MaxRetries meant "use the default"
 // — an explicit 0 was not expressible, so nothing regresses.
 func (pq *Queue) resolveMaxRetries(
-	queueMeta *QueueMetadata,
+	queueMeta *queueMetadata,
 ) int {
 	var opts struct {
 		MaxRetries    int  `json:"MaxRetries"`

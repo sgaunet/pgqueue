@@ -60,9 +60,12 @@ func TestT024_StressWorkloadZeroLossZeroDuplication(t *testing.T) {
 	var ackedCount atomic.Int64
 
 	// Start GC goroutine
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		Interval: 50 * time.Millisecond,
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	gc.Start(ctx)
 	defer gc.Stop()
 

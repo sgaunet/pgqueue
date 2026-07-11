@@ -19,7 +19,7 @@ func TestSetReceiptHonorsEmptyQueueName(t *testing.T) {
 		QueueName: "", // intentionally empty
 	}
 
-	pgqueue.SetReceipt(msg, r)
+	msg.SetReceipt(r)
 
 	got := msg.Receipt()
 	if got != r {

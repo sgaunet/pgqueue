@@ -87,7 +87,7 @@ func (pq *Queue) ReceiveChannel(
 	}
 
 	// Stamp queue binding onto the message so Receipt() returns a full Receipt.
-	SetReceipt(msg, Receipt{
+	msg.SetReceipt(Receipt{
 		MessageID: msg.ID,
 		ClaimID:   msg.ClaimID,
 		QueueName: name,
@@ -119,7 +119,7 @@ func (pq *Queue) ReceiveTopic(
 		return nil, ErrQueueEmpty
 	}
 
-	SetReceipt(msg, Receipt{
+	msg.SetReceipt(Receipt{
 		MessageID:    msg.ID,
 		ClaimID:      msg.ClaimID,
 		QueueName:    name,

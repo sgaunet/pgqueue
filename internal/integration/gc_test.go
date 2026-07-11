@@ -52,7 +52,10 @@ func TestGarbageCollector(t *testing.T) {
 			CompletedMessageTTL: 1 * time.Millisecond, // Very short TTL for testing
 		},
 	}
-	gc := pgqueue.NewGarbageCollector(pq, gcConfig)
+	gc, err := pgqueue.NewGarbageCollector(pq, gcConfig)
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	// Wait for TTL to expire (intentional: proves the 1ms TTL is actually elapsed
 	// before GC runs — we cannot detect TTL expiry via a DB query).
@@ -117,7 +120,10 @@ func TestGarbageCollectorVisibilityTimeout(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Run GC to reset timed-out messages
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
@@ -197,7 +203,10 @@ func TestGarbageCollectorKeepForeverPreservesMessages(t *testing.T) {
 			CompletedMessageTTL: pgqueue.KeepForever,
 		},
 	}
-	gc := pgqueue.NewGarbageCollector(pq, gcConfig)
+	gc, err := pgqueue.NewGarbageCollector(pq, gcConfig)
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	// Run collection multiple times — the inter-iteration sleep is intentional:
 	// it spaces out the GC passes to confirm the message survives repeated runs,
@@ -250,7 +259,10 @@ func TestGarbageCollectorDefaultPolicyPurgesCompleted(t *testing.T) {
 	}
 
 	// An empty config: NewGarbageCollector substitutes the default policy.
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
@@ -308,12 +320,15 @@ func TestGarbageCollectorParallel(t *testing.T) {
 	}, "timed out waiting for all per-queue acked messages to reach completed state")
 
 	// Run parallel GC with MaxWorkers=3 (less than numQueues to test semaphore)
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 1 * time.Millisecond,
 		},
 		MaxWorkers: 3,
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	// Wait for TTL to expire (intentional: 1ms TTL must be elapsed before GC
 	// runs; we cannot observe TTL expiry through a DB query).
@@ -395,11 +410,14 @@ func TestGarbageCollectorPubSub(t *testing.T) {
 	// the GC purge runs; no observable DB state change signals this).
 	time.Sleep(10 * time.Millisecond)
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 1 * time.Millisecond,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
@@ -458,11 +476,14 @@ func TestGarbageCollectorPubSubPartialAck(t *testing.T) {
 	// the GC purge runs; no observable DB state change signals this).
 	time.Sleep(10 * time.Millisecond)
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 1 * time.Millisecond,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
@@ -509,7 +530,10 @@ func TestPurgeQueue(t *testing.T) {
 	}
 
 	// Purge the queue.
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	err = gc.PurgeQueue(ctx, "purge-test", pgqueue.QueueTypeChannel)
 	if err != nil {
 		t.Fatalf("failed to purge queue: %v", err)
@@ -529,9 +553,12 @@ func TestGarbageCollectorDoubleStop(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		Interval: 100 * time.Millisecond,
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	gc.Start(ctx)
@@ -551,7 +578,10 @@ func TestGarbageCollectorStopWithoutStart(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	// Stop without Start must not block or panic
 	done := make(chan struct{})
@@ -601,7 +631,10 @@ func TestGarbageCollectorPubSubVisibilityTimeout(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // intentional: wait for 1ms visibility timeout to lapse
 
 	// GC should reset timed-out subscription back to pending
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
@@ -654,7 +687,10 @@ func TestExhaustedTimedOutSubscriptionsPromotedByGC(t *testing.T) {
 		t.Fatalf("failed to publish: %v", err)
 	}
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	// Claim with a 1ms visibility timeout and never ack; a GC pass then resets
 	// the timed-out subscription to pending, counting the timeout (retry_count
@@ -737,11 +773,14 @@ func TestGarbageCollectorMaxPendingAge(t *testing.T) {
 			}
 		}
 
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 			DefaultPolicy: pgqueue.RetentionPolicy{
 				MaxPendingAge: 1 * time.Hour,
 			},
 		})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("garbage collection failed: %v", err)
 		}
@@ -782,11 +821,14 @@ func TestGarbageCollectorMaxPendingAge(t *testing.T) {
 			}
 		}
 
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 			DefaultPolicy: pgqueue.RetentionPolicy{
 				MaxPendingAge: 1 * time.Hour,
 			},
 		})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("garbage collection failed: %v", err)
 		}
@@ -854,11 +896,14 @@ func TestGarbageCollectorDLQRetention(t *testing.T) {
 		t.Fatalf("failed to backdate DLQ: %v", err)
 	}
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			DLQRetention: 1 * time.Hour,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
@@ -911,7 +956,7 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 		}
 	}
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 24 * time.Hour, // Retains all
 		},
@@ -919,6 +964,9 @@ func TestGarbageCollectorPerQueuePolicy(t *testing.T) {
 			"gc-policy-a": {CompletedMessageTTL: 1 * time.Hour}, // Purges old
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("garbage collection failed: %v", err)
 	}
@@ -977,7 +1025,10 @@ func TestT019_GCReclaimCountsVisibilityTimeoutOnce(t *testing.T) {
 
 	// Run GC: it resets the timed-out message to pending and counts the timeout
 	// as one delivery attempt (retry_count 0 -> 1).
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("GC collect failed: %v", err)
 	}
@@ -1089,7 +1140,10 @@ func TestGCCountsVisibilityTimeoutTowardDLQ(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 
 	// maxRetries=2 means the message tolerates retry_count 0 and 1; a third
 	// timed-out reclaim (retry_count would reach 2) promotes it to the DLQ.
@@ -1172,9 +1226,12 @@ func TestGCKeepsDLQReferencedPubSubMessage(t *testing.T) {
 	// intentional: the 1ms CompletedMessageTTL must have elapsed before GC
 	// would attempt to delete the row; we cannot observe TTL expiry via DB.
 	time.Sleep(20 * time.Millisecond)
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{CompletedMessageTTL: 1 * time.Millisecond},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("GC collect: %v", err)
 	}
@@ -1248,12 +1305,15 @@ func TestGCPubSubDLQRetentionExceedsCompletedTTL(t *testing.T) {
 	// CompletedMessageTTL (1ms) is far shorter than DLQRetention (1h): the exact
 	// configuration C9 warned about. The DLQ entry is fresh, so it survives this
 	// pass; the message must survive too because the DLQ entry pins it.
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 1 * time.Millisecond,
 			DLQRetention:        1 * time.Hour,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("GC collect: %v", err)
 	}
@@ -1298,7 +1358,10 @@ func TestGarbageCollectorInertAfterClose(t *testing.T) {
 		t.Fatalf("close queue: %v", err)
 	}
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	gc.Start(ctx) // must be a no-op on a closed Queue
 
 	done := make(chan struct{})
@@ -1344,9 +1407,12 @@ func TestGarbageCollectorPaginatesRetentionPurges(t *testing.T) {
 			t.Fatalf("seed completed channel rows: %v", err)
 		}
 
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 			DefaultPolicy: pgqueue.RetentionPolicy{CompletedMessageTTL: time.Hour},
 		})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("collect: %v", err)
 		}
@@ -1384,9 +1450,12 @@ func TestGarbageCollectorPaginatesRetentionPurges(t *testing.T) {
 			t.Fatalf("seed pubsub subscriptions: %v", err)
 		}
 
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 			DefaultPolicy: pgqueue.RetentionPolicy{CompletedMessageTTL: time.Hour},
 		})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("collect: %v", err)
 		}
@@ -1415,9 +1484,12 @@ func TestGarbageCollectorPaginatesRetentionPurges(t *testing.T) {
 			t.Fatalf("seed pending channel rows: %v", err)
 		}
 
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 			DefaultPolicy: pgqueue.RetentionPolicy{MaxPendingAge: time.Hour},
 		})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("collect: %v", err)
 		}
@@ -1463,9 +1535,12 @@ func TestGarbageCollectorPaginatesRetentionPurges(t *testing.T) {
 			t.Fatalf("seed acked subs: %v", err)
 		}
 
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 			DefaultPolicy: pgqueue.RetentionPolicy{MaxPendingAge: time.Hour},
 		})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("collect: %v", err)
 		}
@@ -1513,9 +1588,12 @@ func TestGarbageCollectorPaginatesRetentionPurges(t *testing.T) {
 			t.Fatalf("seed DLQ rows: %v", err)
 		}
 
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 			DefaultPolicy: pgqueue.RetentionPolicy{DLQRetention: time.Hour},
 		})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("collect: %v", err)
 		}
@@ -1549,7 +1627,10 @@ func TestGarbageCollectorPaginatesRetentionPurges(t *testing.T) {
 		}
 
 		// Default policy is fine: orphan reclaim runs regardless of policy.
-		gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+		gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+		if err != nil {
+			t.Fatalf("NewGarbageCollector: %v", err)
+		}
 		if err := gc.Collect(ctx); err != nil {
 			t.Fatalf("collect: %v", err)
 		}

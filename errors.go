@@ -122,6 +122,18 @@ var (
 		"pgqueue schema is outdated: run InitSchema to migrate",
 	)
 
+	// ErrSchemaTooNew is returned by InitSchema (and therefore by New via
+	// checkSchemaReady) when the database's recorded schema version is strictly
+	// greater than this binary's SchemaVersion constant. This indicates a
+	// rolling-deploy scenario where an older binary is starting against a database
+	// already migrated by a newer binary. Proceeding would risk data corruption or
+	// query errors against columns that the older code does not expect, so the
+	// binary aborts with this error instead of silently running against a schema it
+	// does not understand.
+	ErrSchemaTooNew = errors.New(
+		"pgqueue schema is newer than this binary: upgrade the binary or roll back the schema",
+	)
+
 	// ErrQueueEmpty is returned by single-shot consume operations when no
 	// message is currently available. It is an expected, non-fatal signal:
 	// callers should treat it as "try again later", not as a failure.

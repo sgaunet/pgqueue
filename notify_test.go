@@ -78,6 +78,18 @@ func (l *blockingListener) Notifications() <-chan string {
 }
 func (l *blockingListener) Close() error { return nil }
 
+// registerWaker installs a fresh waker for channel and returns it, mirroring what
+// wakeChan does under the lock. Tests that drive confirmListen directly pass the
+// returned waker as the "captured" waker so the staleness guard treats the call
+// as the live owner of the channel's bookkeeping.
+func registerWaker(n *notifier, channel string) *waker {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	w := newWaker()
+	n.wakers[channel] = w
+	return w
+}
+
 // TestPumpRecoversPanicAndWakesAll is the issue #69 regression: a panic in
 // the pump-goroutine loop body must be recovered, logged at ERROR, and every
 // currently-blocked consumer must be woken so they fall back to the
@@ -152,11 +164,12 @@ func TestConfirmListenLogsListenFailures(t *testing.T) {
 	}
 
 	const channel = "pgqueue_msg_x"
+	w := registerWaker(n, channel)
 
 	// Drive listenEscalateThreshold failures; each one bumps the per-channel
 	// counter and the threshold-th attempt escalates to ERROR.
 	for range listenEscalateThreshold {
-		n.confirmListen(channel)
+		n.confirmListen(channel, w)
 	}
 
 	out := buf.String()
@@ -177,7 +190,7 @@ func TestConfirmListenLogsListenFailures(t *testing.T) {
 
 	// One more failure escalates to a fresh ERROR? No — we're at threshold+1,
 	// which is not a multiple, so only a WARN should land.
-	n.confirmListen(channel)
+	n.confirmListen(channel, w)
 	if got := strings.Count(buf.String(), "level=ERROR"); got != 1 {
 		t.Errorf("ERROR count after attempt 11 = %d, want 1", got)
 	}
@@ -193,15 +206,16 @@ func TestConfirmListenResetsFailureCountOnSuccess(t *testing.T) {
 	fl := &failingListener{err: errors.New("transient")}
 	n := newNotifier(fl, logger)
 	const channel = "ch"
+	w := registerWaker(n, channel)
 	for range 3 {
-		n.confirmListen(channel)
+		n.confirmListen(channel, w)
 	}
 	if got := n.listenFailures[channel]; got != 3 {
 		t.Fatalf("listenFailures = %d, want 3", got)
 	}
 	// Flip the Listener to succeed; next confirmListen resets the counter.
 	fl.err = nil
-	n.confirmListen(channel)
+	n.confirmListen(channel, w)
 	if got, ok := n.listenFailures[channel]; ok {
 		t.Errorf("listenFailures still tracks %q with value %d after success", channel, got)
 	}
@@ -250,6 +264,105 @@ func TestWakeChanConfirmsListenAsync(t *testing.T) {
 		defer n.mu.Unlock()
 		return n.listening[channel] && !n.listenInFlight[channel]
 	}, "channel was not marked listening after Listen returned")
+}
+
+// TestConfirmListenStaleAfterForgetDoesNotRevive is the regression for the
+// confirmListen race: if forget runs while Listen is in flight (queue deleted)
+// and the channel is then recreated under the same name, the stale confirmListen
+// must NOT mark the channel listening (which would make a later wakeChan skip
+// re-establishing the server-side LISTEN and silently lose push delivery) nor
+// delete the new owner's listenInFlight flag.
+func TestConfirmListenStaleAfterForgetDoesNotRevive(t *testing.T) {
+	bl := &blockingListener{release: make(chan struct{})}
+	n := newNotifier(bl, nil)
+	if n == nil {
+		t.Fatal("newNotifier returned nil")
+	}
+	const channel = "pgqueue_msg_stale"
+
+	// Model wakeChan having spawned confirmListen for the original waker.
+	w1 := registerWaker(n, channel)
+	n.mu.Lock()
+	n.listenInFlight[channel] = true
+	n.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.confirmListen(channel, w1) // blocks inside Listen
+	}()
+	waitFor(t, func() bool { return bl.callCount() == 1 }, "Listen was not entered")
+
+	// Queue deleted: forget drops w1 and all per-channel bookkeeping (bl is not an
+	// Unlistener, so forget just clears the maps and bumps the waker identity).
+	n.forget(context.Background(), channel)
+
+	// Queue recreated under the same name: a new wakeChan installs a fresh waker
+	// and marks a new confirmation in flight. Model that resulting state directly.
+	w2 := registerWaker(n, channel)
+	n.mu.Lock()
+	n.listenInFlight[channel] = true
+	n.mu.Unlock()
+
+	// Release the original (now stale) Listen; it returns success.
+	close(bl.release)
+	<-done
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.listening[channel] {
+		t.Error("stale confirmListen revived listening for a forgotten channel")
+	}
+	if !n.listenInFlight[channel] {
+		t.Error("stale confirmListen deleted the new owner's listenInFlight flag")
+	}
+	if n.wakers[channel] != w2 {
+		t.Error("the new owner's waker was clobbered")
+	}
+}
+
+// TestConfirmListenStaleFailureDoesNotCorruptCounter ensures a stale FAILING
+// confirmListen does not increment the new owner's failure counter or fire a
+// missed-notification metric for the recreated channel.
+func TestConfirmListenStaleFailureDoesNotCorruptCounter(t *testing.T) {
+	bl := &blockingListener{release: make(chan struct{}), err: errors.New("listen failed")}
+	n := newNotifier(bl, nil)
+	if n == nil {
+		t.Fatal("newNotifier returned nil")
+	}
+	var missed int
+	n.onMissedNotification = func(string) { missed++ }
+	const channel = "pgqueue_msg_stalefail"
+
+	w1 := registerWaker(n, channel)
+	n.mu.Lock()
+	n.listenInFlight[channel] = true
+	n.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.confirmListen(channel, w1) // blocks, then returns an error
+	}()
+	waitFor(t, func() bool { return bl.callCount() == 1 }, "Listen was not entered")
+
+	n.forget(context.Background(), channel)
+	registerWaker(n, channel) // new owner installs a fresh waker
+	n.mu.Lock()
+	n.listenInFlight[channel] = true
+	n.mu.Unlock()
+
+	close(bl.release)
+	<-done
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if got := n.listenFailures[channel]; got != 0 {
+		t.Errorf("stale failure incremented the new owner's failure counter to %d, want 0", got)
+	}
+	if missed != 0 {
+		t.Errorf("stale failure fired onMissedNotification %d times, want 0", missed)
+	}
 }
 
 // waitFor polls cond until it holds or a short deadline passes.

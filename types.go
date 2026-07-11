@@ -146,14 +146,15 @@ type FailedReceipt struct {
 // returns the full binding. ReceiveChannel and ReceiveTopic call this
 // internally; it is exported chiefly so in-memory test doubles (the
 // fake package) can build messages that behave identically to ones
-// returned by a real Queue.
-func SetReceipt(m *Message, r Receipt) {
+// returned by a real Queue. It is a method to pair with the (m *Message)
+// Receipt() getter.
+func (m *Message) SetReceipt(r Receipt) {
 	m.receipt = r
 	m.receiptSet = true
 }
 
-// QueueMetadata holds information about a queue.
-type QueueMetadata struct {
+// queueMetadata holds information about a queue.
+type queueMetadata struct {
 	ID        uuid.UUID
 	QueueType QueueType
 	QueueName string
@@ -164,8 +165,8 @@ type QueueMetadata struct {
 	UpdatedAt time.Time
 }
 
-// Subscriber represents a pub/sub subscriber registration.
-type Subscriber struct {
+// subscriber represents a pub/sub subscriber registration.
+type subscriber struct {
 	ID           uuid.UUID
 	TopicName    string
 	SubscriberID string

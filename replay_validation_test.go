@@ -11,8 +11,9 @@ import (
 
 // TestReplayOptionsPerformedByValidation is the issue #72 regression: the
 // validation that runs before any database call must reject PerformedBy
-// values that are too long or carry NUL/CR/LF characters, so the audit log
-// in pgqueue_replay_log cannot be bloated or made unreadable by a
+// values that are too long or carry any control character (NUL, CR, LF, tab,
+// ESC, and other C0/C1 controls), so the audit log in pgqueue_replay_log cannot
+// be bloated, made unreadable, or used to inject terminal escape sequences by a
 // misconfigured caller.
 //
 // Only the rejection path is exercised here — the test drives validation
@@ -32,6 +33,10 @@ func TestReplayOptionsPerformedByValidation(t *testing.T) {
 		{"NUL", "alice\x00root"},
 		{"CR", "alice\rinjected"},
 		{"LF", "alice\ninjected"},
+		{"tab", "alice\tinjected"},
+		{"ESC", "alice\x1b[31minjected"},
+		{"vertical_tab", "alice\x0binjected"},
+		{"DEL", "alice\x7finjected"},
 	}
 
 	for _, tc := range cases {

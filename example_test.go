@@ -163,7 +163,7 @@ func ExampleNewGarbageCollector() {
 		ctx context.Context
 		q   *pgqueue.Queue
 	)
-	gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
 		Interval: 5 * time.Minute,
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: 24 * time.Hour,
@@ -171,6 +171,9 @@ func ExampleNewGarbageCollector() {
 			DLQRetention:        30 * 24 * time.Hour,
 		},
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 	gc.Start(ctx) // background loop; q.Close() stops it
 }
 

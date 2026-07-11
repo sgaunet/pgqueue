@@ -111,14 +111,18 @@ func (pq *Queue) consumableDepth(
 	return count, nil
 }
 
-// queueDepthQuery builds the consumable-depth COUNT for a queue. When a TTL is
-// configured the count excludes messages past their TTL — for channels via the
-// message table's created_at, for topics via the joined message row — so it
-// agrees with what the consume queries deliver.
+// queueDepthQuery builds the consumable-depth COUNT for a queue. It mirrors the
+// consume queries' delivery predicate so the depth never over-reports: a pending
+// row is only consumable once available_at has elapsed (channel.go / pubsub.go
+// gate on available_at <= NOW()), so a backoff-sleeping or delayed message in
+// status 'pending' but with a future available_at is excluded. When a TTL is
+// configured the count additionally excludes messages past their TTL — for
+// channels via the message table's created_at, for topics via the joined message
+// row.
 func queueDepthQuery(pq *Queue, tableName string, queueType QueueType, ttl time.Duration) (string, []any) {
 	if queueType == QueueTypeChannel {
 		base := fmt.Sprintf(
-			"SELECT COUNT(*) FROM %s WHERE status = '%s'",
+			"SELECT COUNT(*) FROM %s WHERE status = '%s' AND available_at <= NOW()",
 			pq.msgTable(tableName), MessageStatusPending,
 		)
 		if ttl > 0 {
@@ -131,12 +135,13 @@ func queueDepthQuery(pq *Queue, tableName string, queueType QueueType, ttl time.
 	if ttl > 0 {
 		return fmt.Sprintf(
 			`SELECT COUNT(*) FROM %s s JOIN %s m ON s.message_id = m.id
-			 WHERE s.status = '%s' AND m.created_at > NOW() - make_interval(secs => $1)`,
+			 WHERE s.status = '%s' AND s.available_at <= NOW()
+			   AND m.created_at > NOW() - make_interval(secs => $1)`,
 			pq.subTable(tableName), pq.msgTable(tableName), MessageStatusPending,
 		), []any{ttl.Seconds()}
 	}
 	return fmt.Sprintf(
-		"SELECT COUNT(*) FROM %s WHERE status = '%s'",
+		"SELECT COUNT(*) FROM %s WHERE status = '%s' AND available_at <= NOW()",
 		pq.subTable(tableName), MessageStatusPending,
 	), nil
 }

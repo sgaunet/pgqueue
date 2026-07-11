@@ -127,6 +127,62 @@ func TestQueueDepth(t *testing.T) {
 	}
 }
 
+// TestQueueDepthExcludesNotYetDue is the regression for the available_at depth
+// inflation: a message nacked with a backoff delay is back in status 'pending'
+// but its available_at is in the future, so consume will not deliver it yet.
+// QueueDepth must exclude it (matching what consume delivers) even though the
+// raw Stats().PendingCount still counts it.
+func TestQueueDepthExcludesNotYetDue(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if err := pq.CreateChannel(ctx, "depth-backoff"); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, "depth-backoff", []byte("test message")); err != nil {
+		t.Fatalf("failed to publish message: %v", err)
+	}
+
+	// Immediately available: depth 1.
+	if depth, err := pq.QueueDepth(ctx, "depth-backoff", pgqueue.QueueTypeChannel); err != nil {
+		t.Fatalf("failed to get queue depth: %v", err)
+	} else if depth != 1 {
+		t.Fatalf("expected depth 1 after publish, got %d", depth)
+	}
+
+	// Claim then nack with a long retry delay so available_at is pushed far into
+	// the future while the message returns to 'pending'.
+	msg, err := pq.ReceiveChannel(ctx, "depth-backoff", pgqueue.WithVisibilityTimeout(30*time.Second))
+	if err != nil {
+		t.Fatalf("failed to consume message: %v", err)
+	}
+	if err := pq.Nack(ctx, msg.Receipt(), "transient", pgqueue.WithRetryDelay(time.Hour)); err != nil {
+		t.Fatalf("failed to nack message: %v", err)
+	}
+
+	// The message is pending again but not yet due — QueueDepth must report 0.
+	depth, err := pq.QueueDepth(ctx, "depth-backoff", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get queue depth: %v", err)
+	}
+	if depth != 0 {
+		t.Errorf("expected depth 0 for a backoff-sleeping message, got %d", depth)
+	}
+
+	// The raw pending count still includes it, confirming the message is not lost
+	// and that QueueDepth's exclusion is the available_at gate, not deletion.
+	stats, err := pq.Stats(ctx, "depth-backoff", pgqueue.QueueTypeChannel)
+	if err != nil {
+		t.Fatalf("failed to get stats: %v", err)
+	}
+	if stats.PendingCount != 1 {
+		t.Errorf("expected raw PendingCount 1 (message retained), got %d", stats.PendingCount)
+	}
+}
+
 func TestSubscriberLag(t *testing.T) {
 	pq, _, cleanup := setupTestDB(t)
 	defer cleanup()

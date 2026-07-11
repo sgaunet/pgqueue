@@ -245,7 +245,7 @@ func (pq *Queue) fetchPendingChannelMessage(
 	visibilityTimeout time.Duration,
 	ttl time.Duration,
 ) (*Message, *time.Time, error) {
-	query, args := channelConsumeQuery(pq.msgTable(tableName), ttl)
+	pendingQuery, reclaimQuery, args := channelConsumeQueries(pq.msgTable(tableName), ttl)
 
 	// Loop so that a timed-out message that is skipped — its redelivery
 	// deferred by the backoff policy (R-05), or it has exhausted its retries
@@ -255,17 +255,31 @@ func (pq *Queue) fetchPendingChannelMessage(
 	// unbounded backlog.
 	defers := 0
 	for {
+		// Probe A (pending): the hot path. A pending row is delivered directly —
+		// it needs no reclaim accounting — and its dedicated partial index means
+		// this probe's cost is bounded by the pending set, not by history depth
+		// (C1). Preferred over the reclaim probe (pending-first tie-break).
 		var row channelCandidate
-		err := tx.QueryRowContext(ctx, query, args...).Scan(
-			&row.id, &row.payload, &row.createdAt, &row.status,
-			&row.retryCount, &row.maxRetries, &row.metadataJSON,
-			&row.processedAt, &row.errorMessage,
-		)
+		err := scanChannelCandidate(tx.QueryRowContext(ctx, pendingQuery, args...), &row)
+		switch {
+		case err == nil:
+			return pq.claimChannelMessage(
+				ctx, tx, tableName, channelName, visibilityTimeout, row, row.retryCount,
+			)
+		case !errors.Is(err, sql.ErrNoRows):
+			return nil, nil, fmt.Errorf("failed to query pending message: %w", err)
+		}
+
+		// Probe B (reclaim): no pending message is available, so look for a
+		// timed-out 'processing' message whose previous consumer never acked.
+		// Reclaiming here means redelivery does not depend on the GarbageCollector
+		// running. Its own partial index keeps this probe bounded too.
+		err = scanChannelCandidate(tx.QueryRowContext(ctx, reclaimQuery, args...), &row)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, nil
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to query message: %w", err)
+			return nil, nil, fmt.Errorf("failed to query timed-out message: %w", err)
 		}
 
 		retryCount, deferred, err := pq.reclaimChannelAttempt(ctx, tx, tableName, row)
@@ -288,18 +302,35 @@ func (pq *Queue) fetchPendingChannelMessage(
 	}
 }
 
-// channelConsumeQuery builds the SELECT for the next consumable channel message.
-// A message is consumable when it is pending, or when it is still marked
-// processing but its visibility timeout has expired (the previous consumer
-// crashed or never acked). Reclaiming timed-out messages here means redelivery
-// does not depend on the GarbageCollector running.
+// scanChannelCandidate reads one channel message row into c. Both consume probes
+// select the same column list, so they share this scan. The scan error is
+// wrapped with query context by the caller.
 //
-// A timed-out 'processing' message that has exhausted its retries is also
-// selected: reclaimChannelAttempt promotes it to the DLQ inline and the scan
-// skips to the next candidate. This keeps an exhausted-by-timeout message from
-// being stranded when no GarbageCollector is running, matching how the pub/sub
-// consume path handles exhausted subscriptions (reclaimTopicAttempt).
-func channelConsumeQuery(msgTable string, ttl time.Duration) (string, []any) {
+//nolint:wrapcheck // caller annotates the error with which probe failed
+func scanChannelCandidate(scanner interface{ Scan(dest ...any) error }, c *channelCandidate) error {
+	return scanner.Scan(
+		&c.id, &c.payload, &c.createdAt, &c.status,
+		&c.retryCount, &c.maxRetries, &c.metadataJSON,
+		&c.processedAt, &c.errorMessage,
+	)
+}
+
+// channelConsumeQueries builds the two consume probes for the next consumable
+// channel message. Splitting the former single OR query into two single-branch
+// probes is what lets PostgreSQL serve each from its own partial index instead
+// of falling back to a primary-key scan across history rows (C1):
+//
+//   - pendingQuery selects an immediately-consumable pending message. A pending
+//     message is only consumable once available_at has elapsed, which enforces
+//     the retry backoff delay (FR-023) and any WithRetryDelay override.
+//   - reclaimQuery selects a still-'processing' message whose visibility timeout
+//     has expired (the previous consumer crashed or never acked).
+//
+// Both order by id and LIMIT 1 FOR UPDATE SKIP LOCKED, and both carry the same
+// optional ttl cutoff so a message past its TTL is delivered by neither probe —
+// exactly the semantics of the previous combined query, whose trailing ttl
+// clause was ANDed with both OR branches.
+func channelConsumeQueries(msgTable string, ttl time.Duration) (string, string, []any) {
 	args := []any{}
 	ttlClause := ""
 	if ttl > 0 {
@@ -307,22 +338,30 @@ func channelConsumeQuery(msgTable string, ttl time.Duration) (string, []any) {
 		args = append(args, ttl.Seconds())
 	}
 
-	// A pending message is only consumable once available_at has elapsed: this
-	// is what enforces the retry backoff delay (FR-023) and any WithRetryDelay
-	// override. Freshly published messages default available_at to now().
-	query := fmt.Sprintf(`
-		SELECT id, payload, created_at, status, retry_count, max_retries,
-		       metadata, processed_at, error_message
+	const cols = `id, payload, created_at, status, retry_count, max_retries,
+		       metadata, processed_at, error_message`
+
+	pendingQuery := fmt.Sprintf(`
+		SELECT %s
 		FROM %s
-		WHERE ((status = '%s' AND available_at <= NOW())
-		       OR (status = '%s' AND visibility_timeout < NOW()))
+		WHERE status = '%s' AND available_at <= NOW()
 		  %s
 		ORDER BY id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, msgTable, MessageStatusPending, MessageStatusProcessing, ttlClause)
+	`, cols, msgTable, MessageStatusPending, ttlClause)
 
-	return query, args
+	reclaimQuery := fmt.Sprintf(`
+		SELECT %s
+		FROM %s
+		WHERE status = '%s' AND visibility_timeout < NOW()
+		  %s
+		ORDER BY id
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`, cols, msgTable, MessageStatusProcessing, ttlClause)
+
+	return pendingQuery, reclaimQuery, args
 }
 
 // reclaimChannelAttempt accounts for a redelivery when a candidate was picked

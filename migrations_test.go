@@ -3,18 +3,8 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
 	"testing"
 )
-
-// fakeSQLStateErr is a driver-style error exposing a SQLSTATE via the same
-// SQLState() accessor pgx's *pgconn.PgError uses, so isDuplicateObjectError can
-// be exercised without a live database or a driver import.
-type fakeSQLStateErr struct{ code string }
-
-func (e fakeSQLStateErr) Error() string    { return "sqlstate " + e.code }
-func (e fakeSQLStateErr) SQLState() string { return e.code }
 
 // stubApply is a non-nil apply phase used to build well-formed test migrations
 // without touching a database.
@@ -94,31 +84,5 @@ func TestValidateMigrationsNoPhase(t *testing.T) {
 	ms[len(ms)-1].applyNonTx = nil
 	if err := validateMigrations(ms); err == nil {
 		t.Fatal("expected a migration with no apply/applyNonTx to be rejected")
-	}
-}
-
-// TestIsDuplicateObjectError covers the SQLSTATE-first classification: pgx-style
-// errors are matched on 42710 exactly (so a duplicate_table 42P07 with the same
-// "already exists" text is NOT misread as duplicate_object), while drivers
-// without a SQLState() accessor (lib/pq) fall back to the error text.
-func TestIsDuplicateObjectError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"nil", nil, false},
-		{"sqlstate 42710", fakeSQLStateErr{code: "42710"}, true},
-		{"wrapped sqlstate 42710", fmt.Errorf("apply v3: %w", fakeSQLStateErr{code: "42710"}), true},
-		{"sqlstate 42P07 duplicate_table", fakeSQLStateErr{code: "42P07"}, false},
-		{"lib/pq text fallback", errors.New(`constraint "c" for relation "r" already exists`), true},
-		{"unrelated text", errors.New("connection refused"), false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isDuplicateObjectError(tc.err); got != tc.want {
-				t.Errorf("isDuplicateObjectError(%v) = %v, want %v", tc.err, got, tc.want)
-			}
-		})
 	}
 }

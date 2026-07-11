@@ -72,7 +72,7 @@ func (pq *Queue) PublishBatch(
 // checks before calling this.
 func (pq *Queue) publishBatchResolved(
 	ctx context.Context,
-	queueMeta *QueueMetadata,
+	queueMeta *queueMetadata,
 	messages []PublishMessage,
 ) ([]uuid.UUID, error) {
 	// Resolve the payload-size cap once for the whole batch rather than
@@ -468,7 +468,7 @@ func (pq *Queue) nackTopicBatch(
 func (pq *Queue) getTopicMetadata(
 	ctx context.Context,
 	topicName string,
-) (*QueueMetadata, error) {
+) (*queueMetadata, error) {
 	queueMeta, err := pq.getQueueMetadata(
 		ctx, string(QueueTypePubSub), topicName,
 	)
@@ -551,7 +551,7 @@ func validateBatchSize(size int) error {
 // prepareBatchMessages generates IDs and marshals metadata for all messages,
 // rejecting any message whose marshaled metadata exceeds the configured cap.
 func (pq *Queue) prepareBatchMessages(
-	queueMeta *QueueMetadata,
+	queueMeta *queueMetadata,
 	messages []PublishMessage,
 ) ([]uuid.UUID, [][]byte, error) {
 	ids := make([]uuid.UUID, len(messages))
@@ -727,7 +727,7 @@ func (pq *Queue) batchCreateSubscriptionRecords(
 	tx *sql.Tx,
 	tableName string,
 	messageIDs []uuid.UUID,
-	subscribers []Subscriber,
+	subscribers []subscriber,
 ) error {
 	records := make([]subRecord, 0, len(messageIDs)*len(subscribers))
 	for _, msgID := range messageIDs {

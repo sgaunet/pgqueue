@@ -409,7 +409,9 @@ func (pq *Queue) fetchPendingTopicMessage(
 	ttl time.Duration,
 	maxRetries int,
 ) (*Message, *time.Time, error) {
-	query, args := topicConsumeQuery(pq.subTable(tableName), pq.msgTable(tableName), subscriberID, ttl)
+	pendingQuery, reclaimQuery, args := topicConsumeQueries(
+		pq.subTable(tableName), pq.msgTable(tableName), subscriberID, ttl,
+	)
 
 	// Loop so an exhausted timed-out subscription is moved to the DLQ and
 	// skipped rather than redelivered forever — see fetchPendingChannelMessage.
@@ -417,16 +419,28 @@ func (pq *Queue) fetchPendingTopicMessage(
 	// walk — and row-lock — an unbounded backlog in a single transaction.
 	skips := 0
 	for {
+		// Probe A (pending): the hot path, delivered directly. Its per-subscriber
+		// partial index bounds the probe's cost by the subscriber's pending set,
+		// not by its delivered history (C1). Preferred over the reclaim probe.
 		var row topicCandidate
-		err := tx.QueryRowContext(ctx, query, args...).Scan(
-			&row.subID, &row.msgID, &row.payload, &row.createdAt,
-			&row.status, &row.retryCount, &row.metadataJSON, &row.errorMessage,
-		)
+		err := scanTopicCandidate(tx.QueryRowContext(ctx, pendingQuery, args...), &row)
+		switch {
+		case err == nil:
+			return pq.claimTopicSubscription(
+				ctx, tx, tableName, topicName, visibilityTimeout, row, row.retryCount, maxRetries,
+			)
+		case !errors.Is(err, sql.ErrNoRows):
+			return nil, nil, fmt.Errorf("failed to query pending subscription: %w", err)
+		}
+
+		// Probe B (reclaim): no pending subscription, so look for a timed-out
+		// 'processing' one whose previous consumer never acked.
+		err = scanTopicCandidate(tx.QueryRowContext(ctx, reclaimQuery, args...), &row)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, nil
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to query subscription: %w", err)
+			return nil, nil, fmt.Errorf("failed to query timed-out subscription: %w", err)
 		}
 
 		retryCount, dlqd, err := pq.reclaimTopicAttempt(
@@ -451,34 +465,71 @@ func (pq *Queue) fetchPendingTopicMessage(
 	}
 }
 
-// topicConsumeQuery builds the SELECT for the next consumable subscription. A
-// subscription is consumable when pending, or when still processing but its
-// visibility timeout has expired — see channelConsumeQuery.
-func topicConsumeQuery(subTable, msgTable, subscriberID string, ttl time.Duration) (string, []any) {
-	ttlClause := ""
+// scanTopicCandidate reads one subscription row into c. Both consume probes
+// select the same column list, so they share this scan. The scan error is
+// wrapped with query context by the caller.
+//
+//nolint:wrapcheck // caller annotates the error with which probe failed
+func scanTopicCandidate(scanner interface{ Scan(dest ...any) error }, c *topicCandidate) error {
+	return scanner.Scan(
+		&c.subID, &c.msgID, &c.payload, &c.createdAt,
+		&c.status, &c.retryCount, &c.metadataJSON, &c.errorMessage,
+	)
+}
+
+// topicConsumeQueries builds the two consume probes for a subscriber's next
+// consumable subscription. Like channelConsumeQueries, splitting the former
+// single OR query into two single-branch probes lets PostgreSQL serve each from
+// its own per-subscriber partial index instead of scanning the subscriber's
+// delivered history (C1):
+//
+//   - pendingQuery selects an immediately-consumable pending subscription; a
+//     pending subscription is only consumable once available_at has elapsed,
+//     enforcing the retry backoff delay (FR-023).
+//   - reclaimQuery selects a still-'processing' subscription whose visibility
+//     timeout has expired.
+//
+// Both order by m.id and LIMIT 1 FOR UPDATE OF s SKIP LOCKED, and both carry the
+// same optional ttl cutoff (bound as $2) so a message past its TTL is delivered
+// by neither probe — the semantics of the previous combined query.
+func topicConsumeQueries(
+	subTable, msgTable, subscriberID string, ttl time.Duration,
+) (string, string, []any) {
 	args := []any{subscriberID}
+	ttlClause := ""
 	if ttl > 0 {
 		ttlClause = "AND m.created_at > NOW() - make_interval(secs => $2)"
 		args = append(args, ttl.Seconds())
 	}
 
-	// A pending subscription is only consumable once available_at has elapsed,
-	// enforcing the retry backoff delay (FR-023) — see channelConsumeQuery.
-	query := fmt.Sprintf(`
-		SELECT s.id, s.message_id, m.payload, m.created_at,
-		       s.status, s.retry_count, m.metadata, s.error_message
+	const cols = `s.id, s.message_id, m.payload, m.created_at,
+		       s.status, s.retry_count, m.metadata, s.error_message`
+
+	pendingQuery := fmt.Sprintf(`
+		SELECT %s
 		FROM %s s
 		JOIN %s m ON s.message_id = m.id
 		WHERE s.subscriber_id = $1
-		  AND ((s.status = '%s' AND s.available_at <= NOW())
-		       OR (s.status = '%s' AND s.visibility_timeout < NOW()))
+		  AND s.status = '%s' AND s.available_at <= NOW()
 		  %s
 		ORDER BY m.id
 		LIMIT 1
 		FOR UPDATE OF s SKIP LOCKED
-	`, subTable, msgTable, MessageStatusPending, MessageStatusProcessing, ttlClause)
+	`, cols, subTable, msgTable, MessageStatusPending, ttlClause)
 
-	return query, args
+	reclaimQuery := fmt.Sprintf(`
+		SELECT %s
+		FROM %s s
+		JOIN %s m ON s.message_id = m.id
+		WHERE s.subscriber_id = $1
+		  AND s.status = '%s' AND s.visibility_timeout < NOW()
+		  %s
+		ORDER BY m.id
+		LIMIT 1
+		FOR UPDATE OF s SKIP LOCKED
+	`, cols, subTable, msgTable, MessageStatusProcessing, ttlClause)
+
+	return pendingQuery, reclaimQuery, args
 }
 
 // reclaimTopicAttempt accounts for a redelivery when a subscription was picked

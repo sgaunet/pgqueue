@@ -53,7 +53,10 @@ func TestGCPreservesInFlightSubscriptionOnUnsubscribe(t *testing.T) {
 	}
 
 	// A GC pass must not delete the live in-flight subscription row.
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("gc collect: %v", err)
 	}

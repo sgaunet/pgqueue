@@ -13,8 +13,10 @@ import (
 )
 
 // repairTargetIndex is one of the partial indexes createChannelIndexes emits for
-// the "repairme" channel; sanitizeTableName leaves "repairme" unchanged.
-const repairTargetIndex = "idx_pgqueue_msg_repairme_available"
+// the "repairme" channel; sanitizeTableName leaves "repairme" unchanged. It must
+// name a partial (predicated) index so indexDef confirms the repair recreates
+// the WHERE clause identically.
+const repairTargetIndex = "idx_pgqueue_msg_repairme_consumable_null"
 
 // setupRepairTestDB starts a dedicated PostgreSQL container with
 // allow_system_table_mods enabled. That postmaster flag is what lets the test

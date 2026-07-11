@@ -1391,12 +1391,15 @@ func TestCloseJoinsBackgroundGoroutines(t *testing.T) {
 	}
 
 	// A GC that polls aggressively so it is genuinely running background work.
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		Interval: 10 * time.Millisecond,
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			CompletedMessageTTL: time.Millisecond,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	gc.Start(ctx)
 
 	// A handler-consume loop owned by the Queue.

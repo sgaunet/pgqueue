@@ -15,8 +15,19 @@ import (
 // table growth (issue #47). These tests pin that defaulting and its escape
 // hatches; they need no database — the constructor only reads/writes config.
 
+// mustNewGC constructs a GarbageCollector for a config expected to be valid,
+// failing the test on the (now returned) validation error.
+func mustNewGC(t *testing.T, config GarbageCollectorConfig) *GarbageCollector {
+	t.Helper()
+	gc, err := NewGarbageCollector(&Queue{}, config)
+	if err != nil {
+		t.Fatalf("NewGarbageCollector(%+v): unexpected error %v", config, err)
+	}
+	return gc
+}
+
 func TestNewGarbageCollectorDefaultsEmptyPolicy(t *testing.T) {
-	gc := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{})
+	gc := mustNewGC(t, GarbageCollectorConfig{})
 
 	if gc.config.DefaultPolicy != defaultRetentionPolicy {
 		t.Errorf("empty DefaultPolicy: got %+v, want default %+v",
@@ -35,7 +46,7 @@ func TestNewGarbageCollectorKeepsConfiguredPolicy(t *testing.T) {
 		MaxPendingAge:       2 * time.Hour,
 		DLQRetention:        3 * time.Hour,
 	}
-	gc := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{DefaultPolicy: want})
+	gc := mustNewGC(t, GarbageCollectorConfig{DefaultPolicy: want})
 
 	if gc.config.DefaultPolicy != want {
 		t.Errorf("configured DefaultPolicy: got %+v, want %+v", gc.config.DefaultPolicy, want)
@@ -48,7 +59,7 @@ func TestNewGarbageCollectorKeepsConfiguredPolicy(t *testing.T) {
 // keep their "forever" meaning rather than picking up defaults.
 func TestNewGarbageCollectorKeepForeverNotOverridden(t *testing.T) {
 	policy := RetentionPolicy{CompletedMessageTTL: KeepForever}
-	gc := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{DefaultPolicy: policy})
+	gc := mustNewGC(t, GarbageCollectorConfig{DefaultPolicy: policy})
 
 	if gc.config.DefaultPolicy != policy {
 		t.Errorf("KeepForever policy was overridden: got %+v, want %+v",
@@ -56,24 +67,38 @@ func TestNewGarbageCollectorKeepForeverNotOverridden(t *testing.T) {
 	}
 }
 
-// TestNewGarbageCollectorNormalizesNonPositiveInterval pins the fix for the
-// negative-interval crash: a non-positive Interval (zero, or a negative from a
-// caller-side misconfiguration) must be normalized to defaultGCInterval. A
-// negative value used to pass through unchanged and reach time.NewTicker in the
-// background GC goroutine, which panics on a <= 0 duration and crashed the
-// whole process.
-func TestNewGarbageCollectorNormalizesNonPositiveInterval(t *testing.T) {
-	for _, in := range []time.Duration{0, -time.Second, -time.Hour} {
-		gc := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{Interval: in})
-		if gc.config.Interval != defaultGCInterval {
-			t.Errorf("Interval %v: got %v, want default %v",
-				in, gc.config.Interval, defaultGCInterval)
-		}
+// TestNewGarbageCollectorInterval pins the interval handling: a zero Interval is
+// the "unset" sentinel and normalizes to defaultGCInterval (so an empty config
+// still works — issue #47), a positive interval is honored verbatim, and a
+// negative interval is now a rejected configuration error rather than being
+// silently normalized. A negative value used to pass through and reach
+// time.NewTicker in the background GC goroutine, which panics on a <= 0 duration.
+func TestNewGarbageCollectorInterval(t *testing.T) {
+	// Zero -> default.
+	gc, err := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{Interval: 0})
+	if err != nil {
+		t.Fatalf("zero Interval: unexpected error %v", err)
 	}
-	// A positive interval must still be honored verbatim.
-	gc := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{Interval: 90 * time.Second})
+	if gc.config.Interval != defaultGCInterval {
+		t.Errorf("zero Interval: got %v, want default %v", gc.config.Interval, defaultGCInterval)
+	}
+
+	// Positive -> verbatim.
+	gc, err = NewGarbageCollector(&Queue{}, GarbageCollectorConfig{Interval: 90 * time.Second})
+	if err != nil {
+		t.Fatalf("positive Interval: unexpected error %v", err)
+	}
 	if gc.config.Interval != 90*time.Second {
 		t.Errorf("positive Interval: got %v, want %v", gc.config.Interval, 90*time.Second)
+	}
+
+	// Negative -> error.
+	for _, in := range []time.Duration{-time.Second, -time.Hour} {
+		if _, err := NewGarbageCollector(&Queue{}, GarbageCollectorConfig{Interval: in}); err == nil {
+			t.Errorf("Interval %v: expected an error, got nil", in)
+		} else if !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("Interval %v: error = %v, want ErrInvalidConfig", in, err)
+		}
 	}
 }
 

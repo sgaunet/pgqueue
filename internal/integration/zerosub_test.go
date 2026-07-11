@@ -52,7 +52,10 @@ func TestZeroSubscriberTopicMessageReclaimed(t *testing.T) {
 		t.Fatalf("expected 2 messages before GC, got %d", got)
 	}
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("GC Collect: %v", err)
 	}

@@ -154,11 +154,14 @@ func TestPubSubMaxPendingAgePreservesOtherSubscribers(t *testing.T) {
 	// we are about to test.
 	time.Sleep(30 * time.Millisecond) // intentional: let 1ms MaxPendingAge cutoff elapse
 
-	gc := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
+	gc, err := pgqueue.NewGarbageCollector(pq, pgqueue.GarbageCollectorConfig{
 		DefaultPolicy: pgqueue.RetentionPolicy{
 			MaxPendingAge: time.Millisecond,
 		},
 	})
+	if err != nil {
+		t.Fatalf("NewGarbageCollector: %v", err)
+	}
 	if err := gc.Collect(ctx); err != nil {
 		t.Fatalf("GC Collect failed: %v", err)
 	}

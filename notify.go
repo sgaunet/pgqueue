@@ -214,7 +214,10 @@ func (n *notifier) wakeChan(_ context.Context, notifyChannel string) <-chan stru
 	// previous attempt has returned and (on failure) cleared the flag.
 	if !n.listening[notifyChannel] && !n.listenInFlight[notifyChannel] {
 		n.listenInFlight[notifyChannel] = true
-		n.wg.Go(func() { n.confirmListen(notifyChannel) })
+		// Hand confirmListen the exact waker we just installed/looked up so it can
+		// detect (under the lock, after Listen returns) whether a forget has since
+		// replaced or dropped it — see the staleness guard in confirmListen.
+		n.wg.Go(func() { n.confirmListen(notifyChannel, w) })
 	}
 	return w.wait()
 }
@@ -229,11 +232,27 @@ func (n *notifier) wakeChan(_ context.Context, notifyChannel string) <-chan stru
 // server-side LISTEN failure finally reaches this machinery instead of being
 // silently swallowed (#134). The Listen uses the notifier-scoped context so
 // close() can unblock a goroutine stuck confirming during an outage.
-func (n *notifier) confirmListen(notifyChannel string) {
+//
+// capturedWaker is the waker wakeChan held when it spawned this goroutine. If a
+// forget runs while Listen is in flight (the queue is deleted, possibly recreated
+// under the same name), the staleness guard below detects that this confirmation
+// no longer owns the channel's bookkeeping and returns without mutating it.
+func (n *notifier) confirmListen(notifyChannel string, capturedWaker *waker) {
 	err := n.listener.Listen(n.ctx, notifyChannel)
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	// Staleness guard: if forget ran while Listen was in flight, the waker we were
+	// spawned with is no longer the live one for this channel (forget deletes it;
+	// a same-name recreate installs a fresh *waker). In that case listening,
+	// listenInFlight and listenFailures belong to a newer wakeChan/confirmListen
+	// (or were cleared by forget), so mutate nothing and return. Otherwise we would
+	// (a) revive listening for a deleted channel, making a same-name recreate skip
+	// re-establishing LISTEN and silently lose push delivery, and (b) delete the
+	// new owner's listenInFlight flag, defeating the retry-storm guard.
+	if n.wakers[notifyChannel] != capturedWaker {
+		return
+	}
 	delete(n.listenInFlight, notifyChannel)
 	if err == nil {
 		n.listening[notifyChannel] = true

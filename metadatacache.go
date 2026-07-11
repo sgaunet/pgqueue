@@ -36,7 +36,7 @@ type metadataCache struct {
 	items map[string]*cachedQueueMeta // key: "<queue_type>/<queue_name>"
 }
 
-// cachedQueueMeta is the subset of QueueMetadata that is safe to cache, plus
+// cachedQueueMeta is the subset of queueMetadata that is safe to cache, plus
 // the time the entry was stored so get can enforce metadataCacheTTL.
 type cachedQueueMeta struct {
 	tableName string

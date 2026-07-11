@@ -45,13 +45,24 @@ type GarbageCollector struct {
 	mu       sync.Mutex // serializes Start and Stop so wg.Add never races wg.Wait
 }
 
-// NewGarbageCollector creates a new garbage collector instance.
+// NewGarbageCollector creates a new garbage collector instance, returning an
+// error for an out-of-range configuration (consistent with New rather than
+// silently clamping a mistake).
 //
-// An all-zero config.DefaultPolicy is replaced with default retention
-// (CompletedMessageTTL 24h, DLQRetention 30d; MaxPendingAge stays unbounded) so
-// the GC bounds table growth out of the box. A DefaultPolicy with any field
-// set, and every Policies entry, is used verbatim; set fields to KeepForever to
-// run a GC that retains everything.
+// Defaults and validation:
+//   - Interval: zero means "unset" and uses the default (5m); a negative value
+//     is an error (it would otherwise crash time.NewTicker in the background
+//     goroutine).
+//   - MaxWorkers: zero means "unset" and uses the default (10); a value outside
+//     [1, 100] is an error (an out-of-range worker count was previously clamped).
+//   - RetentionPolicy durations (DefaultPolicy and every Policies entry): each
+//     field must be >= 0 or exactly KeepForever (-1); any other negative value
+//     is an error.
+//   - An all-zero DefaultPolicy is treated as unconfigured and replaced with
+//     default retention (CompletedMessageTTL 24h, DLQRetention 30d; MaxPendingAge
+//     stays unbounded) so the GC bounds table growth out of the box (issue #47).
+//     A DefaultPolicy with any field set — including a KeepForever field — is
+//     honored verbatim; set fields to KeepForever to retain everything.
 //
 // The GC back-registers on the Queue so Queue.Close stops it automatically. A
 // GC created after the Queue is already closed is inert: it is not registered
@@ -59,29 +70,10 @@ type GarbageCollector struct {
 func NewGarbageCollector(
 	pq *Queue,
 	config GarbageCollectorConfig,
-) *GarbageCollector {
-	// Set defaults. A non-positive interval (zero or, via a caller-side
-	// misconfiguration, negative) is normalized to the default rather than
-	// reaching time.NewTicker in run(), which panics on a <= 0 duration and would
-	// crash the background goroutine. Matches the MaxWorkers guard below.
-	if config.Interval <= 0 {
-		config.Interval = defaultGCInterval
-	}
-	// An all-zero DefaultPolicy is treated as unconfigured and replaced with
-	// default retention so the GC bounds table growth out of the box (issue
-	// #47). A policy that sets even one field — including a KeepForever field —
-	// is honored verbatim.
-	if config.DefaultPolicy == (RetentionPolicy{}) {
-		config.DefaultPolicy = defaultRetentionPolicy
-	}
-	if config.Policies == nil {
-		config.Policies = make(map[string]RetentionPolicy)
-	}
-	if config.MaxWorkers <= 0 {
-		config.MaxWorkers = defaultGCMaxWorkers
-	}
-	if config.MaxWorkers > maxGCMaxWorkers {
-		config.MaxWorkers = maxGCMaxWorkers
+) (*GarbageCollector, error) {
+	config, err := normalizeGCConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	gc := &GarbageCollector{
@@ -93,7 +85,82 @@ func NewGarbageCollector(
 	// caller forgets to (R-08). Stop is idempotent, so a caller that also
 	// stops it stays safe.
 	pq.registerGC(gc)
-	return gc
+	return gc, nil
+}
+
+// normalizeGCConfig validates a GarbageCollectorConfig and fills in defaults for
+// unset (zero) fields. It rejects values that are outside their documented range
+// rather than silently clamping them (D7/M13). Zero Interval / MaxWorkers are the
+// "unset" sentinels and are replaced with defaults; only genuinely invalid values
+// (negative interval, worker count outside [1,100], a retention duration that is
+// negative but not KeepForever) return an error.
+func normalizeGCConfig(config GarbageCollectorConfig) (GarbageCollectorConfig, error) {
+	if err := validateGCConfig(config); err != nil {
+		return config, err
+	}
+
+	// Apply defaults for the unset (zero) sentinels. Validation above has already
+	// rejected genuinely-invalid values, so an all-zero DefaultPolicy here is the
+	// "unconfigured" case and is replaced with default retention (issue #47).
+	if config.Interval == 0 {
+		config.Interval = defaultGCInterval
+	}
+	if config.MaxWorkers == 0 {
+		config.MaxWorkers = defaultGCMaxWorkers
+	}
+	if config.DefaultPolicy == (RetentionPolicy{}) {
+		config.DefaultPolicy = defaultRetentionPolicy
+	}
+	if config.Policies == nil {
+		config.Policies = make(map[string]RetentionPolicy)
+	}
+	return config, nil
+}
+
+// validateGCConfig rejects out-of-range configuration without mutating it.
+func validateGCConfig(config GarbageCollectorConfig) error {
+	if config.Interval < 0 {
+		return fmt.Errorf(
+			"%w: GarbageCollectorConfig.Interval must be positive (zero uses the %v default), got %v",
+			ErrInvalidConfig, defaultGCInterval, config.Interval)
+	}
+	if config.MaxWorkers < 0 || config.MaxWorkers > maxGCMaxWorkers {
+		return fmt.Errorf(
+			"%w: GarbageCollectorConfig.MaxWorkers must be between 1 and %d (zero uses the %d default), got %d",
+			ErrInvalidConfig, maxGCMaxWorkers, defaultGCMaxWorkers, config.MaxWorkers)
+	}
+	if err := validateRetentionPolicy("DefaultPolicy", config.DefaultPolicy); err != nil {
+		return err
+	}
+	for name, policy := range config.Policies {
+		if err := validateRetentionPolicy(fmt.Sprintf("Policies[%q]", name), policy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateRetentionPolicy rejects any retention duration that is negative but not
+// exactly KeepForever (-1). A 0 field means "keep forever" for the rows it governs
+// and is valid; KeepForever is the only permitted negative. field names the config
+// location for the error message.
+func validateRetentionPolicy(field string, policy RetentionPolicy) error {
+	durations := []struct {
+		name string
+		val  time.Duration
+	}{
+		{"CompletedMessageTTL", policy.CompletedMessageTTL},
+		{"MaxPendingAge", policy.MaxPendingAge},
+		{"DLQRetention", policy.DLQRetention},
+	}
+	for _, d := range durations {
+		if d.val < 0 && d.val != KeepForever {
+			return fmt.Errorf(
+				"%w: GarbageCollectorConfig.%s.%s must be >= 0 or exactly KeepForever, got %v",
+				ErrInvalidConfig, field, d.name, d.val)
+		}
+	}
+	return nil
 }
 
 // Start begins the garbage collection loop in a background goroutine.
@@ -180,7 +247,7 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 
 	// Combine all queues
 	allQueues := make(
-		[]QueueMetadata, 0, len(topics)+len(channels),
+		[]queueMetadata, 0, len(topics)+len(channels),
 	)
 	allQueues = append(allQueues, topics...)
 	allQueues = append(allQueues, channels...)
@@ -193,7 +260,7 @@ func (gc *GarbageCollector) Collect(ctx context.Context) error {
 // function under the funlen ceiling.
 func (gc *GarbageCollector) dispatchCollect(
 	ctx context.Context,
-	queues []QueueMetadata,
+	queues []queueMetadata,
 ) []error {
 	// dispatchCtx lets a worker short-circuit the dispatch loop when it sees
 	// a sentinel that means the pool is dead (sql.ErrConnDone, driver bad
@@ -234,7 +301,7 @@ func (gc *GarbageCollector) dispatchCollect(
 			return cancelErrs
 		case sem <- struct{}{}:
 			wg.Add(1)
-			go func(q QueueMetadata) {
+			go func(q queueMetadata) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
@@ -258,6 +325,15 @@ func (gc *GarbageCollector) dispatchCollect(
 	}
 
 	wg.Wait()
+	// The outer ctx may have been cancelled while workers ran even though every
+	// queue still got dispatched (the loop never took the dispatchCtx.Done()
+	// branch). Annotate the cancellation here too so both exit paths report it
+	// consistently. wg.Wait() established happens-before for every worker's writes
+	// to errs, so reading it without mu is safe.
+	if outerErr := ctx.Err(); outerErr != nil {
+		return append(errs,
+			fmt.Errorf("garbage collection cancelled: %w", outerErr))
+	}
 	return errs
 }
 
@@ -394,7 +470,7 @@ func (gc *GarbageCollector) executePurge(
 // and any error.
 func (gc *GarbageCollector) collectQueue(
 	ctx context.Context,
-	queue QueueMetadata,
+	queue queueMetadata,
 ) error {
 	start := time.Now()
 	purged, reclaimed, err := gc.doCollectQueue(ctx, queue)
@@ -409,7 +485,7 @@ func (gc *GarbageCollector) collectQueue(
 // collectQueue can record the metric unconditionally, even on error.
 func (gc *GarbageCollector) doCollectQueue(
 	ctx context.Context,
-	queue QueueMetadata,
+	queue queueMetadata,
 ) (int64, int64, error) {
 	policy := gc.getPolicy(queue.QueueName)
 
@@ -425,12 +501,19 @@ func (gc *GarbageCollector) doCollectQueue(
 	var promoted int64
 
 	if queue.QueueType == QueueTypePubSub {
-		if err := gc.purgeInactiveSubscriptions(
+		// Both purges delete rows for pub/sub topics; fold their counts into purged
+		// so the GC metric reflects every deleted row, not just retention-policy
+		// deletions (mirrors how the promote* passes feed promoted).
+		inactivePurged, err := gc.purgeInactiveSubscriptions(
 			ctx, queue.QueueName, queue.TableName,
-		); err != nil {
+		)
+		purged += inactivePurged
+		if err != nil {
 			return purged, 0, fmt.Errorf("failed to purge inactive subscriptions: %w", err)
 		}
-		if err := gc.reclaimOrphanTopicMessages(ctx, queue.TableName); err != nil {
+		orphanPurged, err := gc.reclaimOrphanTopicMessages(ctx, queue.TableName)
+		purged += orphanPurged
+		if err != nil {
 			return purged, 0, fmt.Errorf("failed to reclaim orphan topic messages: %w", err)
 		}
 		// Promote timed-out-and-exhausted subscriptions to the DLQ before
@@ -597,7 +680,7 @@ const promoteExhaustedTopicSubscriptionsPageSize = 100
 // deletes each promoted row, so a fresh SELECT never re-sees it.
 func (gc *GarbageCollector) promoteExhaustedTopicSubscriptions(
 	ctx context.Context,
-	queue QueueMetadata,
+	queue queueMetadata,
 ) (int64, error) {
 	maxRetries := gc.pq.resolveMaxRetries(&queue)
 	tableName := queue.TableName
@@ -774,7 +857,7 @@ func (gc *GarbageCollector) runPagedPurge(
 func (gc *GarbageCollector) reclaimOrphanTopicMessages(
 	ctx context.Context,
 	tableName string,
-) error {
+) (int64, error) {
 	query := fmt.Sprintf(`
 		DELETE FROM %s
 		WHERE id IN (
@@ -795,19 +878,19 @@ func (gc *GarbageCollector) reclaimOrphanTopicMessages(
 
 	total, err := gc.runPagedPurge(ctx, query)
 	if err != nil {
-		return fmt.Errorf("failed to delete orphan topic messages: %w", err)
+		return total, fmt.Errorf("failed to delete orphan topic messages: %w", err)
 	}
 	if total > 0 {
 		gc.pq.logInfo("reclaimed orphan topic messages", "count", total, "table", tableName)
 	}
-	return nil
+	return total, nil
 }
 
 // applyRetentionPolicy runs the TTL/age/DLQ purges for one queue and returns
 // the total number of rows deleted across all three purge phases.
 func (gc *GarbageCollector) applyRetentionPolicy(
 	ctx context.Context,
-	queue QueueMetadata,
+	queue queueMetadata,
 	policy RetentionPolicy,
 ) (int64, error) {
 	queueType := queue.QueueType
@@ -850,7 +933,7 @@ func (gc *GarbageCollector) applyRetentionPolicy(
 // and returns the total number of rows reset (the "reclaimed" count).
 func (gc *GarbageCollector) resetTimedOutEntries(
 	ctx context.Context,
-	queue QueueMetadata,
+	queue queueMetadata,
 ) (int64, error) {
 	if queue.QueueType == QueueTypeChannel {
 		n, err := gc.resetTimedOutMessages(ctx, queue.TableName)
@@ -1172,7 +1255,7 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 func (gc *GarbageCollector) purgeInactiveSubscriptions(
 	ctx context.Context,
 	queueName, tableName string,
-) error {
+) (int64, error) {
 	// Paginated like reclaimOrphanTopicMessages (#3): select at most
 	// retentionPurgePageSize matching sub rows by id, lock them with FOR UPDATE
 	// OF s SKIP LOCKED so concurrent workers never block each other, and delete
@@ -1200,11 +1283,11 @@ func (gc *GarbageCollector) purgeInactiveSubscriptions(
 
 	total, err := gc.runPagedPurge(ctx, query, queueName)
 	if err != nil {
-		return fmt.Errorf("failed to purge inactive subscriptions: %w", err)
+		return total, fmt.Errorf("failed to purge inactive subscriptions: %w", err)
 	}
 	if total > 0 {
 		gc.pq.logInfo("purged inactive subscriptions", "count", total, "table", tableName)
 	}
 
-	return nil
+	return total, nil
 }

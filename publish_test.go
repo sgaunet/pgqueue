@@ -56,13 +56,13 @@ func TestResolveMaxMetadataSizePrefersPerQueue(t *testing.T) {
 	pq := &Queue{cfg: queueConfig{maxMetadataSize: 1024}}
 
 	perQueueConfig, _ := json.Marshal(channelOptions{MaxMetadataSize: 4096})
-	meta := &QueueMetadata{Config: perQueueConfig}
+	meta := &queueMetadata{Config: perQueueConfig}
 	if got := pq.resolveMaxMetadataSize(meta); got != 4096 {
 		t.Errorf("per-queue 4096 + queue-wide 1024: got %d, want 4096", got)
 	}
 
 	emptyConfig := json.RawMessage(`{}`)
-	if got := pq.resolveMaxMetadataSize(&QueueMetadata{Config: emptyConfig}); got != 1024 {
+	if got := pq.resolveMaxMetadataSize(&queueMetadata{Config: emptyConfig}); got != 1024 {
 		t.Errorf("empty per-queue config: got %d, want 1024 (queue-wide)", got)
 	}
 }
@@ -73,7 +73,7 @@ func TestResolveMaxMetadataSizePrefersPerQueue(t *testing.T) {
 // the only ceiling.
 func TestMarshalAndValidateMetadataRejectsOversized(t *testing.T) {
 	pq := &Queue{cfg: queueConfig{maxMetadataSize: 64}}
-	meta := &QueueMetadata{Config: json.RawMessage(`{}`)}
+	meta := &queueMetadata{Config: json.RawMessage(`{}`)}
 
 	// A 200-byte string value blows past the 64-byte cap once JSON-encoded.
 	big := map[string]any{"k": strings.Repeat("x", 200)}

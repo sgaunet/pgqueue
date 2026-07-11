@@ -475,7 +475,7 @@ func (q *Queue) claim(ch *channel, base pgqueue.Receipt) (*pgqueue.Message, erro
 	}
 	base.MessageID = e.id
 	base.ClaimID = e.claimID
-	pgqueue.SetReceipt(msg, base)
+	msg.SetReceipt(base)
 	return msg, nil
 }
 
