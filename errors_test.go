@@ -25,3 +25,45 @@ func TestReplayNotFoundWrapsMessageNotFound(t *testing.T) {
 		t.Error("a wrapped ErrReplayMessageNotFound should still match ErrReplayMessageNotFound")
 	}
 }
+
+// TestClaimClassificationSentinelsAreDistinct is a regression test for issue
+// #129: ErrMessageNotFound, ErrMessageAlreadyAcked, and ErrClaimExpired are
+// the three outcomes of classifyClaimState (queries.go) and must never match
+// one another via errors.Is, or a caller branching on one would silently also
+// catch the others.
+func TestClaimClassificationSentinelsAreDistinct(t *testing.T) {
+	sentinels := map[string]error{
+		"ErrMessageNotFound":     pgqueue.ErrMessageNotFound,
+		"ErrMessageAlreadyAcked": pgqueue.ErrMessageAlreadyAcked,
+		"ErrClaimExpired":        pgqueue.ErrClaimExpired,
+	}
+	for aName, a := range sentinels {
+		for bName, b := range sentinels {
+			if aName == bName {
+				continue
+			}
+			if errors.Is(a, b) {
+				t.Errorf("errors.Is(%s, %s) should be false: the sentinels must stay distinct", aName, bName)
+			}
+		}
+	}
+}
+
+// TestReceiptMissingQueueTypeIdentity pins ErrReceiptMissingQueueType's
+// identity and confirms it stays distinct from the claim-classification
+// sentinels (issue #129: its doc now covers any invalid QueueType, not only
+// an unset one, but the sentinel value itself is unchanged).
+func TestReceiptMissingQueueTypeIdentity(t *testing.T) {
+	if !errors.Is(pgqueue.ErrReceiptMissingQueueType, pgqueue.ErrReceiptMissingQueueType) {
+		t.Error("errors.Is(ErrReceiptMissingQueueType, ErrReceiptMissingQueueType) should be true")
+	}
+	wrapped := fmt.Errorf("some-context: %w", pgqueue.ErrReceiptMissingQueueType)
+	if !errors.Is(wrapped, pgqueue.ErrReceiptMissingQueueType) {
+		t.Error("a wrapped ErrReceiptMissingQueueType should still match ErrReceiptMissingQueueType")
+	}
+	if errors.Is(pgqueue.ErrReceiptMissingQueueType, pgqueue.ErrMessageNotFound) ||
+		errors.Is(pgqueue.ErrReceiptMissingQueueType, pgqueue.ErrMessageAlreadyAcked) ||
+		errors.Is(pgqueue.ErrReceiptMissingQueueType, pgqueue.ErrClaimExpired) {
+		t.Error("ErrReceiptMissingQueueType must not match any claim-classification sentinel")
+	}
+}

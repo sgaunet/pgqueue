@@ -945,6 +945,165 @@ func TestReplayDLQPerPageAuditLog(t *testing.T) {
 	}
 }
 
+// TestReplayMessageNotFound is a regression test for issue #129: replaying an
+// id that never existed must classify as ErrReplayMessageNotFound, both for a
+// real run (executeReplayMessage's re-SELECT after the UPDATE affects 0 rows)
+// and for a DryRun (checkMessageExists). This exercises the
+// errors.Is(err, sql.ErrNoRows) branch of the switch introduced by the #129
+// fix, guarding against a regression back to the old code path that collapsed
+// every non-processing outcome into "not found".
+func TestReplayMessageNotFound(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "replay-msg-not-found"
+	if err := pq.CreateChannel(ctx, queueName); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	missing, err := pgqueue.NewUUIDv7()
+	if err != nil {
+		t.Fatalf("failed to generate id: %v", err)
+	}
+
+	// Real run.
+	err = pq.ReplayMessage(ctx, queueName, pgqueue.QueueTypeChannel, missing, pgqueue.ReplayOptions{})
+	if !errors.Is(err, pgqueue.ErrReplayMessageNotFound) {
+		t.Errorf("ReplayMessage for a nonexistent id: got %v, want ErrReplayMessageNotFound", err)
+	}
+
+	// DryRun path (checkMessageExists) must classify identically.
+	err = pq.ReplayMessage(ctx, queueName, pgqueue.QueueTypeChannel, missing, pgqueue.ReplayOptions{DryRun: true})
+	if !errors.Is(err, pgqueue.ErrReplayMessageNotFound) {
+		t.Errorf("ReplayMessage(DryRun) for a nonexistent id: got %v, want ErrReplayMessageNotFound", err)
+	}
+}
+
+// TestReplayMessageCurrentlyProcessing is a regression test for issue #129: a
+// message currently 'processing' must classify as ErrMessageInProcessing, not
+// ErrReplayMessageNotFound — the defect the #129 switch statement fixes is
+// exactly this misclassification when the re-SELECT observed the row in a
+// different state than the UPDATE did. Here there is no race (nothing else
+// touches the message), so the re-SELECT sees 'processing' too, exercising the
+// switch's explicit MessageStatusProcessing case for both the real run and
+// DryRun.
+func TestReplayMessageCurrentlyProcessing(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "replay-msg-processing"
+	if err := pq.CreateChannel(ctx, queueName); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	if _, err := pq.Publish(ctx, queueName, []byte("payload")); err != nil {
+		t.Fatalf("failed to publish: %v", err)
+	}
+
+	msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
+	if err != nil || msg == nil {
+		t.Fatalf("failed to consume message: %v", err)
+	}
+	// Message is now 'processing' and NOT acked/nacked, so it stays that way
+	// for the rest of the test.
+
+	err = pq.ReplayMessage(ctx, queueName, pgqueue.QueueTypeChannel, msg.ID, pgqueue.ReplayOptions{})
+	if !errors.Is(err, pgqueue.ErrMessageInProcessing) {
+		t.Errorf("ReplayMessage for a processing message: got %v, want ErrMessageInProcessing", err)
+	}
+
+	err = pq.ReplayMessage(ctx, queueName, pgqueue.QueueTypeChannel, msg.ID, pgqueue.ReplayOptions{DryRun: true})
+	if !errors.Is(err, pgqueue.ErrMessageInProcessing) {
+		t.Errorf("ReplayMessage(DryRun) for a processing message: got %v, want ErrMessageInProcessing", err)
+	}
+}
+
+// TestReplayAllConstantReplaysEverything (#75) verifies that
+// pgqueue.ReplayAll — the named zero-value sentinel for ReplayOptions.Limit —
+// behaves identically to omitting Limit: every matching message is replayed,
+// with no cap applied.
+func TestReplayAllConstantReplaysEverything(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "replay-all-constant"
+	if err := pq.CreateChannel(ctx, queueName); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	startTime := time.Now().Add(-time.Hour)
+
+	const total = 3
+	for range total {
+		if _, err := pq.Publish(ctx, queueName, []byte("msg")); err != nil {
+			t.Fatalf("failed to publish: %v", err)
+		}
+	}
+	for range total {
+		msg, err := pq.ReceiveChannel(ctx, queueName, pgqueue.WithVisibilityTimeout(30*time.Second))
+		if err != nil || msg == nil {
+			t.Fatalf("failed to consume: %v", err)
+		}
+		if err := pq.Ack(ctx, msg.Receipt()); err != nil {
+			t.Fatalf("failed to ack: %v", err)
+		}
+	}
+
+	count, err := pq.ReplayFrom(ctx, queueName, pgqueue.QueueTypeChannel, startTime, pgqueue.ReplayOptions{
+		Limit: pgqueue.ReplayAll,
+	})
+	if err != nil {
+		t.Fatalf("replay with ReplayAll failed: %v", err)
+	}
+	if count != total {
+		t.Errorf("expected ReplayAll to replay all %d messages, got %d", total, count)
+	}
+}
+
+// TestReplayHistoryDefaultLimit (#115) verifies that a limit <= 0 falls back
+// to pgqueue.DefaultReplayHistoryLimit rather than an undocumented magic
+// literal, by seeding more than DefaultReplayHistoryLimit audit rows (one per
+// ReplayMessage call) and confirming ReplayHistory(limit=0) caps at exactly
+// DefaultReplayHistoryLimit rows.
+func TestReplayHistoryDefaultLimit(t *testing.T) {
+	pq, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const queueName = "replay-history-default-limit"
+	if err := pq.CreateChannel(ctx, queueName); err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	// Seed DefaultReplayHistoryLimit+5 replay-log rows directly: driving that
+	// many real ReplayMessage calls would be slow, and the audit log write path
+	// is already covered elsewhere.
+	const seeded = pgqueue.DefaultReplayHistoryLimit + 5
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO pgqueue_replay_log
+			(id, queue_type, queue_name, replay_type, replay_params, message_count, created_at)
+		SELECT uuidv7(), 'channel', $1, 'message_id', '{}'::jsonb, 1, NOW()
+		FROM generate_series(1, $2)`, queueName, seeded); err != nil {
+		t.Fatalf("failed to seed replay log: %v", err)
+	}
+
+	history, err := pq.ReplayHistory(ctx, queueName, pgqueue.QueueTypeChannel, 0)
+	if err != nil {
+		t.Fatalf("failed to get replay history: %v", err)
+	}
+	if len(history) != pgqueue.DefaultReplayHistoryLimit {
+		t.Errorf("ReplayHistory(limit=0) returned %d rows, want DefaultReplayHistoryLimit (%d)",
+			len(history), pgqueue.DefaultReplayHistoryLimit)
+	}
+}
+
 // TestReplayDLQLegacyNullSubscriberCount verifies that ReplayDLQ reports an
 // accurate count for a legacy DLQ row whose subscriber_id is NULL. Such a row
 // fans out to every active subscriber, but it is still one replayed DLQ entry:

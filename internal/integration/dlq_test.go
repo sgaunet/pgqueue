@@ -97,6 +97,96 @@ func TestListDLQMessagesKeysetPagination(t *testing.T) {
 	}
 }
 
+// TestListDLQMessagesEmptyPagePreservesCursor is a regression test: once
+// ListDLQMessages pages a DLQ to exhaustion, calling it again with the
+// last-returned (now empty) page must not rewind the cursor back to the
+// beginning of the DLQ. AfterID must carry forward unchanged, and reusing
+// that preserved cursor must not re-return rows already seen. Before the
+// fix, an empty page reset AfterID to uuid.Nil — which ListDLQMessages
+// treats as "start from the beginning" — so a poller that unconditionally
+// reassigns page = next (exactly what the DLQPage godoc instructs) would
+// silently re-read the entire DLQ the tick after it first drained it.
+func TestListDLQMessagesEmptyPagePreservesCursor(t *testing.T) {
+	pq, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const channelName = "dlq-empty-page-cursor"
+	if err := pq.CreateChannel(ctx, channelName,
+		pgqueue.WithQueueMaxRetries(1)); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+
+	// Publish and dead-letter a handful of messages (two nacks each, given
+	// max-retries 1).
+	const total = 5
+	for i := range total {
+		publishOne(t, pq, channelName, fmt.Appendf(nil, "msg-%02d", i))
+	}
+	for {
+		msg, err := pq.ReceiveChannel(ctx, channelName)
+		if errors.Is(err, pgqueue.ErrQueueEmpty) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("receive: %v", err)
+		}
+		if err := pq.Nack(ctx, msg.Receipt(), "fail", pgqueue.WithRetryDelay(1)); err != nil {
+			t.Fatalf("nack: %v", err)
+		}
+	}
+
+	// Page through the DLQ 2 at a time until a short page signals exhaustion,
+	// tracking every id seen and the cursor to use for the next call.
+	seen := make(map[uuid.UUID]bool)
+	page := pgqueue.DLQPage{Limit: 2}
+	for {
+		msgs, next, err := pq.ListDLQMessages(ctx, channelName, pgqueue.QueueTypeChannel, page)
+		if err != nil {
+			t.Fatalf("ListDLQMessages: %v", err)
+		}
+		for _, m := range msgs {
+			seen[m.ID] = true
+		}
+		short := len(msgs) < page.Limit
+		page = next
+		if short {
+			break
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("expected %d distinct DLQ messages before exhaustion, got %d", total, len(seen))
+	}
+	if page.AfterID == uuid.Nil {
+		t.Fatalf("cursor after exhaustion is uuid.Nil, want the last seen id")
+	}
+	exhaustedCursor := page.AfterID
+
+	// One more call with the exhausted cursor: must return zero rows and must
+	// NOT rewind AfterID back to uuid.Nil.
+	empty, next, err := pq.ListDLQMessages(ctx, channelName, pgqueue.QueueTypeChannel, page)
+	if err != nil {
+		t.Fatalf("ListDLQMessages (empty page): %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected an empty page, got %d messages", len(empty))
+	}
+	if next.AfterID != exhaustedCursor {
+		t.Fatalf("empty page rewound cursor: got AfterID=%s, want unchanged %s",
+			next.AfterID, exhaustedCursor)
+	}
+
+	// Reusing the (correctly preserved) cursor again must not re-return any
+	// already-seen message — proof the cursor was not silently reset.
+	again, _, err := pq.ListDLQMessages(ctx, channelName, pgqueue.QueueTypeChannel, next)
+	if err != nil {
+		t.Fatalf("ListDLQMessages (after empty page): %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("expected DLQ to remain exhausted, got %d messages: cursor was rewound", len(again))
+	}
+}
+
 // TestReplayDLQLargeBacklogPaged verifies that replaying a large DLQ backlog
 // processes it in bounded keyset pages (FR-025) and reinstates every message.
 func TestReplayDLQLargeBacklogPaged(t *testing.T) {

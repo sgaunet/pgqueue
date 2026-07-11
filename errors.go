@@ -56,11 +56,22 @@ var (
 	// message exceeds the configured per-queue or queue-wide cap.
 	ErrMetadataSizeExceeded = errors.New("message metadata size exceeds limit")
 
-	// ErrMessageNotFound is returned when a message cannot be found or is not in the expected state.
-	ErrMessageNotFound = errors.New("message not found or not in processing state")
+	// ErrMessageNotFound is returned when the targeted message row does not exist.
+	// Ack, Nack, ExtendVisibility, AckBatch and NackBatch return it when the row
+	// is gone: never published, purged by the garbage collector, or moved to the
+	// DLQ (which deletes the row from the message table — the payload survives in
+	// the DLQ table). ReplayMessage returns it wrapped as ErrReplayMessageNotFound.
+	// If the message exists but was fenced to another consumer, see ErrClaimExpired;
+	// if it exists but has left the processing state, see ErrMessageAlreadyAcked.
+	ErrMessageNotFound = errors.New("message not found")
 
-	// ErrMessageAlreadyAcked is returned when attempting to ack a message that was already acknowledged.
-	ErrMessageAlreadyAcked = errors.New("message not found or already acknowledged")
+	// ErrMessageAlreadyAcked is returned by Ack, Nack, ExtendVisibility, AckBatch
+	// and NackBatch when the message row still exists but is not in the
+	// processing state under the caller's claim: it was already acked or nacked,
+	// or it was never legitimately consumed (a zero claim token). A message
+	// fenced to another consumer yields ErrClaimExpired; a message whose row is
+	// gone yields ErrMessageNotFound.
+	ErrMessageAlreadyAcked = errors.New("message already acknowledged or never consumed")
 
 	// ErrClaimExpired is returned by Ack/Nack when the receipt's claim token no
 	// longer matches the message: its visibility timeout lapsed and it was
@@ -150,11 +161,16 @@ var (
 	// called on the pgqueue handle.
 	ErrQueueClosed = errors.New("pgqueue handle is closed")
 
-	// ErrReceiptMissingQueueType is returned by the queue-agnostic Ack/Nack
-	// when a Receipt was not populated by ReceiveChannel or ReceiveTopic and
-	// therefore does not carry the required queue binding.
+	// ErrReceiptMissingQueueType is returned by the queue-agnostic Ack, Nack,
+	// ExtendVisibility, AckBatch and NackBatch when a Receipt carries no valid
+	// QueueType — either unset (the receipt was not populated by ReceiveChannel or
+	// ReceiveTopic) or not one of QueueTypeChannel / QueueTypePubSub. Other
+	// malformed receipts surface as more specific errors: an unknown QueueName as
+	// ErrQueueNotFound / ErrTopicNotFound, a bad SubscriberID as
+	// ErrInvalidSubscriberID, and an unmatched MessageID/ClaimID as
+	// ErrMessageNotFound / ErrClaimExpired / ErrMessageAlreadyAcked.
 	ErrReceiptMissingQueueType = errors.New(
-		"receipt missing QueueType: obtain the receipt via ReceiveChannel or ReceiveTopic",
+		"receipt has no valid QueueType: obtain the receipt via ReceiveChannel or ReceiveTopic",
 	)
 
 	// ErrInvalidPerformedBy is returned when ReplayOptions.PerformedBy is

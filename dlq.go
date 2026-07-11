@@ -12,26 +12,54 @@ import (
 	"github.com/google/uuid"
 )
 
-// defaultDLQPageSize is the page size used by ListDLQMessages when DLQPage.Limit
-// is not set to a positive value.
-const defaultDLQPageSize = 100
+// DefaultDLQPageSize is the page size used by ListDLQMessages when
+// DLQPage.Limit is not set to a positive value.
+const DefaultDLQPageSize = 100
+
+// MaxDLQPageSize caps DLQPage.Limit. A larger value is clamped to it rather
+// than rejected, so a mistaken huge limit cannot pre-allocate an unbounded
+// result slice (mirrors the maxConcurrency clamp in consume.go).
+const MaxDLQPageSize = 1000
 
 // DLQPage is a keyset-pagination cursor for ListDLQMessages. Start with the zero
 // value; on each call pass back the DLQPage returned by the previous call to
-// fetch the next page. Keyset pagination on the UUIDv7 id column is index-
-// friendly and stable under concurrent inserts and deletes (R8).
+// fetch the next page — including when the returned page was empty: the
+// cursor returned alongside an empty page still carries the incoming AfterID
+// forward (rather than resetting to the beginning), and its Limit is filled
+// in with the effective limit that was actually applied, so it is always
+// safe and directly reusable for the next call. Keyset pagination on the
+// UUIDv7 id column is index-friendly and stable under concurrent inserts and
+// deletes (R8).
 type DLQPage struct {
 	// AfterID returns only rows with a greater id. The zero value starts at the
 	// beginning.
 	AfterID uuid.UUID
-	// Limit caps the rows per page; <= 0 means defaultDLQPageSize.
+	// Limit caps the rows per page. A non-positive value falls back to
+	// DefaultDLQPageSize; a value greater than MaxDLQPageSize is clamped to it.
 	Limit int
+}
+
+// resolveDLQLimit resolves the DLQPage.Limit a caller supplied into the
+// effective per-page row limit: non-positive values fall back to
+// DefaultDLQPageSize, and values above MaxDLQPageSize are clamped down to it.
+// It is a pure function so the limit-resolution rules can be unit-tested
+// without a database.
+func resolveDLQLimit(n int) int {
+	if n <= 0 {
+		return DefaultDLQPageSize
+	}
+	if n > MaxDLQPageSize {
+		return MaxDLQPageSize
+	}
+	return n
 }
 
 // ListDLQMessages returns one keyset-paginated page of dead-letter messages,
 // ordered by id, together with the cursor for the next page. When the returned
 // page has fewer rows than the requested limit, the dead-letter queue is
-// exhausted.
+// exhausted. An empty page still returns a usable cursor: AfterID carries the
+// incoming cursor forward instead of rewinding to the beginning, so polling
+// callers can unconditionally reassign page = next after every call.
 func (pq *Queue) ListDLQMessages(
 	ctx context.Context,
 	name string,
@@ -42,10 +70,7 @@ func (pq *Queue) ListDLQMessages(
 		return nil, DLQPage{}, err
 	}
 
-	limit := page.Limit
-	if limit <= 0 {
-		limit = defaultDLQPageSize
-	}
+	limit := resolveDLQLimit(page.Limit)
 
 	tableName, err := pq.cachedTableName(ctx, string(queueType), name)
 	if err != nil {
@@ -88,7 +113,13 @@ func (pq *Queue) ListDLQMessages(
 		return nil, DLQPage{}, fmt.Errorf("error iterating DLQ messages: %w", err)
 	}
 
-	next := DLQPage{Limit: limit}
+	// Seed next with the incoming cursor so an empty page preserves it rather
+	// than rewinding to the beginning (uuid.Nil means "start from the
+	// beginning" — see the afterID handling above). Limit carries forward the
+	// effective limit, not the possibly-zero page.Limit the caller passed in,
+	// so a caller that started from the zero value gets back a Limit it can
+	// compare against len(msgs) on the very next call.
+	next := DLQPage{Limit: limit, AfterID: page.AfterID}
 	if len(messages) > 0 {
 		next.AfterID = messages[len(messages)-1].ID
 	}

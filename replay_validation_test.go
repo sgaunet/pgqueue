@@ -52,3 +52,48 @@ func TestReplayOptionsPerformedByValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestReplayOptionsNegativeLimitRejected (#75) is a companion to the
+// PerformedBy validation test above: validateReplayOpts runs before any
+// database call, so a negative Limit is rejected on a zero-value Queue too.
+// It pins the documented bound on ReplayOptions.Limit — must be >= 0 — added
+// alongside the ReplayAll named constant.
+func TestReplayOptionsNegativeLimitRejected(t *testing.T) {
+	t.Parallel()
+
+	pq := &pgqueue.Queue{}
+
+	err := pq.ReplayMessage(t.Context(), "queue", pgqueue.QueueTypeChannel,
+		uuid.Nil,
+		pgqueue.ReplayOptions{Limit: -1},
+	)
+	if !errors.Is(err, pgqueue.ErrInvalidConfig) {
+		t.Fatalf("want ErrInvalidConfig for Limit=-1, got %v", err)
+	}
+}
+
+// TestReplayAllIsZeroValue (#75) pins ReplayAll as the documented "no cap"
+// sentinel: it must equal 0, the zero value of ReplayOptions.Limit, so a
+// caller who never sets Limit already gets ReplayAll semantics.
+func TestReplayAllIsZeroValue(t *testing.T) {
+	t.Parallel()
+
+	if pgqueue.ReplayAll != 0 {
+		t.Errorf("ReplayAll = %d, want 0", pgqueue.ReplayAll)
+	}
+
+	var opts pgqueue.ReplayOptions
+	if opts.Limit != pgqueue.ReplayAll {
+		t.Errorf("zero-value ReplayOptions.Limit = %d, want ReplayAll (%d)", opts.Limit, pgqueue.ReplayAll)
+	}
+}
+
+// TestDefaultReplayHistoryLimitValue (#115) pins the exported constant that
+// replaced ReplayHistory's bare "100" magic literal.
+func TestDefaultReplayHistoryLimitValue(t *testing.T) {
+	t.Parallel()
+
+	if pgqueue.DefaultReplayHistoryLimit != 100 {
+		t.Errorf("DefaultReplayHistoryLimit = %d, want 100", pgqueue.DefaultReplayHistoryLimit)
+	}
+}

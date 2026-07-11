@@ -290,10 +290,17 @@ type PublishMessage struct {
 	Metadata map[string]any // Optional message metadata
 }
 
+// ReplayAll is the ReplayOptions.Limit value meaning "replay every matching
+// message, with no cap". It is the zero value and the usual case.
+const ReplayAll int64 = 0
+
 // ReplayOptions holds options for replay operations.
 type ReplayOptions struct {
-	DryRun      bool   // If true, return count without performing replay
-	Limit       int64  // Maximum number of messages to replay (0 = no limit)
+	DryRun bool // If true, return count without performing replay
+	// Limit caps the number of messages a replay call reinstates. Must be >= 0;
+	// a negative value is rejected with ErrInvalidConfig. ReplayAll (0, the zero
+	// value) means no cap.
+	Limit       int64
 	PerformedBy string // Who initiated the replay (for audit log)
 }
 

@@ -202,7 +202,13 @@ func (pq *Queue) ReplayDLQ(
 	return result, nil
 }
 
-// ReplayHistory returns the replay history for a queue.
+// DefaultReplayHistoryLimit is the number of ReplayLog rows ReplayHistory
+// returns when limit is <= 0.
+const DefaultReplayHistoryLimit = 100
+
+// ReplayHistory returns the replay history for a queue, most recent first.
+// limit caps the number of rows returned; a limit <= 0 selects
+// DefaultReplayHistoryLimit.
 func (pq *Queue) ReplayHistory(
 	ctx context.Context,
 	queueName string,
@@ -214,7 +220,7 @@ func (pq *Queue) ReplayHistory(
 	}
 
 	if limit <= 0 {
-		limit = 100
+		limit = DefaultReplayHistoryLimit
 	}
 
 	return pq.getReplayHistory(
@@ -599,16 +605,34 @@ func (pq *Queue) executeReplayMessage(
 		}
 
 		if rows == 0 {
-			// Distinguish "not found" from "currently being processed"
+			// rows == 0 means either the row is absent, or the UPDATE's
+			// "AND status != 'processing'" predicate excluded it. Re-SELECT to
+			// tell those apart — and since withTx runs at READ COMMITTED, this
+			// SELECT takes a fresh snapshot, so a row that was processing at
+			// UPDATE time may have since been acked/nacked by a concurrent
+			// consumer. Handle all four outcomes explicitly rather than
+			// collapsing everything but the processing case into "not found",
+			// which would misreport a genuine DB error, or an existing row that
+			// just left 'processing' mid-race, as ErrReplayMessageNotFound.
 			var status string
 			checkQuery := fmt.Sprintf( //nolint:gosec // G201: table name validated by queueNameRegex
 				`SELECT status FROM %s WHERE id = $1`, pq.msgTable(tableName),
 			)
 			err := tx.QueryRowContext(ctx, checkQuery, messageID).Scan(&status)
-			if err == nil && MessageStatus(status) == MessageStatusProcessing {
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				return fmt.Errorf("%s: %w", messageID, ErrReplayMessageNotFound)
+			case err != nil:
+				return fmt.Errorf("failed to check message status: %w", err)
+			case MessageStatus(status) == MessageStatusProcessing:
+				return fmt.Errorf("%s: %w", messageID, ErrMessageInProcessing)
+			default:
+				// The row exists but left 'processing' between the UPDATE and
+				// this SELECT: a concurrent ack/nack won the race. The row was
+				// in-flight when we tried it, so report that rather than
+				// claiming it does not exist.
 				return fmt.Errorf("%s: %w", messageID, ErrMessageInProcessing)
 			}
-			return fmt.Errorf("%s: %w", messageID, ErrReplayMessageNotFound)
 		}
 
 		if err := pq.writeReplayLog(
