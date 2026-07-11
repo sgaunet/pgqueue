@@ -13,16 +13,26 @@ import (
 )
 
 // getQueueTTL extracts the TTL from queue config JSON, falling back to the
-// default TTL from Queue config. Returns 0 if no TTL is configured.
+// default TTL from Queue config. Returns 0 if no TTL is configured (including
+// when a per-queue WithQueueTTL(0) explicitly requests no expiry).
+//
+// The TTLSet flag distinguishes an explicit WithQueueTTL value from "unset":
+// CreateChannel/CreateTopic marshal TTLSet=true into the config only when
+// WithQueueTTL was supplied, so an explicit value — including a real 0 ("no
+// expiry") — wins and is returned as-is, while a config that omits TTLSet
+// (false, e.g. an empty '{}' config or a queue created without WithQueueTTL)
+// falls back to the queue-wide default. This mirrors how MaxRetriesSet lets an
+// explicit WithQueueMaxRetries(0) win over the queue-wide default.
 func (pq *Queue) getQueueTTL(configJSON []byte) time.Duration {
-	var cfg struct {
-		TTL time.Duration `json:"TTL"`
-	}
+	cfg := struct {
+		TTL    time.Duration `json:"TTL"`
+		TTLSet bool          `json:"TTLSet"`
+	}{}
 
 	if len(configJSON) > 0 {
 		if err := json.Unmarshal(configJSON, &cfg); err != nil {
 			pq.logError("failed to unmarshal queue config for TTL", "error", err)
-		} else if cfg.TTL > 0 {
+		} else if cfg.TTLSet {
 			return cfg.TTL
 		}
 	}
@@ -34,8 +44,9 @@ func (pq *Queue) getQueueTTL(configJSON []byte) time.Duration {
 // metadata is logged, counted via RecordMetadataParseError, and treated as
 // absent rather than failing the surrounding consume, so a single bad row
 // cannot wedge a consumer. queue is the queue or topic name used to label the
-// metric; pass the logical queue name (not the physical table name).
-func (pq *Queue) parseMetadataJSON(queue string, s sql.NullString) map[string]any {
+// metric; pass the logical queue name (not the physical table name). ctx is
+// the consume/scan call's context, passed through to RecordMetadataParseError.
+func (pq *Queue) parseMetadataJSON(ctx context.Context, queue string, s sql.NullString) map[string]any {
 	if !s.Valid || s.String == "" {
 		return nil
 	}
@@ -43,7 +54,7 @@ func (pq *Queue) parseMetadataJSON(queue string, s sql.NullString) map[string]an
 	var m map[string]any
 	if err := json.Unmarshal([]byte(s.String), &m); err != nil {
 		pq.logError("failed to parse message metadata; dropping it", "error", err)
-		pq.recordMetadataParseError(queue)
+		pq.recordMetadataParseError(ctx, queue)
 		return nil
 	}
 

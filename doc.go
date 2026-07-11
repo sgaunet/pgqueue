@@ -33,6 +33,17 @@ Per-queue creation options (TTL, max retries, message size) are functional
 options passed to CreateChannel/CreateTopic — WithQueueTTL, WithQueueMaxRetries,
 WithQueueMaxMessageSize.
 
+A finite TTL (WithQueueTTL or the queue-wide WithDefaultTTL) must comfortably
+exceed the worst-case backoff horizon a message can accumulate across its
+retries (BaseDelay * Multiplier^MaxRetries, capped at MaxDelay — see
+BackoffPolicy). Otherwise a message that keeps failing can have its
+available_at pushed past created_at+TTL by repeated backoff before it exhausts
+its retries: the consume queries' TTL cutoff then excludes it from every future
+delivery, but the garbage collector only dead-letters on retry-count
+exhaustion, not on TTL, so the message is neither redelivered nor
+dead-lettered — it is silently stranded. WithQueueTTL(0) (no expiry) avoids
+this entirely.
+
 The default message-size cap is 256 KiB. To allow larger payloads, pass an
 explicit size to WithMaxMessageSize or WithQueueMaxMessageSize, up to
 MaxAllowedMessageSize (PostgreSQL's bytea per-value limit, 1 GiB).

@@ -48,7 +48,7 @@ func (pq *Queue) Publish(
 	id, err := pq.publishResolved(ctx, queueName, payload, o.messageID, o.metadata)
 	pq.endSpan(span, err)
 	if err == nil {
-		pq.recordPublish(queueName, 1)
+		pq.recordPublish(ctx, queueName, 1)
 	}
 	return id, err
 }

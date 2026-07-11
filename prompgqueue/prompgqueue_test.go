@@ -1,6 +1,7 @@
 package prompgqueue_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -66,8 +67,8 @@ func TestNewMetricsAlreadyRegisteredResolves(t *testing.T) {
 	}
 
 	// The reused collectors must still record without panicking.
-	m2.RecordPublish("orders", 3)
-	m2.RecordAck("orders", true)
+	m2.RecordPublish(context.Background(), "orders", 3)
+	m2.RecordAck(context.Background(), "orders", true)
 }
 
 // TestNewMetricsFreshRegistry confirms the happy path: all collectors register

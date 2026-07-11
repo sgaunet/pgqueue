@@ -97,17 +97,21 @@ This document captures key architectural decisions made in `pgqueue` and the rat
 
 ---
 
-## ADR-006: Explicit Safety Confirmations for Destructive Operations
+## ADR-006: Destructive Operations Are Explicit at the Call Site (No Confirmation Flag)
 
-**Status**: Accepted
+**Status**: Accepted — updated 2026-07, superseding the original `confirm=true` design (see note below).
 
-**Decision**: Destructive operations (`ReplayFrom`, `ReplayMessage`, `ReplayDLQ`, `PurgeQueue`, `DeleteChannel`, `DeleteTopic`) require an explicit `confirm=true` or `Confirm: true` parameter.
+**Decision**: Destructive operations do not take a confirmation parameter. Instead:
+- **Replay** (`ReplayFrom`, `ReplayMessage`, `ReplayDLQ`) **executes by default**. To preview how many messages *would* be replayed (and skipped) without mutating anything, pass `ReplayOptions{DryRun: true}` — the returned `Replayed` / `Skipped` counts report what a real run would do.
+- **Purge and delete** (`GarbageCollector.PurgeQueue`, `DeleteChannel`, `DeleteTopic`) act **immediately and irreversibly** and take no confirmation flag. Callers gate them at the call site.
 
-**Context**: Accidental replays or purges can cause data loss or duplicate processing. A simple boolean guard prevents programmatic accidents while keeping the API ergonomic.
+**Context**: An earlier iteration required an explicit `confirm=true` / `Confirm: true` boolean on every destructive call. In practice a mandatory `true` literal is boilerplate that callers and reviewers rubber-stamp: it does not actually prevent copy-paste accidents (the copied call carries `true` too), it clutters the API, and it conflates two distinct needs — *previewing* a replay versus *authorizing* a purge.
 
 **Rationale**:
-- **Defense against copy-paste errors**: Prevents accidental destructive calls in scripts or REPL sessions.
-- **Self-documenting**: The `Confirm` field in the call site makes the intent explicit to code reviewers.
-- **No external dependency**: Unlike interactive prompts, this works in automated pipelines where stdin is unavailable.
+- **A preview beats a confirmation for replay.** `DryRun: true` returns the would-be `Replayed` / `Skipped` counts with no side effects — the real information an operator wants before a large replay, rather than a ceremonial boolean.
+- **Purge/delete intent belongs at the call site.** These have no meaningful preview, so the guard that matters is one the caller owns: a feature flag, an operator prompt, or an environment check. A library-level boolean gives false assurance without adding real safety.
+- **Cleaner, idiomatic API.** Executing by default, with an opt-in dry run, matches Go norms and removes a required argument that carried no information.
 
-**Trade-offs**: Slightly more verbose call sites, but the cost of accidental data loss far outweighs the minor ergonomic overhead.
+**Trade-offs**: Destructive calls are no longer syntactically self-flagging, so the docs foreground them (see the "Destructive operations" sections in the README and CLAUDE.md) and callers must add their own guards where the blast radius warrants.
+
+> **Superseded/updated (2026-07).** The original ADR-006 mandated a `confirm=true` / `Confirm: true` parameter on these operations. That parameter was removed (commit `731b4fa`) in favour of the DryRun-preview / call-site-gated design above. This entry is updated in place to reconcile the ADR with the shipped API, the project constitution (v2.0.0), the README, and CLAUDE.md, which were already aligned to it.

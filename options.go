@@ -15,6 +15,7 @@ type queueCreateOpts struct {
 	maxMessageSize  int
 	maxMetadataSize int
 	ttl             time.Duration
+	ttlSet          bool // true when WithQueueTTL was supplied
 	maxRetries      int
 	maxRetriesSet   bool // true when WithQueueMaxRetries was supplied
 }
@@ -37,9 +38,20 @@ func WithQueueMaxRetries(n int) QueueOption {
 //
 // TTL only hides expired messages from consumers; it does not delete them. Use a
 // GarbageCollector RetentionPolicy (MaxPendingAge) to reclaim their storage.
+//
+// A finite TTL must comfortably exceed the worst-case backoff horizon a message
+// can accumulate across its retries (BaseDelay * Multiplier^MaxRetries, capped
+// at MaxDelay — see BackoffPolicy). Otherwise a message that keeps failing can
+// have its available_at pushed past created_at+TTL by repeated backoff before
+// it exhausts its retries: the consume queries' TTL cutoff then excludes it from
+// every future delivery, but the garbage collector only dead-letters on
+// retry-count exhaustion, not on TTL, so the message is neither redelivered nor
+// dead-lettered — it is silently stranded. WithQueueTTL(0) (no expiry) avoids
+// this entirely.
 func WithQueueTTL(d time.Duration) QueueOption {
 	return func(o *queueCreateOpts) {
 		o.ttl = d
+		o.ttlSet = true
 	}
 }
 
@@ -71,7 +83,10 @@ func WithQueueMaxMetadataSize(bytes int) QueueOption {
 	}
 }
 
-// applyQueueOptions applies functional options onto a zero queueCreateOpts.
+// applyQueueOptions applies functional options onto a zero-value
+// queueCreateOpts. WithQueueTTL sets ttlSet so an explicit WithQueueTTL(0) can
+// be told apart from no WithQueueTTL call at all (mirroring maxRetriesSet);
+// every field starts at its natural zero value.
 func applyQueueOptions(opts []QueueOption) queueCreateOpts {
 	o := queueCreateOpts{}
 	for _, fn := range opts {

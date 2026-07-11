@@ -101,7 +101,7 @@ func (pq *Queue) PublishBatch(
 	ids, err := pq.publishBatchResolved(ctx, queueMeta, messages)
 	pq.endSpan(span, err)
 	if err == nil {
-		pq.recordPublish(queueName, len(messages))
+		pq.recordPublish(ctx, queueName, len(messages))
 	}
 	return ids, err
 }
@@ -219,7 +219,7 @@ func (pq *Queue) ackChannelBatch(
 	}
 
 	msgTable := pq.msgTable(queueMeta.TableName)
-	return pq.finishBatch(tx, channelName, receipts, matched,
+	return pq.finishBatch(ctx, tx, channelName, receipts, matched,
 		func(misses []Receipt) ([]FailedReceipt, error) {
 			return classifyChannelBatchMisses(ctx, tx, msgTable, misses)
 		})
@@ -269,8 +269,11 @@ func queryMatchedIDs(
 // finishBatch partitions receipts into Succeeded (those whose (MessageID,
 // ClaimID) pair is in matched) and Failed (classified via classify), commits
 // tx, and records the skipped-receipt metric. Input order is preserved within
-// Succeeded and Failed. classify is invoked only when there are misses.
+// Succeeded and Failed. classify is invoked only when there are misses. ctx is
+// the triggering AckBatch/NackBatch call's context, passed through to the
+// RecordAckAfterExpired observation.
 func (pq *Queue) finishBatch(
+	ctx context.Context,
 	tx *sql.Tx,
 	queueName string,
 	receipts []Receipt,
@@ -313,7 +316,7 @@ func (pq *Queue) finishBatch(
 			expired++
 		}
 	}
-	pq.recordAckAfterExpired(queueName, expired)
+	pq.recordAckAfterExpired(ctx, queueName, expired)
 	return res, nil
 }
 
@@ -376,7 +379,7 @@ func (pq *Queue) ackTopicBatch(
 	}
 
 	subTable := pq.subTable(queueMeta.TableName)
-	return pq.finishBatch(tx, topicName, receipts, matched,
+	return pq.finishBatch(ctx, tx, topicName, receipts, matched,
 		func(misses []Receipt) ([]FailedReceipt, error) {
 			return classifyTopicBatchMisses(ctx, tx, subTable, subscriberID, misses)
 		})
@@ -441,7 +444,7 @@ func (pq *Queue) nackChannelBatch(
 	}
 
 	msgTable := pq.msgTable(queueMeta.TableName)
-	return pq.finishBatch(tx, channelName, receipts, matched,
+	return pq.finishBatch(ctx, tx, channelName, receipts, matched,
 		func(misses []Receipt) ([]FailedReceipt, error) {
 			return classifyChannelBatchMisses(ctx, tx, msgTable, misses)
 		})
@@ -509,7 +512,7 @@ func (pq *Queue) nackTopicBatch(
 	}
 
 	subTable := pq.subTable(queueMeta.TableName)
-	return pq.finishBatch(tx, topicName, receipts, matched,
+	return pq.finishBatch(ctx, tx, topicName, receipts, matched,
 		func(misses []Receipt) ([]FailedReceipt, error) {
 			return classifyTopicBatchMisses(ctx, tx, subTable, subscriberID, misses)
 		})

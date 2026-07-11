@@ -331,7 +331,7 @@ func TestConfirmListenStaleFailureDoesNotCorruptCounter(t *testing.T) {
 		t.Fatal("newNotifier returned nil")
 	}
 	var missed int
-	n.onMissedNotification = func(string) { missed++ }
+	n.onMissedNotification = func(context.Context, string) { missed++ }
 	const channel = "pgqueue_msg_stalefail"
 
 	w1 := registerWaker(n, channel)

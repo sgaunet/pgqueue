@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS pgqueue_metadata (
     -- back from this column, and is only ever written via sanitizeTableName
     -- ([a-z0-9_]+). Enforce that charset structurally as defense in depth against
     -- a future in-tree bug or direct-SQL tampering planting an injection-bearing
-    -- value. Folds the former v8 migration into the baseline.
+    -- value. Folds a constraint from the pre-1.0 migration history into the baseline.
     CONSTRAINT pgqueue_metadata_table_name_charset CHECK (table_name ~ '^[a-z0-9_]+$')
 );
 
@@ -469,6 +469,7 @@ func (pq *Queue) CreateChannel(
 		MaxMessageSize:  o.maxMessageSize,
 		MaxMetadataSize: o.maxMetadataSize,
 		TTL:             o.ttl,
+		TTLSet:          o.ttlSet,
 		MaxRetries:      o.maxRetries,
 		MaxRetriesSet:   o.maxRetriesSet,
 	}
@@ -500,6 +501,7 @@ func (pq *Queue) CreateTopic(
 		MaxMessageSize:  o.maxMessageSize,
 		MaxMetadataSize: o.maxMetadataSize,
 		TTL:             o.ttl,
+		TTLSet:          o.ttlSet,
 		MaxRetries:      o.maxRetries,
 		MaxRetriesSet:   o.maxRetriesSet,
 	}
@@ -1199,18 +1201,25 @@ func (pq *Queue) createPubSubIndexes(
 		// query that does not mention visibility_timeout, forcing a scan across a
 		// subscriber's delivered history (C1). Keyed (subscriber_id, message_id) so
 		// the probe's ORDER BY message_id is served in order per subscriber.
+		//
+		// INCLUDE (available_at) (#11): same groundwork, and the same FOR UPDATE
+		// OF s SKIP LOCKED limit, as the channel msg table's consumable_null
+		// index — see the INCLUDE comment in createChannelIndexes.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_null
-			 ON %s(subscriber_id, message_id)
+			 ON %s(subscriber_id, message_id) INCLUDE (available_at)
 			 WHERE status = '%s'`,
 			tableName, subTbl, MessageStatusPending,
 		),
 		// Consume probe B (timed-out reclaim): covers 'processing' subscriptions
 		// whose visibility timeout has expired. Keyed (subscriber_id, message_id)
 		// so the reclaim probe's ORDER BY message_id is served without a sort (C1).
+		//
+		// INCLUDE (visibility_timeout) (#11): same groundwork/limit as the channel
+		// consumable_timeout index — see createChannelIndexes.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_sub_%s_consumable_timeout
-			 ON %s(subscriber_id, message_id)
+			 ON %s(subscriber_id, message_id) INCLUDE (visibility_timeout)
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
 			tableName, subTbl, MessageStatusProcessing,
 		),
@@ -1285,18 +1294,40 @@ func (pq *Queue) createChannelIndexes(
 		// so it never changed which rows the index covered — it only made the
 		// index unselectable for a query that (correctly) does not mention
 		// visibility_timeout, forcing a primary-key scan across history rows (C1).
+		//
+		// INCLUDE (available_at) (#11): a query needing only id + available_at can
+		// be answered as a true Index Only Scan, the only way PostgreSQL skips the
+		// heap for a row a Filter rejects. That is NOT channelConsumeQueries'
+		// pendingQuery (channel.go) as written today: it also selects
+		// payload/metadata/etc. (deliberately never indexed) and carries FOR
+		// UPDATE SKIP LOCKED, and PostgreSQL's planner never emits an Index Only
+		// Scan under a row-locking clause — taking the lock, and SKIP LOCKED's
+		// already-locked check, both require the heap tuple, confirmed against
+		// PostgreSQL 18 with EXPLAIN (ANALYZE, BUFFERS). So a retry storm of
+		// backoff-sleeping pending rows ahead of a ready one still costs one heap
+		// fetch per sleeping row scanned; see TestConsumableIndexIncludeGroundwork
+		// (consume_include_plan_test.go) for the plan evidence. Included anyway,
+		// at 8 bytes/tuple, as groundwork for a future narrow, non-locking
+		// "find the id" probe followed by a targeted FOR UPDATE fetch by id.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_null
-			 ON %s(id)
+			 ON %s(id) INCLUDE (available_at)
 			 WHERE status = '%s'`,
 			tableName, msgTbl, MessageStatusPending,
 		),
 		// Consume probe B (timed-out reclaim): covers 'processing' messages whose
 		// visibility timeout has expired. Keyed on id so the reclaim probe's
 		// ORDER BY id LIMIT 1 is served directly without a sort (C1).
+		//
+		// INCLUDE (visibility_timeout) (#11): same rationale and same limit as
+		// consumable_null's INCLUDE (available_at) above — channelConsumeQueries'
+		// reclaimQuery and gc.go's resetTimedOutMessages/resetTimedOutSubscriptions
+		// all carry FOR UPDATE ... SKIP LOCKED, so this stays a heap-touching
+		// Filter, not an Index Only Scan, until a probe is restructured to drop
+		// the row lock during search.
 		fmt.Sprintf(
 			`CREATE INDEX IF NOT EXISTS idx_pgqueue_msg_%s_consumable_timeout
-			 ON %s(id)
+			 ON %s(id) INCLUDE (visibility_timeout)
 			 WHERE status = '%s' AND visibility_timeout IS NOT NULL`,
 			tableName, msgTbl, MessageStatusProcessing,
 		),

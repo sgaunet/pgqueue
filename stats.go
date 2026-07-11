@@ -63,8 +63,8 @@ func (pq *Queue) Stats(
 	if err != nil {
 		return QueueStats{}, err
 	}
-	pq.observeQueueDepth(queueName, depth)
-	pq.observeDLQSize(queueName, stats.DLQCount)
+	pq.observeQueueDepth(ctx, queueName, depth)
+	pq.observeDLQSize(ctx, queueName, stats.DLQCount)
 
 	return stats, nil
 }

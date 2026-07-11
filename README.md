@@ -1,6 +1,6 @@
 # pgqueue
 
-[![CI](https://github.com/sgaunet/pgqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/sgaunet/pgqueue/actions/workflows/ci.yml)
+[![CI](https://github.com/sgaunet/pgqueue/actions/workflows/ci-matrix.yml/badge.svg)](https://github.com/sgaunet/pgqueue/actions/workflows/ci-matrix.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sgaunet/pgqueue)](https://goreportcard.com/report/github.com/sgaunet/pgqueue)
 [![GoDoc](https://godoc.org/github.com/sgaunet/pgqueue?status.svg)](https://godoc.org/github.com/sgaunet/pgqueue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -18,7 +18,7 @@ Driver-agnostic — works with `pgx` **or** `lib/pq`, and forces neither on you.
 - **Three Consume APIs**: a handler-based loop (`ConsumeChannel`), a range-over-func iterator (`ChannelMessages`), and single-shot `ReceiveChannel` — pick the ergonomics you want.
 - **Push Delivery**: optional `LISTEN/NOTIFY` listener wakes idle consumers in milliseconds, with a bounded safety-net poll as a fallback.
 - **Automatic Retry Backoff**: nacked messages are retried with decorrelated-jitter exponential backoff; override per nack with `WithRetryDelay`.
-- **Message Ordering**: per-topic/channel ordering using UUIDv7.
+- **Approximate FIFO Ordering**: UUIDv7 primary keys and `ORDER BY id` give best-effort, per-topic/channel FIFO — a useful *tendency*, not a guarantee. Strict order holds only for a single sequential consumer, no failures, and a single publishing process. It is broken by: **concurrent consumers** (`FOR UPDATE SKIP LOCKED` hands a later message to consumer B while A still holds an earlier one), **retries/nacks** (a redelivered message is re-queued and moves relative to its neighbours), and **multi-process publishing** (the UUIDv7 monotonic counter is per-process, so IDs minted in the same millisecond by different processes interleave arbitrarily). Do not rely on total ordering.
 - **Dead Letter Queue**: failed messages moved after max retries; inspect with keyset-paginated `ListDLQMessages` / `DLQStats`.
 - **Message Replay**: replay from a timestamp or the DLQ — transactional, deterministic, and memory-bounded for large backlogs.
 - **Opt-in Observability**: zero-dependency `Tracer` / `MetricsRecorder` hooks; ready-made OpenTelemetry and Prometheus adapters ship as optional sub-modules.
@@ -210,7 +210,7 @@ semantics are foregrounded here to make sure nothing is destructive by accident.
 ## Architecture
 
 - **Table-per-queue**: Each channel/topic has dedicated tables for isolation and performance. This design targets **tens to low hundreds of queues per database**; it is not suited for per-tenant/per-user queues at multi-tenant scale. See [ADR-002](ADR.md#adr-002-table-per-queue-architecture) for the ceiling and the linear-scaling operations (`GarbageCollector.Collect`, `ListChannels`/`ListTopics`, `UnhealthySubscribers`).
-- **UUIDv7 for ordering**: Time-ordered identifiers ensure message ordering
+- **UUIDv7 for approximate ordering**: Time-ordered identifiers give best-effort, per-queue FIFO — not a strict guarantee. Concurrent consumers (`SKIP LOCKED`), retries/nacks, and multi-process publishing all reorder delivery (see [Features](#features) for the caveats)
 - **Direct SQL**: Parameterized queries via database/sql for type safety
 - **Self-migrating schema**: `InitSchema()` creates and version-migrates the schema in-process — no external migration tools required
 
@@ -313,8 +313,13 @@ go work use . ./internal/integration ./pglisten ./otelpgqueue ./prompgqueue ./ex
 ### Running Tests
 
 ```bash
-# Integration tests require Docker for testcontainers
-go test ./... -v
+# Unit tests — root module, no Docker required
+task tests                # or: go test ./...
+
+# Integration tests live in a separate module (internal/integration) and need
+# Docker for testcontainers. Running `go test ./...` from the repo root does NOT
+# run them — target the integration module explicitly:
+task tests-integration    # or: cd internal/integration && go test ./...
 ```
 
 ## License

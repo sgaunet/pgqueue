@@ -36,8 +36,8 @@ func (rt *recordingTracer) sawSpan(name string) bool {
 
 type recordingSpan struct{}
 
-func (recordingSpan) End()                 {}
-func (recordingSpan) SetError(error)       {}
+func (recordingSpan) End()                    {}
+func (recordingSpan) SetError(error)          {}
 func (recordingSpan) SetAttr(...pgqueue.Attr) {}
 
 // recordingMetrics is a test pgqueue.MetricsRecorder that counts every call.
@@ -54,25 +54,25 @@ type recordingMetrics struct {
 	missedNotifications int
 }
 
-func (rm *recordingMetrics) RecordPublish(_ string, count int) {
+func (rm *recordingMetrics) RecordPublish(_ context.Context, _ string, count int) {
 	rm.mu.Lock()
 	rm.publishes += count
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordHandle(_ string, _ time.Duration) {
+func (rm *recordingMetrics) RecordHandle(_ context.Context, _ string, _ time.Duration) {
 	rm.mu.Lock()
 	rm.handles++
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordDeliveryLatency(_ string, _ time.Duration) {
+func (rm *recordingMetrics) RecordDeliveryLatency(_ context.Context, _ string, _ time.Duration) {
 	rm.mu.Lock()
 	rm.deliveries++
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordAck(_ string, ok bool) {
+func (rm *recordingMetrics) RecordAck(_ context.Context, _ string, ok bool) {
 	rm.mu.Lock()
 	if ok {
 		rm.acks++
@@ -82,32 +82,32 @@ func (rm *recordingMetrics) RecordAck(_ string, ok bool) {
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordAckAfterExpired(_ string, n int) {
+func (rm *recordingMetrics) RecordAckAfterExpired(_ context.Context, _ string, n int) {
 	rm.mu.Lock()
 	rm.ackAfterExpired += n
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordMetadataParseError(_ string) {
+func (rm *recordingMetrics) RecordMetadataParseError(_ context.Context, _ string) {
 	rm.mu.Lock()
 	rm.metadataParseErrors++
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordGCRun(_ string, _ time.Duration, _, _ int64, _ error) {
+func (rm *recordingMetrics) RecordGCRun(_ context.Context, _ string, _ time.Duration, _, _ int64, _ error) {
 	rm.mu.Lock()
 	rm.gcRuns++
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) RecordMissedNotification(_ string) {
+func (rm *recordingMetrics) RecordMissedNotification(_ context.Context, _ string) {
 	rm.mu.Lock()
 	rm.missedNotifications++
 	rm.mu.Unlock()
 }
 
-func (rm *recordingMetrics) ObserveQueueDepth(string, int64) {}
-func (rm *recordingMetrics) ObserveDLQSize(string, int64)    {}
+func (rm *recordingMetrics) ObserveQueueDepth(context.Context, string, int64) {}
+func (rm *recordingMetrics) ObserveDLQSize(context.Context, string, int64)    {}
 
 func (rm *recordingMetrics) snapshot() (publishes, handles, acks, nacks int) {
 	rm.mu.Lock()

@@ -138,8 +138,10 @@ type notifier struct {
 	// failure fires this hook. Correctness never depends on it — the safety-net
 	// poll still recovers any notification missed during the gap (M7). It is set
 	// from Queue.cfg.metrics via newNotifier and may be nil when no
-	// MetricsRecorder is registered.
-	onMissedNotification func(notifyChannel string)
+	// MetricsRecorder is registered. The ctx passed to it is always n.ctx (the
+	// notifier's own lifetime context, see below) — confirmListen runs as a
+	// detached background goroutine with no per-request context of its own.
+	onMissedNotification func(ctx context.Context, notifyChannel string)
 
 	// ctx scopes the confirmListen goroutines' Listen calls; cancel fires on
 	// close so a goroutine blocked confirming a LISTEN during an outage exits
@@ -280,8 +282,11 @@ func (n *notifier) confirmListen(notifyChannel string, capturedWaker *waker) {
 	// LISTEN failed — any NOTIFYs sent while this channel is not confirmed are
 	// silently dropped. Emit one missed-notification event per failure so
 	// operators can quantify how often push delivery degrades to polling.
+	// n.ctx (not a caller's request context — confirmListen is a detached
+	// background goroutine, see its doc comment) is the closest available
+	// operation-scoped context.
 	if n.onMissedNotification != nil {
-		n.onMissedNotification(notifyChannel)
+		n.onMissedNotification(n.ctx, notifyChannel)
 	}
 }
 

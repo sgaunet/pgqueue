@@ -1070,10 +1070,10 @@ func (pq *Queue) filterExistingMessages(
 // re-create, and returns the ids of the DLQ entries that can be deleted.
 //
 // Rows carrying a subscriber_id are replayed to exactly that subscriber. Legacy
-// rows with a NULL subscriber_id (written before schema v2) fall back to all
-// currently-active subscribers; such a row is only marked for deletion when at
-// least one active subscriber exists, so a replay with no subscribers leaves it
-// in the DLQ rather than silently dropping it.
+// rows with a NULL subscriber_id (carried over from the pre-1.0 schema history)
+// fall back to all currently-active subscribers; such a row is only marked for
+// deletion when at least one active subscriber exists, so a replay with no
+// subscribers leaves it in the DLQ rather than silently dropping it.
 func (pq *Queue) resolvePubSubDLQRecords(
 	ctx context.Context,
 	tx *sql.Tx,

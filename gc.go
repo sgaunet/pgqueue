@@ -474,7 +474,7 @@ func (gc *GarbageCollector) collectQueue(
 ) error {
 	start := time.Now()
 	purged, reclaimed, err := gc.doCollectQueue(ctx, queue)
-	gc.pq.recordGCRun(queue.QueueName, time.Since(start), reclaimed, purged, err)
+	gc.pq.recordGCRun(ctx, queue.QueueName, time.Since(start), reclaimed, purged, err)
 	return err
 }
 

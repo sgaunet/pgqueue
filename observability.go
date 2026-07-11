@@ -58,6 +58,16 @@ type Span interface {
 // example OpenTelemetry) live in optional sub-packages such as otelpgqueue.
 // Register an implementation with the WithTracer option.
 //
+// ctx is the traced operation's context (the same ctx the triggering pgqueue
+// call received, or a descendant of it), so an implementation can read
+// request-scoped values it already propagates (an incoming parent span,
+// baggage, …) and stay cancellation-aware. Implementations must not block on
+// ctx and must not retain it beyond the call: pgqueue keeps the context
+// StartSpan returns (which typically carries the new span) and threads it
+// through the rest of the traced operation, but the Span handle's own methods
+// (End/SetError/SetAttr, below) intentionally take no context — matching
+// OpenTelemetry's own span API, where only span creation is ctx-scoped.
+//
 // Implementations must not panic. pgqueue invokes every Tracer method (and the
 // returned Span's methods) behind a recover, so a panicking adapter is logged
 // and swallowed rather than crashing a consumer goroutine; but a hook that
@@ -73,19 +83,29 @@ type Tracer interface {
 // sub-packages such as otelpgqueue and prompgqueue. Register an implementation
 // with the WithMetrics option.
 //
+// Every method's first parameter, ctx, is the operation's context (the same
+// ctx the triggering pgqueue call received, or a descendant of it). It is
+// provided for cancellation-awareness and so an implementation can correlate
+// an observation with the in-flight trace — for example attaching an OTel
+// exemplar via trace.SpanContextFromContext(ctx), which is why otelpgqueue's
+// adapter now records through the real ctx instead of context.Background().
+// Implementations must not block on ctx: pgqueue does not select on it, so a
+// hook that blocks stalls the caller — a consume/publish/GC goroutine — for as
+// long as it blocks. Implementations must not retain ctx beyond the call.
+//
 // Implementations must not panic. pgqueue invokes every MetricsRecorder method
 // behind a recover, so a panicking adapter is logged and swallowed rather than
 // crashing a consumer goroutine; but a hook that panics still loses its
 // observation for that call.
 type MetricsRecorder interface {
 	// RecordPublish reports that count messages were published to queue.
-	RecordPublish(queue string, count int)
+	RecordPublish(ctx context.Context, queue string, count int)
 	// RecordHandle reports the handler-only execution latency of one message:
 	// the time the registered Handler spent processing it. This deliberately
 	// EXCLUDES queue wait, the receive (SELECT ... FOR UPDATE) round-trip, and
 	// the ack round-trip. For the publish-to-delivery interval, see
 	// RecordDeliveryLatency.
-	RecordHandle(queue string, latency time.Duration)
+	RecordHandle(ctx context.Context, queue string, latency time.Duration)
 	// RecordDeliveryLatency reports the publish-to-delivery latency of one
 	// message: the interval from when its row was created on publish to when
 	// the handler began executing. It captures the queue wait plus fetch
@@ -99,9 +119,9 @@ type MetricsRecorder interface {
 	// time since publish, not since the redelivery. The histogram therefore
 	// mixes fresh deliveries with redeliveries: a long tail can reflect
 	// redelivery or DLQ replay rather than queue backlog.
-	RecordDeliveryLatency(queue string, latency time.Duration)
+	RecordDeliveryLatency(ctx context.Context, queue string, latency time.Duration)
 	// RecordAck reports an acknowledgement outcome; ok is false for a nack.
-	RecordAck(queue string, ok bool)
+	RecordAck(ctx context.Context, queue string, ok bool)
 	// RecordAckAfterExpired reports n receipts whose claim was no longer valid
 	// at ack/nack time because it expired and the message was reassigned to
 	// another consumer — so those n messages will be redelivered. Only genuine
@@ -110,16 +130,16 @@ type MetricsRecorder interface {
 	// this once per batch with the expired count; operators wire it to detect
 	// at-least-twice delivery driven by handlers outrunning the visibility
 	// timeout. Implementations should add n to the counter in one call.
-	RecordAckAfterExpired(queue string, n int)
+	RecordAckAfterExpired(ctx context.Context, queue string, n int)
 	// ObserveQueueDepth reports the current number of pending messages.
-	ObserveQueueDepth(queue string, depth int64)
+	ObserveQueueDepth(ctx context.Context, queue string, depth int64)
 	// ObserveDLQSize reports the current dead-letter queue size.
-	ObserveDLQSize(queue string, size int64)
+	ObserveDLQSize(ctx context.Context, queue string, size int64)
 	// RecordMetadataParseError reports that the JSON metadata column for a
 	// message in queue could not be parsed. The message is delivered with no
 	// metadata rather than being dropped; operators wire this counter to detect
 	// sustained corruption.
-	RecordMetadataParseError(queue string)
+	RecordMetadataParseError(ctx context.Context, queue string)
 	// RecordGCRun reports the outcome of a single per-queue garbage-collection
 	// pass: how long it took, how many expired/timed-out messages were
 	// reclaimed (reset to pending or dead-lettered), how many rows were purged
@@ -127,13 +147,16 @@ type MetricsRecorder interface {
 	// duration is the wall-clock time of the collectQueue call; reclaimed is
 	// the count of timed-out messages reset to pending or moved to the DLQ;
 	// purged is the total rows deleted by the retention policy; err is non-nil
-	// when collectQueue returned an error (the GC logs and continues).
-	RecordGCRun(queue string, duration time.Duration, reclaimed, purged int64, err error)
+	// when collectQueue returned an error (the GC logs and continues). ctx is
+	// the per-queue collection pass's context, not any single caller's request.
+	RecordGCRun(ctx context.Context, queue string, duration time.Duration, reclaimed, purged int64, err error)
 	// RecordMissedNotification reports that the LISTEN/NOTIFY channel for
 	// queue lost at least one notification — typically during a reconnect.
 	// The safety-net poll recovers correctness; this counter lets operators
-	// quantify how often push delivery degrades to polling.
-	RecordMissedNotification(queue string)
+	// quantify how often push delivery degrades to polling. ctx is the
+	// notifier's own long-lived context (reconnect handling runs in a
+	// background goroutine, not any single caller's request).
+	RecordMissedNotification(ctx context.Context, queue string)
 }
 
 // safeHook runs fn — a call into a user-supplied Tracer/MetricsRecorder (or a
@@ -217,20 +240,22 @@ func (pq *Queue) startSpan(
 }
 
 // recordPublish reports a publish to the registered MetricsRecorder, if any.
-func (pq *Queue) recordPublish(queue string, count int) {
+// ctx is the publish call's context, passed through for cancellation-awareness
+// and trace/metric correlation (see MetricsRecorder).
+func (pq *Queue) recordPublish(ctx context.Context, queue string, count int) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.RecordPublish", func() {
-			pq.cfg.metrics.RecordPublish(queue, count)
+			pq.cfg.metrics.RecordPublish(ctx, queue, count)
 		})
 	}
 }
 
 // recordHandle reports one message's handler-only execution latency, if
-// metrics are on.
-func (pq *Queue) recordHandle(queue string, latency time.Duration) {
+// metrics are on. ctx is the dispatching consume call's context.
+func (pq *Queue) recordHandle(ctx context.Context, queue string, latency time.Duration) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.RecordHandle", func() {
-			pq.cfg.metrics.RecordHandle(queue, latency)
+			pq.cfg.metrics.RecordHandle(ctx, queue, latency)
 		})
 	}
 }
@@ -240,22 +265,24 @@ func (pq *Queue) recordHandle(queue string, latency time.Duration) {
 // by the database on publish) to handlerStart (when this process began running
 // the handler). createdAt is database time while handlerStart is this process's
 // clock, so a consumer whose clock lags the database can yield a negative
-// interval; such values are clamped to zero. A zero createdAt is skipped.
-func (pq *Queue) recordDeliveryLatency(queue string, createdAt, handlerStart time.Time) {
+// interval; such values are clamped to zero. A zero createdAt is skipped. ctx
+// is the dispatching consume call's context.
+func (pq *Queue) recordDeliveryLatency(ctx context.Context, queue string, createdAt, handlerStart time.Time) {
 	if pq.cfg.metrics == nil || createdAt.IsZero() {
 		return
 	}
 	latency := max(handlerStart.Sub(createdAt), 0)
 	pq.safeHook("MetricsRecorder.RecordDeliveryLatency", func() {
-		pq.cfg.metrics.RecordDeliveryLatency(queue, latency)
+		pq.cfg.metrics.RecordDeliveryLatency(ctx, queue, latency)
 	})
 }
 
 // recordAck reports an acknowledgement outcome (ok=false for a nack), if on.
-func (pq *Queue) recordAck(queue string, ok bool) {
+// ctx is the Ack/Nack call's context.
+func (pq *Queue) recordAck(ctx context.Context, queue string, ok bool) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.RecordAck", func() {
-			pq.cfg.metrics.RecordAck(queue, ok)
+			pq.cfg.metrics.RecordAck(ctx, queue, ok)
 		})
 	}
 }
@@ -263,56 +290,67 @@ func (pq *Queue) recordAck(queue string, ok bool) {
 // recordAckAfterExpired reports n receipts whose claims had genuinely expired at
 // ack/nack time (and whose messages will therefore redeliver), if metrics are
 // on. The batch helpers pass the expired count for the whole batch in one call.
-func (pq *Queue) recordAckAfterExpired(queue string, n int) {
+// ctx is the triggering ack/nack call's context.
+func (pq *Queue) recordAckAfterExpired(ctx context.Context, queue string, n int) {
 	if pq.cfg.metrics == nil || n <= 0 {
 		return
 	}
 	pq.safeHook("MetricsRecorder.RecordAckAfterExpired", func() {
-		pq.cfg.metrics.RecordAckAfterExpired(queue, n)
+		pq.cfg.metrics.RecordAckAfterExpired(ctx, queue, n)
 	})
 }
 
-// observeQueueDepth reports the current pending depth, if metrics are on.
-func (pq *Queue) observeQueueDepth(queue string, depth int64) {
+// observeQueueDepth reports the current pending depth, if metrics are on. ctx
+// is the Stats call's context.
+func (pq *Queue) observeQueueDepth(ctx context.Context, queue string, depth int64) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.ObserveQueueDepth", func() {
-			pq.cfg.metrics.ObserveQueueDepth(queue, depth)
+			pq.cfg.metrics.ObserveQueueDepth(ctx, queue, depth)
 		})
 	}
 }
 
-// observeDLQSize reports the current DLQ size, if metrics are on.
-func (pq *Queue) observeDLQSize(queue string, size int64) {
+// observeDLQSize reports the current DLQ size, if metrics are on. ctx is the
+// Stats call's context.
+func (pq *Queue) observeDLQSize(ctx context.Context, queue string, size int64) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.ObserveDLQSize", func() {
-			pq.cfg.metrics.ObserveDLQSize(queue, size)
+			pq.cfg.metrics.ObserveDLQSize(ctx, queue, size)
 		})
 	}
 }
 
-// recordMetadataParseError reports one corrupt-metadata event for queue, if on.
-func (pq *Queue) recordMetadataParseError(queue string) {
+// recordMetadataParseError reports one corrupt-metadata event for queue, if
+// on. ctx is the consume/scan call's context that hit the corrupt row.
+func (pq *Queue) recordMetadataParseError(ctx context.Context, queue string) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.RecordMetadataParseError", func() {
-			pq.cfg.metrics.RecordMetadataParseError(queue)
+			pq.cfg.metrics.RecordMetadataParseError(ctx, queue)
 		})
 	}
 }
 
 // recordGCRun reports the outcome of a single per-queue GC pass, if metrics on.
-func (pq *Queue) recordGCRun(queue string, duration time.Duration, reclaimed, purged int64, err error) {
+// ctx is that collection pass's context (see collectQueue), not any single
+// caller's request context.
+func (pq *Queue) recordGCRun(
+	ctx context.Context, queue string, duration time.Duration, reclaimed, purged int64, err error,
+) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.RecordGCRun", func() {
-			pq.cfg.metrics.RecordGCRun(queue, duration, reclaimed, purged, err)
+			pq.cfg.metrics.RecordGCRun(ctx, queue, duration, reclaimed, purged, err)
 		})
 	}
 }
 
 // recordMissedNotification reports one lost LISTEN/NOTIFY notification, if on.
-func (pq *Queue) recordMissedNotification(queue string) {
+// ctx is the notifier's own long-lived context (see notifier.ctx), since a
+// missed notification is detected from a background reconnect goroutine, not
+// any single caller's request.
+func (pq *Queue) recordMissedNotification(ctx context.Context, queue string) {
 	if pq.cfg.metrics != nil {
 		pq.safeHook("MetricsRecorder.RecordMissedNotification", func() {
-			pq.cfg.metrics.RecordMissedNotification(queue)
+			pq.cfg.metrics.RecordMissedNotification(ctx, queue)
 		})
 	}
 }

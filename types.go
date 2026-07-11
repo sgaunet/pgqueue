@@ -36,7 +36,10 @@ type topicOptions struct {
 	MaxMessageSize  int           // Maximum message size (0 = use default)
 	MaxMetadataSize int           // Maximum marshaled metadata size (0 = use default)
 	TTL             time.Duration // Message time-to-live (0 = no expiration)
-	MaxRetries      int           // Maximum retry attempts per subscriber
+	// TTLSet records whether TTL was set explicitly, so an explicit TTL of 0
+	// ("no expiry") is distinguishable from "unset" (inherit the queue default).
+	TTLSet     bool
+	MaxRetries int // Maximum retry attempts per subscriber
 	// MaxRetriesSet records whether MaxRetries was set explicitly, so an
 	// explicit MaxRetries of 0 ("no retries") is distinguishable from "unset".
 	MaxRetriesSet bool
@@ -47,7 +50,10 @@ type channelOptions struct {
 	MaxMessageSize  int           // Maximum message size (0 = use default)
 	MaxMetadataSize int           // Maximum marshaled metadata size (0 = use default)
 	TTL             time.Duration // Message time-to-live (0 = no expiration)
-	MaxRetries      int           // Maximum retry attempts
+	// TTLSet records whether TTL was set explicitly, so an explicit TTL of 0
+	// ("no expiry") is distinguishable from "unset" (inherit the queue default).
+	TTLSet     bool
+	MaxRetries int // Maximum retry attempts
 	// MaxRetriesSet records whether MaxRetries was set explicitly, so an
 	// explicit MaxRetries of 0 ("no retries") is distinguishable from "unset".
 	MaxRetriesSet bool

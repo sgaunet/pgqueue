@@ -214,8 +214,9 @@ const errReasonVisibilityTimeout = "exceeded max retries: not acknowledged befor
 
 // channelMaxRetries resolves the effective retry limit for a channel message:
 // its per-message max_retries when present (including an explicit 0, meaning no
-// retries), otherwise the configured default. Since migration v5 the column is
-// NOT NULL, so the NULL fallback now only guards rows written before v5; both
+// retries), otherwise the configured default. The current baseline schema makes
+// the column NOT NULL, so the NULL fallback now only guards legacy rows carried
+// over from a database upgraded through the pre-1.0 schema history; both
 // publish and DLQ replay (see insertDLQChannelMessages) store the resolved cap
 // explicitly.
 func channelMaxRetries(defaultMax int, maxRetries sql.NullInt64) int {
@@ -505,7 +506,7 @@ func (pq *Queue) claimChannelMessage(
 		CreatedAt:  row.createdAt,
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
-		Metadata:   pq.parseMetadataJSON(channelName, row.metadataJSON),
+		Metadata:   pq.parseMetadataJSON(ctx, channelName, row.metadataJSON),
 	}
 
 	// Report the effective retry limit, not the raw column: a NULL max_retries

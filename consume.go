@@ -73,7 +73,10 @@ func transientBackoff(attempt int) time.Duration {
 // Handler is a callback invoked by the handler-based consume loop
 // (ConsumeChannel/ConsumeTopic) for each delivered message. Return nil to
 // auto-ack; return any non-nil error to auto-nack (the error string is recorded
-// as the failure reason).
+// as the failure reason). Return RetryAfter(d, cause) instead of a plain error
+// to additionally pin the redelivery delay to d, overriding the queue's
+// BackoffPolicy for that one message — see RetryAfter for validation and
+// max-retries interaction.
 //
 // The handler runs under the consume loop's context. That context is cancelled
 // when the caller's context is cancelled or when Queue.Close is called, and
@@ -194,7 +197,7 @@ func (pq *Queue) ackReceipt(ctx context.Context, r Receipt) error {
 
 	pq.endSpan(span, err)
 	if err == nil {
-		pq.recordAck(r.QueueName, true)
+		pq.recordAck(ctx, r.QueueName, true)
 		return nil
 	}
 	return receiptError(r, err)
@@ -242,7 +245,7 @@ func (pq *Queue) nackReceipt(
 
 	pq.endSpan(span, err)
 	if err == nil {
-		pq.recordAck(r.QueueName, false)
+		pq.recordAck(ctx, r.QueueName, false)
 		return nil
 	}
 	return receiptError(r, err)
@@ -785,8 +788,8 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 
 	start := time.Now()
 	herr := pq.callHandler(ctx, h, msg)
-	pq.recordHandle(receipt.QueueName, time.Since(start))
-	pq.recordDeliveryLatency(receipt.QueueName, msg.CreatedAt, start)
+	pq.recordHandle(ctx, receipt.QueueName, time.Since(start))
+	pq.recordDeliveryLatency(ctx, receipt.QueueName, msg.CreatedAt, start)
 	pq.endSpan(span, herr)
 
 	// Detach from cancellation so a handler that finished as shutdown began
@@ -800,11 +803,11 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	ackCtx, ackCancel := context.WithTimeout(context.WithoutCancel(ctx), ackGracePeriod)
 	defer ackCancel()
 	if herr != nil {
-		err := pq.nackReceipt(ackCtx, receipt, herr.Error())
+		err := pq.nackReceipt(ackCtx, receipt, herr.Error(), nackOptionsForHandlerError(herr)...)
 		switch {
 		case err == nil:
 		case errors.Is(err, ErrClaimExpired):
-			pq.signalAckAfterExpired(receipt, msg, "nack")
+			pq.signalAckAfterExpired(ackCtx, receipt, msg, "nack")
 		default:
 			pq.logError("failed to nack message after handler error",
 				"queue", receipt.QueueName,
@@ -822,7 +825,7 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrClaimExpired):
-		pq.signalAckAfterExpired(receipt, msg, "ack")
+		pq.signalAckAfterExpired(ackCtx, receipt, msg, "ack")
 	default:
 		pq.logError("failed to ack message after successful handler",
 			"queue", receipt.QueueName,
@@ -831,13 +834,35 @@ func (pq *Queue) dispatchToHandler(ctx context.Context, h Handler, msg *Message)
 	}
 }
 
+// nackOptionsForHandlerError inspects a handler's returned error for a
+// *retryAfterError (see RetryAfter) and, when found anywhere in its wrap
+// chain, translates its requested delay into the NackOption that the
+// low-level Nack already understands. The option then flows through the same
+// nackReceipt -> nackChannelWithOpts/nackTopicWithOpts -> computeRetryDelay
+// path a manual Nack(ctx, r, reason, WithRetryDelay(d)) would take, so it is
+// subject to the exact same validation (positive-only, clamped to the
+// internal maximum) with no duplicated logic here.
+//
+// A plain handler error — one with no *retryAfterError in its chain — yields
+// no options, so dispatchToHandler's nack call behaves exactly as it did
+// before RetryAfter existed.
+func nackOptionsForHandlerError(herr error) []NackOption {
+	var rae *retryAfterError
+	if errors.As(herr, &rae) {
+		return []NackOption{WithRetryDelay(rae.delay)}
+	}
+	return nil
+}
+
 // signalAckAfterExpired records one ErrClaimExpired observed at auto-ack/nack
 // time so operators see it: the per-receipt metric increments and a WARN log
 // names the queue, message, and which side (ack or nack) hit the stale claim.
 // The message will be redelivered by another consumer; the WARN line is the
 // only application-visible signal that already-completed work will run again.
-func (pq *Queue) signalAckAfterExpired(receipt Receipt, msg *Message, op string) {
-	pq.recordAckAfterExpired(receipt.QueueName, 1)
+// ctx is the detached, grace-bounded ack/nack context dispatchToHandler used
+// for the auto-ack/nack itself (see ackCtx there).
+func (pq *Queue) signalAckAfterExpired(ctx context.Context, receipt Receipt, msg *Message, op string) {
+	pq.recordAckAfterExpired(ctx, receipt.QueueName, 1)
 	pq.logWarn("claim expired before auto-"+op+"; message will redeliver",
 		"queue", receipt.QueueName,
 		"message_id", msg.ID.String(),

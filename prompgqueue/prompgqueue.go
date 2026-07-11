@@ -17,9 +17,17 @@
 // per-tenant or otherwise dynamically generated queue name will grow the time
 // series count without limit and can overwhelm Prometheus. Keep queue names
 // drawn from a small, fixed set (R-24).
+//
+// # MetricsRecorder context parameter
+//
+// pgqueue.MetricsRecorder methods take a context.Context first parameter,
+// threaded through from the triggering operation. Prometheus's client_golang
+// collectors are not context-aware (Inc/Add/Observe/Set take no context), so
+// this adapter accepts and ignores it on every method.
 package prompgqueue
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -232,23 +240,28 @@ func registerCollector[T prometheus.Collector](reg prometheus.Registerer, c T) (
 	return c, fmt.Errorf("register collector: %w", err)
 }
 
-// RecordPublish counts messages published to a queue.
-func (m *Metrics) RecordPublish(queue string, count int) {
+// RecordPublish counts messages published to a queue. ctx is accepted to
+// satisfy pgqueue.MetricsRecorder (see the package doc's ctx-parameter note)
+// and ignored: Prometheus collectors are not context-aware.
+func (m *Metrics) RecordPublish(_ context.Context, queue string, count int) {
 	m.publishes.WithLabelValues(queue).Add(float64(count))
 }
 
-// RecordHandle observes one message's handler-only execution latency.
-func (m *Metrics) RecordHandle(queue string, latency time.Duration) {
+// RecordHandle observes one message's handler-only execution latency. ctx is
+// accepted and ignored; see RecordPublish.
+func (m *Metrics) RecordHandle(_ context.Context, queue string, latency time.Duration) {
 	m.handleDur.WithLabelValues(queue).Observe(latency.Seconds())
 }
 
 // RecordDeliveryLatency observes one message's publish-to-delivery latency.
-func (m *Metrics) RecordDeliveryLatency(queue string, latency time.Duration) {
+// ctx is accepted and ignored; see RecordPublish.
+func (m *Metrics) RecordDeliveryLatency(_ context.Context, queue string, latency time.Duration) {
 	m.deliveryLatency.WithLabelValues(queue).Observe(latency.Seconds())
 }
 
-// RecordAck counts an acknowledgement outcome (ack or nack) for a queue.
-func (m *Metrics) RecordAck(queue string, ok bool) {
+// RecordAck counts an acknowledgement outcome (ack or nack) for a queue. ctx
+// is accepted and ignored; see RecordPublish.
+func (m *Metrics) RecordAck(_ context.Context, queue string, ok bool) {
 	result := "nack"
 	if ok {
 		result = "ack"
@@ -257,31 +270,37 @@ func (m *Metrics) RecordAck(queue string, ok bool) {
 }
 
 // RecordAckAfterExpired counts n receipts whose claims expired at ack/nack time
-// — those messages will be redelivered.
-func (m *Metrics) RecordAckAfterExpired(queue string, n int) {
+// — those messages will be redelivered. ctx is accepted and ignored; see
+// RecordPublish.
+func (m *Metrics) RecordAckAfterExpired(_ context.Context, queue string, n int) {
 	m.ackAfterExpired.WithLabelValues(queue).Add(float64(n))
 }
 
 // ObserveQueueDepth records the current pending-message count for a queue.
-func (m *Metrics) ObserveQueueDepth(queue string, depth int64) {
+// ctx is accepted and ignored; see RecordPublish.
+func (m *Metrics) ObserveQueueDepth(_ context.Context, queue string, depth int64) {
 	m.queueDepth.WithLabelValues(queue).Set(float64(depth))
 }
 
-// ObserveDLQSize records the current dead-letter queue size for a queue.
-func (m *Metrics) ObserveDLQSize(queue string, size int64) {
+// ObserveDLQSize records the current dead-letter queue size for a queue. ctx
+// is accepted and ignored; see RecordPublish.
+func (m *Metrics) ObserveDLQSize(_ context.Context, queue string, size int64) {
 	m.dlqSize.WithLabelValues(queue).Set(float64(size))
 }
 
-// RecordMetadataParseError counts one corrupt-metadata event for queue.
-func (m *Metrics) RecordMetadataParseError(queue string) {
+// RecordMetadataParseError counts one corrupt-metadata event for queue. ctx is
+// accepted and ignored; see RecordPublish.
+func (m *Metrics) RecordMetadataParseError(_ context.Context, queue string) {
 	m.metadataParseErrors.WithLabelValues(queue).Inc()
 }
 
 // RecordGCRun records the outcome of a single per-queue GC pass. It
 // increments the gc-runs counter (labelled "ok" or "error"), observes the
 // duration histogram, and adds reclaimed and purged rows to their respective
-// counters.
-func (m *Metrics) RecordGCRun(queue string, duration time.Duration, reclaimed, purged int64, err error) {
+// counters. ctx is accepted and ignored; see RecordPublish.
+func (m *Metrics) RecordGCRun(
+	_ context.Context, queue string, duration time.Duration, reclaimed, purged int64, err error,
+) {
 	result := "ok"
 	if err != nil {
 		result = "error"
@@ -298,7 +317,7 @@ func (m *Metrics) RecordGCRun(queue string, duration time.Duration, reclaimed, p
 
 // RecordMissedNotification counts one LISTEN confirmation failure for queue,
 // indicating that notifications on this channel were dropped until LISTEN was
-// re-confirmed.
-func (m *Metrics) RecordMissedNotification(queue string) {
+// re-confirmed. ctx is accepted and ignored; see RecordPublish.
+func (m *Metrics) RecordMissedNotification(_ context.Context, queue string) {
 	m.missedNotifications.WithLabelValues(queue).Inc()
 }

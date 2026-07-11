@@ -663,7 +663,7 @@ func (pq *Queue) claimTopicSubscription(
 		Status:     MessageStatusProcessing,
 		RetryCount: retryCount,
 		MaxRetries: maxRetries,
-		Metadata:   pq.parseMetadataJSON(topicName, row.metadataJSON),
+		Metadata:   pq.parseMetadataJSON(ctx, topicName, row.metadataJSON),
 	}
 
 	if row.errorMessage.Valid {
