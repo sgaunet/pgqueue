@@ -87,12 +87,14 @@ registry; operators sharing the advisory-lock space with other software that
 uses keys in the same numeric range should review migrations.go for the
 exact values and the encoding scheme.
 
-Scalability ceiling: each queue creates 2-3 tables plus 6-7 indexes, and
-admin operations (GarbageCollector.Collect, ListChannels, ListTopics,
-UnhealthySubscribers) scale linearly with queue count. The table-per-queue
-design targets tens to low hundreds of queues per database; it is not
-appropriate for per-tenant/per-user queues at multi-tenant scale. Use
-WithMaxQueues to enforce a deliberate cap. See ADR-002 in ADR.md.
+Scalability ceiling: each queue creates 2-3 tables (a channel: message + DLQ;
+a pub/sub topic: message + subscription + DLQ) plus their indexes — roughly 8
+per channel and 12 per topic, counting primary keys — and admin operations
+(GarbageCollector.Collect, ListChannels, ListTopics, UnhealthySubscribers)
+scale linearly with queue count. The table-per-queue design targets tens to low
+hundreds of queues per database; it is not appropriate for per-tenant/per-user
+queues at multi-tenant scale. Use WithMaxQueues to enforce a deliberate cap.
+See ADR-002 in ADR.md.
 
 For complete examples, see the examples/ directory.
 */

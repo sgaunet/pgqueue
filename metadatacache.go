@@ -21,6 +21,15 @@ import (
 // respectively and are left as future work (issue #84).
 const metadataCacheTTL = 1 * time.Minute
 
+// metadataCacheMaxEntries bounds the number of cached table-name mappings so a
+// long-lived process that touches many distinct queues cannot grow the cache
+// without bound when no GarbageCollector sweep is running (M6). At capacity, a
+// set first drops expired entries and, if still full, evicts the oldest-stored
+// entry. Sized far above the tens-to-low-hundreds of queues the table-per-queue
+// design targets, so it never evicts a live working set in practice — it is a
+// safety ceiling, not an LRU tuned for churn.
+const metadataCacheMaxEntries = 4096
+
 // metadataCache caches the immutable per-queue identity: the table name
 // resolved from pgqueue_metadata. Only immutable fields are cached; mutable
 // state such as `paused` is always read fresh from the database to avoid stale
@@ -30,7 +39,10 @@ const metadataCacheTTL = 1 * time.Minute
 // Otherwise expiration happens two ways, both bounded by metadataCacheTTL:
 // opportunistically on the next get of the same key, and via a periodic sweep
 // driven by the GarbageCollector ticker so an unread stale entry cannot pin
-// the mapping indefinitely after a cross-process deletion.
+// the mapping indefinitely after a cross-process deletion. Independently of any
+// GC, the map size is capped at metadataCacheMaxEntries: a set at capacity
+// evicts expired-then-oldest entries, so a GC-less process touching many
+// distinct queues cannot grow the cache without bound (M6).
 type metadataCache struct {
 	mu    sync.Mutex
 	items map[string]*cachedQueueMeta // key: "<queue_type>/<queue_name>"
@@ -72,7 +84,13 @@ func (mc *metadataCache) get(queueType, queueName string) (string, bool) {
 func (mc *metadataCache) set(queueType, queueName, tableName string) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	mc.items[mc.key(queueType, queueName)] = &cachedQueueMeta{
+	key := mc.key(queueType, queueName)
+	// Bound the map size independently of any GC sweep: only a genuinely new key
+	// grows the map, so evict just before inserting one at capacity (M6).
+	if _, exists := mc.items[key]; !exists && len(mc.items) >= metadataCacheMaxEntries {
+		mc.evictLocked()
+	}
+	mc.items[key] = &cachedQueueMeta{
 		tableName: tableName,
 		storedAt:  time.Now(),
 	}
@@ -96,6 +114,34 @@ func (mc *metadataCache) sweep() {
 		if now.Sub(item.storedAt) > metadataCacheTTL {
 			delete(mc.items, key)
 		}
+	}
+}
+
+// evictLocked frees room for a new entry when the cache is at capacity. It first
+// drops every expired entry — the common case, since a cache large enough to hit
+// the cap is usually mostly stale — and only if that frees nothing evicts the
+// single oldest-stored entry. The caller must hold mc.mu.
+func (mc *metadataCache) evictLocked() {
+	now := time.Now()
+	before := len(mc.items)
+	for key, item := range mc.items {
+		if now.Sub(item.storedAt) > metadataCacheTTL {
+			delete(mc.items, key)
+		}
+	}
+	if len(mc.items) < before {
+		return // expired entries freed room
+	}
+	var oldestKey string
+	var oldestAt time.Time
+	first := true
+	for key, item := range mc.items {
+		if first || item.storedAt.Before(oldestAt) {
+			oldestKey, oldestAt, first = key, item.storedAt, false
+		}
+	}
+	if !first {
+		delete(mc.items, oldestKey)
 	}
 }
 

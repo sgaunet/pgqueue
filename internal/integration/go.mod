@@ -10,6 +10,7 @@ require (
 	github.com/sgaunet/pgqueue/pglisten v0.0.0
 	github.com/testcontainers/testcontainers-go v0.39.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.39.0
+	go.uber.org/goleak v1.3.0
 )
 
 replace github.com/sgaunet/pgqueue/pglisten => ../../pglisten

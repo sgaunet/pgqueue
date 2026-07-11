@@ -25,7 +25,7 @@ const (
 	testUser              = "testuser"
 	testPass              = "testpass"
 	testWaitLogOccurrence = 2
-	testStartupTimeout    = 5 * time.Second
+	testStartupTimeout    = 60 * time.Second // generous so a slow/loaded CI runner pulling postgres:18-alpine doesn't flake (L14)
 	testMaxMessageSize    = 1024 * 1024 // 1MB
 	testDefaultMaxRetries = 3
 )

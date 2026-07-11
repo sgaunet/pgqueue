@@ -52,6 +52,12 @@ type queueConfig struct {
 	backoffConfigured bool // true when WithBackoffPolicy was supplied
 	safetyNetPoll     time.Duration
 	listener          Listener
+	// maxSubscribersPerTopic bounds active-subscriber fan-out per publish; 0
+	// means unlimited (H5).
+	maxSubscribersPerTopic int
+	// maxBatchBytes bounds the aggregate PublishBatch payload size in bytes; 0
+	// means unlimited (L8).
+	maxBatchBytes int
 }
 
 // WithMaxMessageSize sets the maximum allowed message payload size in bytes.
@@ -111,6 +117,34 @@ func WithDefaultTTL(d time.Duration) Option {
 func WithMaxQueues(n int) Option {
 	return func(c *queueConfig) {
 		c.maxQueues = n
+	}
+}
+
+// WithMaxSubscribersPerTopic bounds how many active subscribers a topic may fan
+// a published message out to. Zero (the default) means unlimited.
+//
+// It is a DoS guard: with a cap set, a publish to a topic that has more than n
+// active subscribers fails with ErrTooManySubscribers rather than fanning the
+// message out to an unbounded number of per-subscriber delivery rows. The
+// fan-out working set is always inserted in bounded chunks regardless of this
+// setting; the cap additionally rejects a pathological subscriber count outright
+// instead of silently dropping any subscriber's delivery.
+func WithMaxSubscribersPerTopic(n int) Option {
+	return func(c *queueConfig) {
+		c.maxSubscribersPerTopic = n
+	}
+}
+
+// WithMaxBatchBytes bounds the aggregate payload size, in bytes, of a single
+// PublishBatch call. Zero (the default) means unlimited — only the per-message
+// WithMaxMessageSize cap and the MaxBatchSize count cap apply.
+//
+// It is a DoS guard: with a ceiling set, a PublishBatch whose payloads sum to
+// more than n bytes is rejected with ErrBatchTooLarge before any database work,
+// bounding the transaction and driver-buffer footprint of one batch.
+func WithMaxBatchBytes(n int) Option {
+	return func(c *queueConfig) {
+		c.maxBatchBytes = n
 	}
 }
 

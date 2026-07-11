@@ -358,8 +358,9 @@ func (m *Metrics) RecordMissedNotification(queue string) {
 // each function's cyclomatic complexity in check (a single new instrument
 // otherwise pushes NewMetrics past the lint threshold).
 //
-//nolint:cyclop // Linear list of instrument constructions; the cyclomatic count
-// tracks the number of instruments, not branching logic.
+// count and length both track the number of instruments, not branching logic.
+//
+//nolint:cyclop,funlen // Linear list of instrument constructions; the cyclomatic
 func (m *Metrics) buildInstruments(meter metric.Meter) []error {
 	var errs []error
 	var err error

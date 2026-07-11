@@ -1,5 +1,9 @@
 [tools]
-go = "1.26.1"
+# Pin the toolchain to the declared module floor (every go.mod says `go 1.25.0`)
+# so local builds exercise the same minimum version consumers get, instead of
+# drifting ahead to a newer toolchain (FR-009/L15). CI additionally runs a
+# {1.25.x, 1.26.x} matrix (see .github/workflows/ci-matrix.yml).
+go = "1.25.0"
 "github:go-task/task" = "latest"
 "github:golangci/golangci-lint" = "2.11.4"
 "aqua:docker/buildx" = "latest"

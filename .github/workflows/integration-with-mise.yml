@@ -1,0 +1,56 @@
+name: integration-with-mise
+on:
+  push:
+  # Run on pull requests targeting main so PRs (incl. from forks) get integration signal
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Integration suite against a real PostgreSQL 18 container under the race
+  # detector (Taskfile `tests-integration` runs `go test ./... -v -count=2 -race`
+  # in internal/integration). GitHub-hosted ubuntu runners provide a working
+  # Docker daemon, which testcontainers uses to pull postgres:18-alpine. This is
+  # a required gate — a regression on a covered delivery/fencing/DLQ/GC/replay/
+  # batch path fails here (H2/FR-007, SC-004/SC-005).
+  #
+  # SC-005 verification (perform once when first wiring this gate, then revert):
+  # flip the channel.go DLQ guard `retryCount+1 > maxRetry` to `>=`, push, and
+  # confirm THIS job turns red — the DLQ/retry integration tests catch it — then
+  # revert. That demonstrates a covered-path regression actually fails CI.
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true # [default: true] run `mise install`
+          cache: true # [default: true] cache mise using GitHub's cache
+      - run: mise run test-integration
+
+  # Cross-package coverage measured from the integration module with
+  # -coverpkg pointed at the core module, so coverage of github.com/sgaunet/pgqueue
+  # exercised by the integration tests is captured (FR-010). Report-only for now:
+  # the profile is uploaded as an artifact and compared by eye, not hard-gated.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+      - name: integration coverage
+        working-directory: internal/integration
+        run: >-
+          go test ./... -race
+          -coverpkg=github.com/sgaunet/pgqueue/...
+          -coverprofile=${{ github.workspace }}/coverage.out
+      - name: coverage summary
+        run: go tool cover -func="${{ github.workspace }}/coverage.out" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error

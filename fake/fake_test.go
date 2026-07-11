@@ -19,6 +19,34 @@ func TestFakeSatisfiesPublishedInterfaces(t *testing.T) {
 	)
 }
 
+// TestFakePublishUnregisteredQueue pins the fake to the real Queue's fidelity fix
+// (M9/FR-028): publishing to a name that was never created as a channel or topic
+// returns ErrQueueNotFound instead of implicitly creating a channel, so a test
+// that would fail against PostgreSQL also fails against the fake. A registered
+// channel still accepts the publish.
+func TestFakePublishUnregisteredQueue(t *testing.T) {
+	ctx := context.Background()
+	q := fake.New()
+
+	// Unregistered name → ErrQueueNotFound, with no implicit create.
+	if _, err := q.Publish(ctx, "never-created", []byte("x")); !errors.Is(err, pgqueue.ErrQueueNotFound) {
+		t.Fatalf("publish to unregistered queue: want ErrQueueNotFound, got %v", err)
+	}
+	// The failed publish must not have created the channel as a side effect:
+	// consuming it still reports the queue missing.
+	if _, err := q.ReceiveChannel(ctx, "never-created"); !errors.Is(err, pgqueue.ErrQueueNotFound) {
+		t.Fatalf("receive after failed publish: want ErrQueueNotFound, got %v", err)
+	}
+
+	// A registered channel accepts the publish as before.
+	if err := q.CreateChannel(ctx, "orders"); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	if _, err := q.Publish(ctx, "orders", []byte("ok")); err != nil {
+		t.Fatalf("publish to registered channel: %v", err)
+	}
+}
+
 // TestFakeChannelPublishConsumeAck covers the basic channel happy path.
 func TestFakeChannelPublishConsumeAck(t *testing.T) {
 	ctx := context.Background()

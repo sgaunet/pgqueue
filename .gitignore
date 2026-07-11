@@ -1,3 +1,10 @@
 /specs
 /.claude
 /CLAUDE.md
+
+# The go.work workspace is developer-local and must not be tracked: in VCS it
+# would mask an unresolved module `require` (e.g. an adapter silently resolving
+# core at v0.0.0), which is exactly the release trap the go get smoke test
+# guards against. Recreate it locally — see README "Development".
+go.work
+go.work.sum

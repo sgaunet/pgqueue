@@ -1,0 +1,59 @@
+name: ci-matrix
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Build + lint every workspace module independently so an issue confined to an
+  # optional adapter (or the examples/integration modules) cannot hide behind the
+  # root module's green check (H2/FR-008). Each module has its own go.mod; the
+  # matrix cd's into each and runs `go build ./...` and `golangci-lint run` there.
+  # `go build`/lint are static and need no Docker (only the integration *tests*
+  # do, which run in integration-with-mise.yml).
+  build-lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - "."
+          - "internal/integration"
+          - "pglisten"
+          - "otelpgqueue"
+          - "prompgqueue"
+          - "examples"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+      - name: build (${{ matrix.module }})
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+      - name: lint (${{ matrix.module }})
+        working-directory: ${{ matrix.module }}
+        run: golangci-lint run
+
+  # Exercise the declared toolchain floor and the current ceiling. The modules
+  # declare `go 1.25.0`; without this the floor is never actually run (L15/FR-009).
+  # setup-go pins each leg's exact toolchain (mise pins a single version, so a
+  # version matrix needs setup-go here); GOTOOLCHAIN=local keeps Go from silently
+  # upgrading past the matrix version so the floor leg genuinely runs on 1.25.x.
+  go-version:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.x", "1.26.x"]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go build ./...
+      - run: go test ./... -race

@@ -594,13 +594,20 @@ func (pq *Queue) getActiveSubscribers(
 	tx *sql.Tx,
 	topicName string,
 ) ([]subscriber, error) {
-	//nolint:gosec // G201: schema-qualified internal table name, not user input
+	// When a per-topic subscriber cap is configured, LIMIT to cap+1 so an
+	// over-subscribed topic is detected (and rejected below) without loading an
+	// unbounded set into memory — the fan-out working set stays bounded (H5).
+	limitClause := ""
+	if maxSubs := pq.cfg.maxSubscribersPerTopic; maxSubs > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", maxSubs+1)
+	}
+	//nolint:gosec // G201: schema-qualified internal table name + integer LIMIT, not user input
 	query := fmt.Sprintf(`
 		SELECT id, topic_name, subscriber_id, created_at, active
 		FROM %s
 		WHERE topic_name = $1 AND active = TRUE
-		ORDER BY created_at
-	`, pq.globalTable("pgqueue_subscribers"))
+		ORDER BY created_at%s
+	`, pq.globalTable("pgqueue_subscribers"), limitClause)
 
 	var rows *sql.Rows
 	var err error
@@ -632,6 +639,16 @@ func (pq *Queue) getActiveSubscribers(
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate subscriber rows: %w", err)
+	}
+
+	// The LIMIT above fetched at most cap+1 rows; more than cap means the topic
+	// is over-subscribed. Reject the fan-out rather than proceeding — silently
+	// truncating to the first cap subscribers would drop deliveries (H5).
+	if maxSubs := pq.cfg.maxSubscribersPerTopic; maxSubs > 0 && len(items) > maxSubs {
+		return nil, fmt.Errorf(
+			"topic %q has more than %d active subscribers: %w",
+			topicName, maxSubs, ErrTooManySubscribers,
+		)
 	}
 
 	return items, nil

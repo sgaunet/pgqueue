@@ -12,7 +12,22 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// cleanupGracePeriod bounds a cancellation-detached best-effort cleanup so a
+// wedged connection cannot make the cleanup — and the Close/Delete/migration
+// that waits on it — block forever (M11/FR-026).
+const cleanupGracePeriod = 5 * time.Second
+
+// detachedGraceContext returns a context detached from ctx's cancellation but
+// bounded by cleanupGracePeriod. It is for best-effort cleanup that must still
+// run when the caller's ctx is already cancelled (advisory-unlock, search_path
+// reset, cache/LISTEN invalidation) yet must not hang on a stuck connection.
+// The caller must defer the returned CancelFunc.
+func detachedGraceContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupGracePeriod)
+}
 
 // baseSchemaSQL contains the DDL for creating the base schema tables required by pgqueue.
 // This includes: pgqueue_metadata, pgqueue_subscribers, and pgqueue_replay_log.
@@ -932,9 +947,13 @@ func (pq *Queue) deleteQueue(
 	// concurrent consumer's wakeChan can repopulate the notifier waker and
 	// re-issue LISTEN in the same in-process window that repopulates the metadata
 	// cache (#63), so forgetting only the cache leaks a waker + server-side LISTEN
-	// for the deleted queue (#52). Use a cancellation-detached context so a
-	// near-cancelled request ctx cannot abort the best-effort Unlisten.
-	pq.invalidateQueueCaches(context.WithoutCancel(ctx), queueType, name, metadata.TableName)
+	// for the deleted queue (#52). Use a cancellation-detached, grace-bounded
+	// context so a near-cancelled request ctx cannot abort the best-effort
+	// Unlisten, yet a wedged connection cannot make DeleteChannel/DeleteTopic
+	// hang forever either (M11).
+	cleanupCtx, cancelCleanup := detachedGraceContext(ctx)
+	defer cancelCleanup()
+	pq.invalidateQueueCaches(cleanupCtx, queueType, name, metadata.TableName)
 
 	return nil
 }

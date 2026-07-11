@@ -157,7 +157,7 @@ entries, acked subscription rows, orphaned topic messages) only happens if you
 run a `GarbageCollector`:
 
 ```go
-gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
+gc, err := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
     Interval: 5 * time.Minute,
     DefaultPolicy: pgqueue.RetentionPolicy{
         CompletedMessageTTL: 24 * time.Hour,      // delete completed messages after 24h
@@ -166,6 +166,9 @@ gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
     },
     // Per-queue overrides: Policies map[string]RetentionPolicy{"orders": {...}}
 })
+if err != nil {
+    log.Fatal(err) // invalid config (e.g. MaxWorkers out of range, negative interval)
+}
 gc.Start(ctx) // runs in the background until ctx is cancelled or q.Close()
 ```
 
@@ -180,6 +183,29 @@ gc.Start(ctx) // runs in the background until ctx is cancelled or q.Close()
 
 `q.Close()` stops every `GarbageCollector` created for the queue (it
 back-registers on construction), so you do not have to track them for shutdown.
+
+## Destructive operations
+
+Some operations mutate or delete data irreversibly. pgqueue deliberately does
+**not** take a `confirm` parameter — callers gate these at the call site — so the
+semantics are foregrounded here to make sure nothing is destructive by accident.
+
+- **Replay executes by default.** `ReplayFrom`, `ReplayMessage`, and `ReplayDLQ`
+  perform the replay immediately. To preview how many messages *would* be replayed
+  (and how many would be skipped) without mutating anything, set
+  `ReplayOptions.DryRun = true`:
+
+  ```go
+  // Preview only — nothing is modified.
+  res, err := q.ReplayDLQ(ctx, "orders", pgqueue.QueueTypeChannel,
+      pgqueue.ReplayOptions{DryRun: true})
+  // res.Replayed / res.Skipped report what a real (DryRun:false) run would do.
+  ```
+
+- **Purge and delete act immediately and irreversibly.** `PurgeQueue` empties a
+  queue's messages and DLQ; `DeleteChannel` / `DeleteTopic` drop the queue and its
+  tables. There is no undo and no confirmation flag — guard the call site yourself
+  (a feature flag, an operator prompt, an environment check).
 
 ## Architecture
 
@@ -251,7 +277,38 @@ pgqueue uses an in-process, **forward-only** schema migration runner. `InitSchem
 - **Upgrade binaries before (or with) the schema.** If a binary starts against a database whose schema is *newer* than its own `SchemaVersion`, `InitSchema()` aborts with `ErrSchemaTooNew` instead of risking corruption. In a rolling deploy, roll the new binary out everywhere; never point an old binary at an already-migrated database.
 - **Test upgrades in staging first**, against a copy of production data, and measure each migration's runtime before applying it to production. Some migrations patch every per-queue table, so their duration grows with the number of queues and the rows in them.
 
+## Versioning and compatibility
+
+pgqueue follows [Semantic Versioning](https://semver.org); see
+[CHANGELOG.md](CHANGELOG.md) for per-release detail.
+
+- **API SemVer.** A breaking change to the exported Go API requires a major
+  version bump; backward-compatible additions are minor; bug fixes are patch. The
+  optional adapter modules (`pglisten`, `otelpgqueue`, `prompgqueue`) version
+  independently but track the core major.
+- **Schema compatibility is forward-only and begins at v1.0.0.** `InitSchema` runs
+  a forward-only migration chain starting from the `v1.0.0` baseline
+  (`SchemaVersion = 1`). Upgrades **append** migrations and bump `SchemaVersion`;
+  a released migration is never edited, reordered, or removed. Downgrades are not
+  supported, and a database whose recorded version exceeds the running binary's
+  `SchemaVersion` is rejected with `ErrSchemaTooNew` rather than risking
+  corruption (see [Upgrading](#upgrading)). The one-time pre-1.0 migration squash
+  that produced this baseline is exactly that — one-time — and does not recur.
+
 ## Development
+
+### Workspace setup
+
+pgqueue is a Go multi-module workspace: the core module plus optional adapter
+modules (`pglisten`, `otelpgqueue`, `prompgqueue`), the runnable `examples`, and
+the `internal/integration` test suite. The `go.work` file is **not** tracked —
+in VCS it would mask an unresolved module `require` (for example an adapter
+silently resolving the core at `v0.0.0`). Create it locally after cloning:
+
+```bash
+go work init
+go work use . ./internal/integration ./pglisten ./otelpgqueue ./prompgqueue ./examples
+```
 
 ### Running Tests
 

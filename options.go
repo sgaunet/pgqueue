@@ -153,9 +153,11 @@ func WithVisibilityTimeout(d time.Duration) ConsumeOption {
 // APIs (ConsumeChannel/ConsumeTopic). It is ignored by single-shot
 // ReceiveChannel/ReceiveTopic.
 //
-// A non-positive n is coerced to 1 (a single worker) rather than rejected,
-// since consume runs in a long-lived loop with no natural place to surface a
-// configuration error.
+// Zero (the default) uses a single worker. A negative n is a caller mistake and
+// makes ConsumeChannel/ConsumeTopic return ErrInvalidConfig rather than being
+// silently coerced (L10). A value above the internal maximum (1024) is clamped
+// to it so a mistaken huge count cannot spawn an unbounded worker pool or open
+// that many pooled connections (M8).
 func WithConcurrency(n int) ConsumeOption {
 	return func(o *consumeOpts) {
 		o.concurrency = n
@@ -165,9 +167,11 @@ func WithConcurrency(n int) ConsumeOption {
 // WithPollInterval sets the polling interval between successive consume attempts
 // when no message is available.
 //
-// A non-positive d is ignored: the queue-wide WithSafetyNetPoll interval (or
-// the built-in default) is used instead, as if WithPollInterval had not been
-// called.
+// Zero uses the queue-wide WithSafetyNetPoll interval (or the built-in default),
+// as if WithPollInterval had not been called. A negative d is a caller mistake
+// and makes ConsumeChannel/ConsumeTopic return ErrInvalidConfig rather than
+// being silently ignored (L10); the iterator APIs, which cannot return a
+// configuration error, still fall back to the default for a non-positive value.
 func WithPollInterval(d time.Duration) ConsumeOption {
 	return func(o *consumeOpts) {
 		o.pollInterval = d

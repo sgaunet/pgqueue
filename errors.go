@@ -93,6 +93,13 @@ var (
 	// ErrSubscriberNotFound is returned when a subscriber cannot be found or is already inactive.
 	ErrSubscriberNotFound = errors.New("subscriber not found or already inactive")
 
+	// ErrTooManySubscribers is returned by a topic fan-out (single or batch
+	// publish) when the topic's active-subscriber count exceeds the
+	// WithMaxSubscribersPerTopic cap. It is a DoS guard: the publish is rejected
+	// rather than fanning the message out to an unbounded number of
+	// per-subscriber delivery rows.
+	ErrTooManySubscribers = errors.New("topic has too many active subscribers")
+
 	// ErrInvalidSubscriberID is returned when a subscriber ID is empty, too long,
 	// or contains invalid characters. The message is built from
 	// maxSubscriberIDLength so it cannot drift from the validation (issue #128).

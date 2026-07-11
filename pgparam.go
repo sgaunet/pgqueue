@@ -1,7 +1,9 @@
 package pgqueue
 
 import (
+	"bytes"
 	"database/sql"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -64,10 +66,25 @@ func float64ArrayLiteral(vals []float64) string {
 // array literals — message IDs and claim IDs — for the two uuid[] parameters of
 // an unnest(...) join. The first return is the ID literal, the second the
 // claim-ID literal.
+//
+// The pairs are emitted in canonical (MessageID, ClaimID) order so every batch
+// statement that unnest-joins them acquires row locks in a consistent order,
+// preventing ABBA deadlocks between concurrent batches that touch overlapping
+// rows (M2). A copy is sorted so the caller's slice — which drives the
+// input-order-preserving BatchResult partition in finishBatch — is untouched.
 func receiptsToIDClaimLiterals(receipts []Receipt) (string, string) {
-	idParts := make([]string, len(receipts))
-	claimParts := make([]string, len(receipts))
-	for i, r := range receipts {
+	sorted := make([]Receipt, len(receipts))
+	copy(sorted, receipts)
+	slices.SortFunc(sorted, func(a, b Receipt) int {
+		if c := bytes.Compare(a.MessageID[:], b.MessageID[:]); c != 0 {
+			return c
+		}
+		return bytes.Compare(a.ClaimID[:], b.ClaimID[:])
+	})
+
+	idParts := make([]string, len(sorted))
+	claimParts := make([]string, len(sorted))
+	for i, r := range sorted {
 		idParts[i] = r.MessageID.String()
 		claimParts[i] = r.ClaimID.String()
 	}

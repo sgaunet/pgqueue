@@ -31,6 +31,47 @@ const (
 	subDLQInsertParams  = 6 // dlqInsertParams + subscriber_id
 )
 
+// subFanoutChunkRows bounds both the in-memory fan-out working set (H5) and each
+// subscription multi-row INSERT: the messages×subscribers cross product is
+// streamed into the insert this many rows at a time instead of being fully
+// materialized first. Each row binds subInsertParams (2) parameters and
+// PostgreSQL's bind-parameter limit is 65535, so 16000 rows stays well under it.
+const subFanoutChunkRows = 16000
+
+// maxBatchTransientRetries bounds how many times a batch ack/nack is retried when
+// its transaction aborts with a transient error — chiefly a deadlock (40P01).
+// Canonical lock ordering (receiptsToIDClaimLiterals sorts its arrays and the
+// FOR UPDATE state fetches ORDER BY id) makes deadlocks rare; this retry absorbs
+// the residual and any serialization/connection blip (M2/FR-026).
+const maxBatchTransientRetries = 3
+
+// batchRetryBackoffStep is the base of the linear backoff between batch retries;
+// attempt i waits (i+1)*step so a deadlock victim does not immediately re-collide.
+const batchRetryBackoffStep = 10 * time.Millisecond
+
+// withBatchRetry runs a batch ack/nack attempt, retrying up to
+// maxBatchTransientRetries times when it fails with a transient error. Each
+// attempt runs its own transaction (the callee begins it and rolls it back on
+// error), so a retry re-does the work against a clean snapshot — safe because
+// nothing from a deadlocked/aborted attempt was committed. Success, a
+// non-transient error, or a cancelled context ends the loop immediately.
+func withBatchRetry(ctx context.Context, attempt func() (BatchResult, error)) (BatchResult, error) {
+	var res BatchResult
+	var err error
+	for i := 0; i <= maxBatchTransientRetries; i++ {
+		res, err = attempt()
+		if err == nil || !isTransientError(err) || ctx.Err() != nil {
+			return res, err
+		}
+		select {
+		case <-ctx.Done():
+			return res, err
+		case <-time.After(time.Duration(i+1) * batchRetryBackoffStep):
+		}
+	}
+	return res, err
+}
+
 // PublishBatch publishes multiple messages to a channel or topic in a single operation.
 // Returns message IDs in the same order as the input messages.
 //
@@ -79,7 +120,10 @@ func (pq *Queue) publishBatchResolved(
 	// re-unmarshaling the queue config per message in the hot path.
 	maxMsgSize := pq.resolveMaxMessageSize(queueMeta)
 
-	// Validate all payloads upfront before any DB work.
+	// Validate all payloads upfront before any DB work, accumulating the batch
+	// total so an aggregate WithMaxBatchBytes ceiling can reject an abusively
+	// large batch before it reaches the database (L8).
+	var totalBytes int64
 	for i := range messages {
 		if messages[i].Payload == nil {
 			return nil, ErrNilPayload
@@ -87,6 +131,13 @@ func (pq *Queue) publishBatchResolved(
 		if err := checkPayloadSize(maxMsgSize, messages[i].Payload); err != nil {
 			return nil, err
 		}
+		totalBytes += int64(len(messages[i].Payload))
+	}
+	if maxBatchBytes := pq.cfg.maxBatchBytes; maxBatchBytes > 0 && totalBytes > int64(maxBatchBytes) {
+		return nil, fmt.Errorf(
+			"batch payload total %d bytes exceeds limit %d: %w",
+			totalBytes, maxBatchBytes, ErrBatchTooLarge,
+		)
 	}
 
 	ids, metadataJSONs, err := pq.prepareBatchMessages(queueMeta, messages)
@@ -729,17 +780,34 @@ func (pq *Queue) batchCreateSubscriptionRecords(
 	messageIDs []uuid.UUID,
 	subscribers []subscriber,
 ) error {
-	records := make([]subRecord, 0, len(messageIDs)*len(subscribers))
+	// Stream the messages×subscribers cross product into the insert in bounded
+	// chunks instead of materializing the whole product first: a large batch
+	// fanned out to a large subscriber set is len(messageIDs)*len(subscribers)
+	// rows, which could be tens of millions of subRecords held in memory at once
+	// (H5). Capping the working set to subFanoutChunkRows keeps that footprint
+	// flat regardless of batch or subscriber count.
+	buf := make([]subRecord, 0, subFanoutChunkRows)
+	flush := func() error {
+		if len(buf) == 0 {
+			return nil
+		}
+		if err := pq.insertSubscriptionRecords(ctx, tx, tableName, buf); err != nil {
+			return err
+		}
+		buf = buf[:0]
+		return nil
+	}
 	for _, msgID := range messageIDs {
 		for _, sub := range subscribers {
-			records = append(records, subRecord{
-				messageID:    msgID,
-				subscriberID: sub.SubscriberID,
-			})
+			buf = append(buf, subRecord{messageID: msgID, subscriberID: sub.SubscriberID})
+			if len(buf) == subFanoutChunkRows {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
 		}
 	}
-
-	return pq.insertSubscriptionRecords(ctx, tx, tableName, records)
+	return flush()
 }
 
 // insertSubscriptionRecords inserts subscription rows, chunked to stay within
@@ -751,11 +819,8 @@ func (pq *Queue) insertSubscriptionRecords(
 	tableName string,
 	records []subRecord,
 ) error {
-	// Each row uses 2 params; PostgreSQL limit is 65535.
-	const maxRowsPerInsert = 16000
-
-	for start := 0; start < len(records); start += maxRowsPerInsert {
-		end := min(start+maxRowsPerInsert, len(records))
+	for start := 0; start < len(records); start += subFanoutChunkRows {
+		end := min(start+subFanoutChunkRows, len(records))
 		chunk := records[start:end]
 
 		var sb strings.Builder
@@ -814,6 +879,7 @@ func (pq *Queue) fetchBatchMessageStates(
 		JOIN unnest($1::text::uuid[], $2::text::uuid[]) AS u(id, claim_id)
 		  ON m.id = u.id AND m.claim_id = u.claim_id
 		WHERE m.status = '%s'
+		ORDER BY m.id
 		FOR UPDATE OF m
 	`, pq.msgTable(tableName), MessageStatusProcessing)
 
@@ -886,6 +952,12 @@ func (pq *Queue) batchMoveToDLQ(
 	messages []batchDLQMessage,
 	errorMsg string,
 ) error {
+	// Defense-in-depth: the DLQ failure_reason column is the durable sink, so
+	// bound the message here regardless of whether the caller already truncated
+	// it (L4). truncateErrorMsg is idempotent, so re-truncating an already-bounded
+	// message from nackChannelBatch is a no-op.
+	errorMsg = truncateErrorMsg(errorMsg)
+
 	dlqInsert := fmt.Sprintf(
 		`INSERT INTO %s (original_message_id, payload, failure_reason, retry_count, metadata) VALUES `,
 		pq.dlqTable(tableName),
@@ -953,6 +1025,7 @@ func (pq *Queue) fetchBatchSubStates(
 		  ON s.message_id = u.message_id AND s.claim_id = u.claim_id
 		WHERE s.subscriber_id = $3
 		  AND s.status = '%s'
+		ORDER BY s.message_id
 		FOR UPDATE OF s
 	`, pq.subTable(tableName), pq.msgTable(tableName), MessageStatusProcessing)
 
@@ -1077,6 +1150,10 @@ func (pq *Queue) batchMoveSubToDLQ(
 	messages []batchDLQMessage,
 	errorMsg string,
 ) error {
+	// Defense-in-depth truncation at the durable DLQ failure_reason sink (L4);
+	// idempotent, so the entry-point truncation in nackTopicBatch is preserved.
+	errorMsg = truncateErrorMsg(errorMsg)
+
 	// Batch insert into DLQ, recording which subscriber failed.
 	dlqPrefix := fmt.Sprintf(
 		`INSERT INTO %s `+

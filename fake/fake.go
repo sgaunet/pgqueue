@@ -199,8 +199,9 @@ func (q *Queue) Subscribe(_ context.Context, topicName, subscriberID string) err
 // Publish publishes a message to the named channel or topic. The destination
 // type is resolved by name — mirroring the real Queue, where a name is unique
 // across both types. A name registered as a topic fans the message out to a
-// copy in each current subscriber's queue; any other name is treated as a
-// channel and created on first use.
+// copy in each current subscriber's queue; a name registered as a channel
+// receives the message. An unregistered name returns ErrQueueNotFound, matching
+// the real Queue rather than implicitly creating a channel (M9/FR-028).
 func (q *Queue) Publish(
 	_ context.Context, name string, payload []byte, opts ...pgqueue.PublishOption,
 ) (uuid.UUID, error) {
@@ -254,8 +255,11 @@ func (q *Queue) Publish(
 
 	ch, ok := q.channels[name]
 	if !ok {
-		ch = newChannel()
-		q.channels[name] = ch
+		// Match the real Queue (publish.go resolveQueueMetadata): publishing to a
+		// name that was never created as a channel or topic returns
+		// ErrQueueNotFound rather than implicitly creating it (M9/FR-028), so a
+		// test that would fail against PostgreSQL also fails against the fake.
+		return uuid.UUID{}, fmt.Errorf("%s: %w", name, pgqueue.ErrQueueNotFound)
 	}
 	if ch.hasMessage(id) {
 		return uuid.UUID{}, fmt.Errorf("%s: %w", id, pgqueue.ErrDuplicateMessageID)

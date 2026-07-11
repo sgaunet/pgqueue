@@ -1148,7 +1148,14 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 ) (int64, error) {
 	msgTbl := gc.pq.msgTable(tableName)
 	// The table name comes from a queueNameRegex-validated queue name, so this
-	// interpolation is injection-safe.
+	// interpolation is injection-safe. Paginated (M3): each page resets at most
+	// retentionPurgePageSize timed-out rows via ORDER BY id LIMIT + FOR UPDATE
+	// SKIP LOCKED, bounding the lock window and WAL footprint of a huge
+	// crash-reclaim backlog per statement while concurrent workers never block
+	// each other. A reset row flips to 'pending' and no longer matches the
+	// status='processing' predicate, so a fresh page never re-sees it — the same
+	// paging invariant runPagedPurge relies on (and it propagates a RowsAffected
+	// error rather than silently reporting nothing reclaimed, #67).
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -1160,29 +1167,21 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 			WHERE status = '%s'
 			  AND visibility_timeout IS NOT NULL
 			  AND visibility_timeout < NOW()
+			ORDER BY id
+			LIMIT %d
 			FOR UPDATE SKIP LOCKED
 		)
-	`, msgTbl, MessageStatusPending, msgTbl, MessageStatusProcessing)
+	`, msgTbl, MessageStatusPending, msgTbl, MessageStatusProcessing, retentionPurgePageSize)
 
-	result, err := gc.pq.db.ExecContext(ctx, query)
+	total, err := gc.runPagedPurge(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("failed to reset timed-out messages: %w", err)
+		return total, fmt.Errorf("failed to reset timed-out messages: %w", err)
+	}
+	if total > 0 {
+		gc.pq.logInfo("reset timed-out messages", "count", total, "table", tableName)
 	}
 
-	rows, raErr := rowsAffectedOrErr(result)
-	if raErr != nil {
-		// Propagate rather than swallow: a discarded error here makes rows=0,
-		// which the caller reports as "nothing reclaimed" even though the UPDATE
-		// ran — the same class of bug fixed for the paged purge loop (#67).
-		gc.pq.logError("reset timed-out messages rows affected",
-			"table", tableName, "error", raErr)
-		return 0, fmt.Errorf("reset timed-out messages rows affected: %w", raErr)
-	}
-	if rows > 0 {
-		gc.pq.logInfo("reset timed-out messages", "count", rows, "table", tableName)
-	}
-
-	return rows, nil
+	return total, nil
 }
 
 // resetTimedOutSubscriptions resets subscriptions with expired visibility
@@ -1197,7 +1196,12 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 ) (int64, error) {
 	subTbl := gc.pq.subTable(tableName)
 	// The table name comes from a queueNameRegex-validated queue name, so this
-	// interpolation is injection-safe.
+	// interpolation is injection-safe. Paginated (M3) on the subscription-row id,
+	// mirroring resetTimedOutMessages: each page resets at most
+	// retentionPurgePageSize rows via ORDER BY id LIMIT + FOR UPDATE SKIP LOCKED,
+	// bounding the lock window on a huge backlog. A reset row flips to 'pending'
+	// so a fresh page never re-sees it, and runPagedPurge propagates a
+	// RowsAffected error rather than silently under-reporting (#67).
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -1209,29 +1213,23 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 			WHERE status = '%s'
 			  AND visibility_timeout IS NOT NULL
 			  AND visibility_timeout < NOW()
+			ORDER BY id
+			LIMIT %d
 			FOR UPDATE SKIP LOCKED
 		)
-	`, subTbl, MessageStatusPending, subTbl, MessageStatusProcessing)
+	`, subTbl, MessageStatusPending, subTbl, MessageStatusProcessing, retentionPurgePageSize)
 
-	result, err := gc.pq.db.ExecContext(ctx, query)
+	total, err := gc.runPagedPurge(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf(
+		return total, fmt.Errorf(
 			"failed to reset timed-out subscriptions: %w", err,
 		)
 	}
-
-	rows, raErr := rowsAffectedOrErr(result)
-	if raErr != nil {
-		// Propagate rather than swallow — see resetTimedOutMessages (#67).
-		gc.pq.logError("reset timed-out subscriptions rows affected",
-			"table", tableName, "error", raErr)
-		return 0, fmt.Errorf("reset timed-out subscriptions rows affected: %w", raErr)
-	}
-	if rows > 0 {
-		gc.pq.logInfo("reset timed-out subscriptions", "count", rows, "table", tableName)
+	if total > 0 {
+		gc.pq.logInfo("reset timed-out subscriptions", "count", total, "table", tableName)
 	}
 
-	return rows, nil
+	return total, nil
 }
 
 // purgeInactiveSubscriptions deletes leftover subscription rows belonging to

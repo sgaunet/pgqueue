@@ -1,0 +1,25 @@
+name: goget-smoke
+on:
+  # Manual until v1.0.0 exists; tag-triggered thereafter, when it becomes a
+  # release gate proving consumers can `go get …@vX.Y.Z` (H3/SC-006).
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  goget-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+      # On a tag push, smoke-test that exact version; otherwise resolve `latest`.
+      # The "core must not resolve to v0.0.0" assertion is the real gate and holds
+      # for either version.
+      - name: go get smoke test
+        run: bash scripts/goget-smoke.sh
+        env:
+          GOGET_SMOKE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}

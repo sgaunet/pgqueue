@@ -238,6 +238,13 @@ const KeepForever time.Duration = -1
 // subscriber's rows are left intact, so a slow subscriber can no longer cause
 // message loss for its peers.
 //
+// MaxPendingAge is anchored at the message's creation time (created_at, i.e.
+// publish time), not its last delivery attempt: a message still pending
+// MaxPendingAge after it was first published is dropped regardless of how many
+// times it was redelivered in between — redelivery does not reset the clock
+// (L6/L7). Set MaxPendingAge comfortably longer than the worst-case processing
+// time plus all retries, or leave it 0/KeepForever to never age out live work.
+//
 // CompletedMessageTTL and DLQRetention may be set independently for pub/sub
 // topics — in particular DLQRetention may exceed CompletedMessageTTL, which is
 // the usual and default arrangement (keep failures around longer than

@@ -9,6 +9,11 @@ import (
 )
 
 // Stats returns statistics for a queue.
+//
+// It runs several COUNT aggregations over the queue's message (and, for topics,
+// subscription) tables, so its cost is O(rows) — an admin/observability call,
+// not a per-message hot-path operation. Avoid calling it in a tight consume loop
+// on a large queue; sample it periodically instead (M5).
 func (pq *Queue) Stats(
 	ctx context.Context,
 	queueName string,
@@ -147,6 +152,10 @@ func queueDepthQuery(pq *Queue, tableName string, queueType QueueType, ttl time.
 }
 
 // SubscriberLag returns lag statistics for a specific subscriber on a topic.
+//
+// It aggregates over the subscription table for the subscriber, so its cost is
+// O(rows) — an admin/observability call, not a per-message hot-path operation
+// (M5).
 func (pq *Queue) SubscriberLag(
 	ctx context.Context,
 	topicName string,
@@ -208,6 +217,9 @@ func (pq *Queue) SubscriberLag(
 }
 
 // DLQStats returns statistics about messages in the dead letter queue.
+//
+// It aggregates over the DLQ table, so its cost is O(rows) — an
+// admin/observability call, not a per-message hot-path operation (M5).
 func (pq *Queue) DLQStats(
 	ctx context.Context,
 	queueName string,

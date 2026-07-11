@@ -270,7 +270,12 @@ func acquireMigrationLock(
 		return nil, fmt.Errorf("failed to acquire migration lock: %w", err)
 	}
 	return func() {
-		if _, unlockErr := conn.ExecContext(context.WithoutCancel(ctx),
+		// Detach from the caller's cancellation so the unlock still runs, but
+		// bound it so a wedged connection cannot make the release (and the
+		// InitSchema that defers it) hang forever (M11).
+		unlockCtx, cancel := detachedGraceContext(ctx)
+		defer cancel()
+		if _, unlockErr := conn.ExecContext(unlockCtx,
 			"SELECT pg_advisory_unlock($1)", migrationAdvisoryLockKey,
 		); unlockErr != nil && logger != nil {
 			logger.Warn("pgqueue: failed to release migration advisory lock",
@@ -325,7 +330,11 @@ func configureMigrationSchema(ctx context.Context, conn *sql.Conn, schema string
 		return noop, fmt.Errorf("failed to set search_path: %w", err)
 	}
 	return func() {
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "RESET search_path")
+		// Bounded, cancellation-detached so a wedged connection cannot make the
+		// search_path reset hang forever (M11).
+		resetCtx, cancel := detachedGraceContext(ctx)
+		defer cancel()
+		_, _ = conn.ExecContext(resetCtx, "RESET search_path")
 	}, nil
 }
 
@@ -393,4 +402,3 @@ func (pq *Queue) SchemaVersion(ctx context.Context) (int, error) {
 
 	return schemaVersion(ctx, pq.db, versionTable)
 }
-

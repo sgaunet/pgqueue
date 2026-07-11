@@ -582,6 +582,7 @@ func (pq *Queue) executeReplayMessage(
 		    retry_count = 0,
 		    visibility_timeout = NULL,
 		    claim_id = NULL,
+		    available_at = NOW(),
 		    processed_at = NULL,
 		    error_message = NULL
 		WHERE id = $1 AND status != '%s'

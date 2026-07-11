@@ -118,15 +118,17 @@ func NewMetrics(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 		return nil, fmt.Errorf("prompgqueue: register publish counter: %w", err)
 	}
 	if m.handleDur, err = registerCollector(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "pgqueue_handle_duration_seconds",
-		Help:    "Handler-only execution latency in seconds (excludes queue wait, fetch, and ack); see DefaultLatencyBuckets for the bucket layout.",
+		Name: "pgqueue_handle_duration_seconds",
+		Help: "Handler-only execution latency in seconds (excludes queue wait, fetch, and ack); " +
+			"see DefaultLatencyBuckets for the bucket layout.",
 		Buckets: cfg.latencyBuckets,
 	}, []string{queueLabel})); err != nil {
 		return nil, fmt.Errorf("prompgqueue: register handle histogram: %w", err)
 	}
 	if m.deliveryLatency, err = registerCollector(reg, prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "pgqueue_delivery_latency_seconds",
-		Help:    "Publish-to-delivery latency in seconds: time from message creation to handler start; see DefaultLatencyBuckets for the bucket layout.",
+		Name: "pgqueue_delivery_latency_seconds",
+		Help: "Publish-to-delivery latency in seconds: time from message creation to handler start; " +
+			"see DefaultLatencyBuckets for the bucket layout.",
 		Buckets: cfg.latencyBuckets,
 	}, []string{queueLabel})); err != nil {
 		return nil, fmt.Errorf("prompgqueue: register delivery-latency histogram: %w", err)

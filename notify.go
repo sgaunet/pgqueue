@@ -32,8 +32,18 @@ func notifyChannelName(tableName string) string {
 // emitNotify issues a NOTIFY on a queue's channel inside the publishing
 // transaction. PostgreSQL delivers the notification only on commit, so a
 // blocked consumer is woken exactly when the message becomes visible and never
-// for a rolled-back publish (FR-014). A failed NOTIFY is logged but never fails
-// the publish — delivery still happens via the safety-net poll.
+// for a rolled-back publish (FR-014).
+//
+// The channel name is always a validated, length-bounded identifier
+// (notifyChannelName over a sanitized table name), so pg_notify does not fail in
+// practice. The failure mode is deliberately NOT "log and continue": a statement
+// error inside a PostgreSQL transaction aborts the whole transaction, so a
+// genuinely failing pg_notify here would surface as a failed COMMIT and fail the
+// publish — it is not silently swallowed. Wrapping the call in a SAVEPOINT would
+// make the NOTIFY independently recoverable, but is omitted on purpose: the
+// per-publish SAVEPOINT round trip is not worth guarding against a failure the
+// validated channel name already precludes. The error is logged for diagnosis
+// on the off chance it ever occurs (L3).
 func (pq *Queue) emitNotify(ctx context.Context, tx *sql.Tx, tableName string) {
 	// pg_notify (the function) is used instead of the NOTIFY statement so the
 	// channel name is passed as a bound parameter.
@@ -121,8 +131,14 @@ type notifier struct {
 	logger   *slog.Logger
 	// onMissedNotification is called when a LISTEN confirmation fails, meaning
 	// at least one notification was or will be missed on notifyChannel until
-	// LISTEN is re-confirmed. It is set from Queue.cfg.metrics via newNotifier
-	// and may be nil when no MetricsRecorder is registered.
+	// LISTEN is re-confirmed. This is the bridge from a dropped/reconnecting
+	// push-delivery connection (e.g. pglisten's reconnect loop, R-07) to the
+	// MetricsRecorder.RecordMissedNotification metric: after a reconnect the
+	// notifier re-issues LISTEN for each active channel, and a re-confirmation
+	// failure fires this hook. Correctness never depends on it — the safety-net
+	// poll still recovers any notification missed during the gap (M7). It is set
+	// from Queue.cfg.metrics via newNotifier and may be nil when no
+	// MetricsRecorder is registered.
 	onMissedNotification func(notifyChannel string)
 
 	// ctx scopes the confirmListen goroutines' Listen calls; cancel fires on

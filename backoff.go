@@ -18,7 +18,13 @@ const (
 // Multiplier, capped at MaxDelay. The jitter spreads retries out and avoids
 // redelivery storms when many messages fail at once.
 type BackoffPolicy struct {
-	// BaseDelay is the minimum wait before the first retry.
+	// BaseDelay is the minimum wait before the first retry. A zero or negative
+	// value is replaced by the 1s default in normalized(). Setting it below ~1ms
+	// in production is discouraged: sub-millisecond backoff makes a batch of
+	// simultaneously-failing messages redeliver in a tight loop that spikes
+	// database load, so pick a value that meaningfully spreads retries out. (The
+	// integration suite deliberately uses sub-ms values for fast redelivery; that
+	// is a test-only trade-off, L5.)
 	BaseDelay time.Duration
 	// MaxDelay caps the wait for any single retry.
 	MaxDelay time.Duration
@@ -73,16 +79,27 @@ func (p BackoffPolicy) Delay(prev time.Duration) time.Duration {
 // hang the call (R-13).
 const maxBackoffSteps = 64
 
+// maxRetryDelay caps an explicit WithRetryDelay override. A day is far beyond
+// any sane redelivery backoff, so a larger value almost always means a unit
+// mix-up (e.g. nanoseconds where seconds were intended) that would otherwise
+// defer a message effectively forever; the override is clamped rather than
+// rejected because Nack is already a failure path (L9).
+const maxRetryDelay = 24 * time.Hour
+
 // computeRetryDelay resolves how long a nacked message must wait before it
 // becomes eligible for redelivery. A positive override (from WithRetryDelay)
-// wins outright; otherwise the queue's BackoffPolicy is advanced attempt times
-// to produce the decorrelated-jitter delay for this retry (FR-023).
+// wins outright, clamped to maxRetryDelay; otherwise the queue's BackoffPolicy
+// is advanced attempt times to produce the decorrelated-jitter delay for this
+// retry (FR-023).
 //
 // The iteration count is capped at maxBackoffSteps so the call runs in O(cap)
 // time regardless of attempt; the delay has already saturated at MaxDelay by
 // then.
 func (pq *Queue) computeRetryDelay(attempt int, override time.Duration) time.Duration {
 	if override > 0 {
+		if override > maxRetryDelay {
+			return maxRetryDelay
+		}
 		return override
 	}
 	steps := min(attempt, maxBackoffSteps)

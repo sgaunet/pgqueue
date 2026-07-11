@@ -37,6 +37,29 @@ const (
 	transientBackoffCap        = 5 * time.Second
 )
 
+// maxConcurrency bounds WithConcurrency so a mistaken huge value cannot spawn an
+// unbounded worker pool — and open that many pooled database connections. A
+// value above it is clamped to it rather than rejected (M8).
+const maxConcurrency = 1024
+
+// validateConsumeOptions rejects clearly-invalid per-consume options at the
+// handler-loop entry points (ConsumeChannel/ConsumeTopic), which can surface the
+// error — rather than silently coercing a caller mistake (L10). Zero means "use
+// the default"; a negative concurrency or poll interval is a bug.
+func validateConsumeOptions(o consumeOpts) error {
+	if o.concurrency < 0 {
+		return fmt.Errorf(
+			"%w: WithConcurrency must be >= 1 (0 uses the default of 1), got %d",
+			ErrInvalidConfig, o.concurrency)
+	}
+	if o.pollInterval < 0 {
+		return fmt.Errorf(
+			"%w: WithPollInterval must be > 0 (0 uses the default), got %v",
+			ErrInvalidConfig, o.pollInterval)
+	}
+	return nil
+}
+
 // transientBackoff returns the wait before the attempt-th consecutive
 // transient-error retry: a linear escalation capped at transientBackoffCap.
 func transientBackoff(attempt int) time.Duration {
@@ -47,12 +70,16 @@ func transientBackoff(attempt int) time.Duration {
 	return d
 }
 
-// Handler is a callback invoked by the handler-based consume loop for each
-// delivered message. Return nil to auto-ack; return any non-nil error to
-// auto-nack (the error string is recorded as the failure reason).
+// Handler is a callback invoked by the handler-based consume loop
+// (ConsumeChannel/ConsumeTopic) for each delivered message. Return nil to
+// auto-ack; return any non-nil error to auto-nack (the error string is recorded
+// as the failure reason).
 //
-// Handler-based consumption is a future feature (Phase 4, US2). The type is
-// declared here so published interfaces can reference it.
+// The handler runs under the consume loop's context. That context is cancelled
+// when the caller's context is cancelled or when Queue.Close is called, and
+// Close blocks until every in-flight handler returns (it joins the worker
+// loops). A handler that ignores ctx cancellation therefore delays Close by up
+// to its own remaining run time, so long-running handlers should honor ctx (L2).
 type Handler func(ctx context.Context, msg *Message) error
 
 // ReceiveChannel retrieves the next available message from a point-to-point
@@ -168,8 +195,9 @@ func (pq *Queue) ackReceipt(ctx context.Context, r Receipt) error {
 	pq.endSpan(span, err)
 	if err == nil {
 		pq.recordAck(r.QueueName, true)
+		return nil
 	}
-	return err
+	return receiptError(r, err)
 }
 
 // Nack negatively acknowledges a message using the Receipt returned by
@@ -215,8 +243,27 @@ func (pq *Queue) nackReceipt(
 	pq.endSpan(span, err)
 	if err == nil {
 		pq.recordAck(r.QueueName, false)
+		return nil
 	}
-	return err
+	return receiptError(r, err)
+}
+
+// receiptError enriches a single-receipt Ack/Nack failure with the queue,
+// message, and (for topics) subscriber it concerns, so a bare ErrClaimExpired /
+// ErrMessageNotFound is actionable from a log line without the caller
+// re-deriving the binding (D8). The sentinel stays matchable via errors.Is
+// because err is wrapped with %w. A receipt with no valid QueueType has no
+// binding to attach, so its error is returned unwrapped.
+func receiptError(r Receipt, err error) error {
+	switch r.QueueType {
+	case QueueTypeChannel:
+		return fmt.Errorf("channel %s, message %s: %w", r.QueueName, r.MessageID, err)
+	case QueueTypePubSub:
+		return fmt.Errorf("topic %s, subscriber %s, message %s: %w",
+			r.QueueName, r.SubscriberID, r.MessageID, err)
+	default:
+		return err
+	}
 }
 
 // receiptGroupKey identifies the set of receipts that target the same queue
@@ -267,9 +314,16 @@ func groupReceiptsByQueue(rs []Receipt) (map[receiptGroupKey][]Receipt, error) {
 // matched a processing message, each with the reason (ErrClaimExpired,
 // ErrMessageAlreadyAcked, or ErrMessageNotFound). Partial success is not an
 // error: a batch where some claims have expired returns a nil error with those
-// receipts in Failed. A non-nil error signals an operational failure (the queue
-// is closed, the batch is too large, a receipt is missing its queue binding,
-// the queue does not exist, or a database error); the BatchResult is then zero.
+// receipts in Failed.
+//
+// Receipts are grouped by queue and each group is acked in its own transaction,
+// so an operational failure in one group (a missing queue, a database error)
+// does not roll back the groups that already committed. Such a failure is
+// returned as a joined error while BatchResult still carries the succeeded and
+// failed receipts of every group that did commit — the result is never silently
+// zeroed (M1). Pre-flight failures that reject the whole call before any group
+// runs (the queue is closed, a receipt is missing its queue binding) still
+// return a zero BatchResult.
 func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) (BatchResult, error) {
 	if err := pq.checkClosed(); err != nil {
 		return BatchResult{}, err
@@ -282,24 +336,34 @@ func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) (BatchResult, error
 		return BatchResult{}, err
 	}
 	var combined BatchResult
+	var errs []error
 	for k, receipts := range groups {
 		var res BatchResult
 		var err error
 		switch k.qt {
 		case QueueTypeChannel:
-			res, err = pq.ackChannelBatch(ctx, k.queueName, receipts)
+			res, err = withBatchRetry(ctx, func() (BatchResult, error) {
+				return pq.ackChannelBatch(ctx, k.queueName, receipts)
+			})
 		case QueueTypePubSub:
-			res, err = pq.ackTopicBatch(ctx, k.queueName, k.subscriberID, receipts)
+			res, err = withBatchRetry(ctx, func() (BatchResult, error) {
+				return pq.ackTopicBatch(ctx, k.queueName, k.subscriberID, receipts)
+			})
 		default:
 			continue
 		}
 		if err != nil {
-			return BatchResult{}, err
+			// Each group commits in its own transaction, so a failure here does
+			// not undo groups that already committed. Record it and keep going;
+			// the caller gets the joined error alongside the committed results
+			// rather than a silently zeroed BatchResult (M1).
+			errs = append(errs, err)
+			continue
 		}
 		combined.Succeeded = append(combined.Succeeded, res.Succeeded...)
 		combined.Failed = append(combined.Failed, res.Failed...)
 	}
-	return combined, nil
+	return combined, errors.Join(errs...)
 }
 
 // NackBatch negatively acknowledges multiple messages using their Receipts.
@@ -310,8 +374,12 @@ func (pq *Queue) AckBatch(ctx context.Context, rs []Receipt) (BatchResult, error
 // The returned BatchResult enumerates the per-receipt outcome the same way as
 // AckBatch: Succeeded lists the receipts that were nacked (retried or moved to
 // DLQ), and Failed lists those whose claim no longer matched, each with the
-// reason. Partial success is not an error; a non-nil error is operational and
-// the BatchResult is then zero.
+// reason. Partial success is not an error. As with AckBatch, receipts are
+// grouped by queue and each group is nacked in its own transaction: an
+// operational failure in one group is returned as a joined error while
+// BatchResult still carries every already-committed group's results, rather than
+// being zeroed (M1). Pre-flight failures (closed queue, missing queue binding)
+// still return a zero BatchResult.
 func (pq *Queue) NackBatch(
 	ctx context.Context,
 	rs []Receipt,
@@ -329,24 +397,32 @@ func (pq *Queue) NackBatch(
 		return BatchResult{}, err
 	}
 	var combined BatchResult
+	var errs []error
 	for k, receipts := range groups {
 		var res BatchResult
 		var err error
 		switch k.qt {
 		case QueueTypeChannel:
-			res, err = pq.nackChannelBatch(ctx, k.queueName, receipts, reason, opts...)
+			res, err = withBatchRetry(ctx, func() (BatchResult, error) {
+				return pq.nackChannelBatch(ctx, k.queueName, receipts, reason, opts...)
+			})
 		case QueueTypePubSub:
-			res, err = pq.nackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason, opts...)
+			res, err = withBatchRetry(ctx, func() (BatchResult, error) {
+				return pq.nackTopicBatch(ctx, k.queueName, k.subscriberID, receipts, reason, opts...)
+			})
 		default:
 			continue
 		}
 		if err != nil {
-			return BatchResult{}, err
+			// Independent per-group transaction: preserve committed groups'
+			// results and join the error rather than zeroing everything (M1).
+			errs = append(errs, err)
+			continue
 		}
 		combined.Succeeded = append(combined.Succeeded, res.Succeeded...)
 		combined.Failed = append(combined.Failed, res.Failed...)
 	}
-	return combined, nil
+	return combined, errors.Join(errs...)
 }
 
 // isStopSignal reports whether err is the expected, non-fatal signal that a
@@ -572,6 +648,9 @@ func (pq *Queue) ConsumeChannel(
 	if err := pq.checkClosed(); err != nil {
 		return err
 	}
+	if err := validateConsumeOptions(applyConsumeOptions(opts)); err != nil {
+		return err
+	}
 	notifyCh := pq.resolveNotifyChannel(ctx, QueueTypeChannel, name)
 	return pq.runHandlerLoop(ctx, opts, notifyCh, h, func(c context.Context) (*Message, error) {
 		return pq.ReceiveChannel(c, name, opts...)
@@ -588,6 +667,9 @@ func (pq *Queue) ConsumeTopic(
 	opts ...ConsumeOption,
 ) error {
 	if err := pq.checkClosed(); err != nil {
+		return err
+	}
+	if err := validateConsumeOptions(applyConsumeOptions(opts)); err != nil {
 		return err
 	}
 	notifyCh := pq.resolveNotifyChannel(ctx, QueueTypePubSub, name)
@@ -618,6 +700,9 @@ func (pq *Queue) runHandlerLoop(
 	workers := o.concurrency
 	if workers <= 0 {
 		workers = 1
+	}
+	if workers > maxConcurrency {
+		workers = maxConcurrency
 	}
 	poll := pq.effectivePoll(o)
 
