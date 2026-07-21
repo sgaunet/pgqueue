@@ -67,8 +67,8 @@ func TestInitRequiresSchema(t *testing.T) {
 	}
 }
 
-// TestSchemaVersion verifies SchemaVersion reports the applied version.
-func TestSchemaVersion(t *testing.T) {
+// TestAppliedSchemaVersion verifies AppliedSchemaVersion reports the applied version.
+func TestAppliedSchemaVersion(t *testing.T) {
 	db, cleanup := setupTestContainer(t)
 	defer cleanup()
 
@@ -83,9 +83,9 @@ func TestSchemaVersion(t *testing.T) {
 		t.Fatalf("Init failed: %v", err)
 	}
 
-	version, err := pq.SchemaVersion(ctx)
+	version, err := pq.AppliedSchemaVersion(ctx)
 	if err != nil {
-		t.Fatalf("SchemaVersion failed: %v", err)
+		t.Fatalf("AppliedSchemaVersion failed: %v", err)
 	}
 	if version != pgqueue.SchemaVersion {
 		t.Errorf("expected version %d, got %d", pgqueue.SchemaVersion, version)

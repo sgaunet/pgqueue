@@ -380,12 +380,13 @@ func applyMigration(ctx context.Context, conn *sql.Conn, m migration) error {
 	return nil
 }
 
-// SchemaVersion returns the schema version currently applied to the database.
+// AppliedSchemaVersion returns the schema version currently applied to the
+// database.
 //
 // It returns 0 if InitSchema has never created the pgqueue_schema_version table.
 // Compare the result against the SchemaVersion constant to detect whether a
 // newer library build would apply further migrations.
-func (pq *Queue) SchemaVersion(ctx context.Context) (int, error) {
+func (pq *Queue) AppliedSchemaVersion(ctx context.Context) (int, error) {
 	// to_regclass resolves to NULL (without erroring) when the table does not
 	// exist, so this stays safe to call before InitSchema. Referencing the
 	// table directly would fail at query-planning time if it were missing.

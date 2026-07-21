@@ -28,9 +28,9 @@ func TestSchemaBaselineParity(t *testing.T) {
 	if pgqueue.SchemaVersion != 1 {
 		t.Fatalf("pgqueue.SchemaVersion = %d, want 1 (squashed baseline)", pgqueue.SchemaVersion)
 	}
-	applied, err := pq.SchemaVersion(ctx)
+	applied, err := pq.AppliedSchemaVersion(ctx)
 	if err != nil {
-		t.Fatalf("SchemaVersion: %v", err)
+		t.Fatalf("AppliedSchemaVersion: %v", err)
 	}
 	if applied != 1 {
 		t.Errorf("applied schema version = %d, want 1", applied)

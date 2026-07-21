@@ -179,7 +179,7 @@ The function is idempotent (safe to call multiple times) and safe to run
 concurrently from multiple processes. It is also the **upgrade path**: when a
 newer release of pgqueue changes the schema, `InitSchema()` transparently
 applies the pending migrations — no external migration tool needed. Call
-`q.SchemaVersion(ctx)` to inspect the applied version.
+`q.AppliedSchemaVersion(ctx)` to inspect the applied version.
 
 **Note**: Per-queue tables (`pgqueue_msg_*`, `pgqueue_dlq_*`, etc.) are created
 automatically when you call `CreateChannel()` or `CreateTopic()`.
