@@ -51,9 +51,9 @@ pre-release development series.
   concurrency suites.
 - A published `CHANGELOG`, a SemVer policy, and a forward-only schema/migration
   compatibility guarantee.
-- CI that runs the integration suite against a real PostgreSQL 18 container under
-  `-race`, builds/tests/lints every workspace module, records a coverage
-  baseline, and exercises the declared minimum toolchain floor.
+- CI that runs the unit tests and the integration suite against a real
+  PostgreSQL 18 container under `-race`, lints, records a coverage baseline, and
+  (on release tags) smoke-tests that consumers can `go get` the modules.
 
 ### Changed
 

@@ -13,8 +13,7 @@ not committed in advance.
 ## 0. Preconditions
 
 - [ ] All P1 CI gates are green on `main`: unit tests, the integration suite
-      under `-race`, the per-module build+lint matrix, and the toolchain matrix
-      (see `.github/workflows/`).
+      under `-race`, and lint (see `.github/workflows/`).
 - [ ] `CHANGELOG.md` has a `## [1.0.0]` entry with the real date filled in
       (replace the `YYYY-MM-DD` placeholder).
 - [ ] The README "Versioning and compatibility" section is merged.
