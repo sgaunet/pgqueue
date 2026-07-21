@@ -39,6 +39,12 @@
 // is redelivered. See the internal/integration suite (testcontainers-backed)
 // for the canonical redelivery tests.
 //
+// Scope: the fake implements only the three published interfaces (single-message
+// publish/consume/ack). Batch operations (PublishBatch, AckBatch, NackBatch), the
+// message iterators (ChannelMessages, TopicMessages), and the admin/DLQ/replay/
+// stats APIs live on the concrete *Queue only and are not modeled here; code
+// exercising those must be tested against the real Queue.
+//
 //	q := fake.New()
 //	q.CreateChannel(ctx, "orders")
 //	q.Publish(ctx, "orders", []byte(`{"id":1}`))

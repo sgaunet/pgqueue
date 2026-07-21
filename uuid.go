@@ -48,6 +48,13 @@ var uuidV7State struct {
 // strictly increasing even within a single millisecond and even if the system
 // clock moves backwards. The remaining 62 bits are random for global uniqueness.
 //
+// This strict monotonicity is per process. Two processes minting UUIDs in the
+// same millisecond order only by their random bits, so "ORDER BY id" is an exact
+// chronological order within one process and a best-effort one across processes.
+// pgqueue's delivery queries rely on id only as a same-timestamp tiebreak behind
+// a DB-clock column (available_at / visibility_timeout), never as a cross-process
+// total order, so best-effort FIFO across processes is by design.
+//
 // Monotonic-counter trade-off: when the wall clock steps backwards the
 // generator keeps the previous (higher) timestamp pinned and advances only the
 // counter, so freshly minted UUIDs briefly embed a timestamp slightly ahead of

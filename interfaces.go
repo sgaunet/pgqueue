@@ -42,3 +42,10 @@ var (
 	_ ChannelConsumer = (*Queue)(nil)
 	_ TopicConsumer   = (*Queue)(nil)
 )
+
+// Scope note: these interfaces intentionally cover only single-message
+// publish/consume/ack — the common seam for decoupling and faking. Batch
+// operations (PublishBatch, AckBatch, NackBatch), the message iterators
+// (ChannelMessages, TopicMessages), and the admin/DLQ/replay/stats APIs are
+// deliberately not part of any published interface, and fake.Queue does not
+// implement them. Code that needs those should depend on the concrete *Queue.

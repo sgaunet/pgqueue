@@ -107,6 +107,14 @@ hundreds of queues per database; it is not appropriate for per-tenant/per-user
 queues at multi-tenant scale. Use WithMaxQueues to enforce a deliberate cap.
 See ADR-002 in ADR.md.
 
+Queue names are trusted input, not a security boundary. They are validated to
+^[a-zA-Z0-9_-]+$ and become physical table names, but pgqueue does not isolate
+one caller's names from another's: names differing only by dash/underscore
+sanitize to the same table and collide, and a creation-time collision error
+echoes the conflicting queue's original name. Do not derive queue names directly
+from untrusted or per-tenant input — map external identifiers to your own vetted
+queue names instead.
+
 For complete examples, see the examples/ directory.
 */
 package pgqueue
