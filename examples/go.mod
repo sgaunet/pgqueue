@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/sgaunet/pgqueue v0.0.0
+	github.com/sgaunet/pgqueue/pglisten v0.0.0
 )
 
 require (
@@ -17,3 +18,5 @@ require (
 )
 
 replace github.com/sgaunet/pgqueue => ../
+
+replace github.com/sgaunet/pgqueue/pglisten => ../pglisten

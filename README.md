@@ -220,6 +220,8 @@ Complete working examples demonstrating both messaging patterns:
 
 - **[Channel Example](examples/channel/)** - Point-to-point order processing with retry logic
 - **[Pub/Sub Example](examples/pubsub/)** - Fan-out user events to multiple subscribers
+- **[Replay & DLQ Example](examples/replay/)** - Dead-letter a failing message, inspect it, dry-run, then replay it back
+- **[Push Delivery Example](examples/pglisten/)** - Low-latency LISTEN/NOTIFY delivery via the optional pglisten adapter
 
 Both examples include:
 - Setup instructions and prerequisites
