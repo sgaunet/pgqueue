@@ -979,7 +979,7 @@ func (gc *GarbageCollector) resetTimedOutEntries(
 	queue queueMetadata,
 ) (int64, error) {
 	if queue.QueueType == QueueTypeChannel {
-		n, err := gc.resetTimedOutMessages(ctx, queue.TableName)
+		n, err := gc.resetTimedOutMessages(ctx, queue.TableName, gc.pq.cfg.defaultMaxRetries)
 		if err != nil {
 			return n, fmt.Errorf("failed to reset timed-out messages: %w", err)
 		}
@@ -987,7 +987,7 @@ func (gc *GarbageCollector) resetTimedOutEntries(
 	}
 
 	if queue.QueueType == QueueTypePubSub {
-		n, err := gc.resetTimedOutSubscriptions(ctx, queue.TableName)
+		n, err := gc.resetTimedOutSubscriptions(ctx, queue.TableName, gc.pq.resolveMaxRetries(&queue))
 		if err != nil {
 			return n, fmt.Errorf(
 				"failed to reset timed-out subscriptions: %w", err,
@@ -1188,6 +1188,7 @@ func (gc *GarbageCollector) purgeDLQMessages(
 func (gc *GarbageCollector) resetTimedOutMessages(
 	ctx context.Context,
 	tableName string,
+	defaultMax int,
 ) (int64, error) {
 	msgTbl := gc.pq.msgTable(tableName)
 	// The table name comes from a queueNameRegex-validated queue name, so this
@@ -1202,6 +1203,13 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 	// page never re-sees it — the same paging invariant runPagedPurge relies on
 	// (and it propagates a RowsAffected error rather than silently reporting
 	// nothing reclaimed, #67).
+	//
+	// The retry_count < COALESCE(max_retries, $1) guard is the exact complement
+	// of promoteExhaustedChannelMessages' exhaustion test, so a row that has
+	// already exhausted its retries is never reset back to pending — which would
+	// deliver it once beyond the maxRetries+1 ceiling — but left for the
+	// DLQ-promotion pass. This makes the outcome independent of the promote/reset
+	// ordering across their separate transactions.
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -1213,13 +1221,14 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 			WHERE status = '%s'
 			  AND visibility_timeout IS NOT NULL
 			  AND visibility_timeout < NOW()
+			  AND retry_count < COALESCE(max_retries, $1)
 			ORDER BY visibility_timeout, id
 			LIMIT %d
 			FOR UPDATE SKIP LOCKED
 		)
 	`, msgTbl, MessageStatusPending, msgTbl, MessageStatusProcessing, retentionPurgePageSize)
 
-	total, err := gc.runPagedPurge(ctx, query)
+	total, err := gc.runPagedPurge(ctx, query, defaultMax)
 	if err != nil {
 		return total, fmt.Errorf("failed to reset timed-out messages: %w", err)
 	}
@@ -1239,6 +1248,7 @@ func (gc *GarbageCollector) resetTimedOutMessages(
 func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	ctx context.Context,
 	tableName string,
+	maxRetries int,
 ) (int64, error) {
 	subTbl := gc.pq.subTable(tableName)
 	// The table name comes from a queueNameRegex-validated queue name, so this
@@ -1247,7 +1257,11 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 	// retentionPurgePageSize rows via ORDER BY id LIMIT + FOR UPDATE SKIP LOCKED,
 	// bounding the lock window on a huge backlog. A reset row flips to 'pending'
 	// so a fresh page never re-sees it, and runPagedPurge propagates a
-	// RowsAffected error rather than silently under-reporting (#67).
+	// RowsAffected error rather than silently under-reporting (#67). The
+	// retry_count < $1 guard mirrors resetTimedOutMessages: an exhausted
+	// subscription is left for promoteExhaustedTopicSubscriptions, never reset
+	// back to pending (which would deliver it once beyond the maxRetries+1
+	// ceiling), regardless of the promote/reset ordering.
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET status = '%s',
@@ -1259,13 +1273,14 @@ func (gc *GarbageCollector) resetTimedOutSubscriptions(
 			WHERE status = '%s'
 			  AND visibility_timeout IS NOT NULL
 			  AND visibility_timeout < NOW()
+			  AND retry_count < $1
 			ORDER BY id
 			LIMIT %d
 			FOR UPDATE SKIP LOCKED
 		)
 	`, subTbl, MessageStatusPending, subTbl, MessageStatusProcessing, retentionPurgePageSize)
 
-	total, err := gc.runPagedPurge(ctx, query)
+	total, err := gc.runPagedPurge(ctx, query, maxRetries)
 	if err != nil {
 		return total, fmt.Errorf(
 			"failed to reset timed-out subscriptions: %w", err,
