@@ -78,6 +78,24 @@ func (l *blockingListener) Notifications() <-chan string {
 }
 func (l *blockingListener) Close() error { return nil }
 
+// panickingListener models a misbehaving third-party Listener whose Listen and
+// Unlisten panic. It also implements Unlistener so forget exercises the
+// Unlisten boundary. Used to prove the notifier contains panics from these
+// caller-supplied extension points instead of letting them crash the process.
+type panickingListener struct {
+	ch chan string
+}
+
+func (l *panickingListener) Listen(context.Context, string) error   { panic("listen boom") }
+func (l *panickingListener) Unlisten(context.Context, string) error { panic("unlisten boom") }
+func (l *panickingListener) Close() error                           { return nil }
+func (l *panickingListener) Notifications() <-chan string {
+	if l.ch == nil {
+		l.ch = make(chan string)
+	}
+	return l.ch
+}
+
 // registerWaker installs a fresh waker for channel and returns it, mirroring what
 // wakeChan does under the lock. Tests that drive confirmListen directly pass the
 // returned waker as the "captured" waker so the staleness guard treats the call
@@ -362,6 +380,86 @@ func TestConfirmListenStaleFailureDoesNotCorruptCounter(t *testing.T) {
 	}
 	if missed != 0 {
 		t.Errorf("stale failure fired onMissedNotification %d times, want 0", missed)
+	}
+}
+
+// TestConfirmListenRecoversListenPanic proves a panic inside a caller-supplied
+// Listener.Listen is contained rather than crashing the host process, and that
+// a panicking Listen is treated exactly like a failed Listen: the per-channel
+// failure counter is bumped, onMissedNotification fires, the channel is not
+// marked listening, and the panic is logged at ERROR with a stack.
+func TestConfirmListenRecoversListenPanic(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	n := newNotifier(&panickingListener{}, logger)
+	if n == nil {
+		t.Fatal("newNotifier returned nil")
+	}
+	var missed int
+	n.onMissedNotification = func(context.Context, string) { missed++ }
+
+	const channel = "pgqueue_msg_panic"
+	w := registerWaker(n, channel)
+
+	// Must return normally; if the panic were not recovered this goroutine (the
+	// test) would crash.
+	n.confirmListen(channel, w)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if got := n.listenFailures[channel]; got != 1 {
+		t.Errorf("listenFailures = %d, want 1 (a panicking Listen must count as a failure)", got)
+	}
+	if n.listening[channel] {
+		t.Error("listening was set true after a panicking Listen")
+	}
+	if missed != 1 {
+		t.Errorf("onMissedNotification fired %d times, want 1", missed)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "listener call panicked") {
+		t.Errorf("panic was not logged at ERROR with the expected message: %q", out)
+	}
+}
+
+// TestForgetRecoversUnlistenPanic proves a panic inside a caller-supplied
+// Unlistener.Unlisten is contained: forget still returns and clears the
+// per-channel bookkeeping, and the panic is logged, rather than propagating up
+// the delete-queue call chain and crashing the process.
+func TestForgetRecoversUnlistenPanic(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	n := newNotifier(&panickingListener{}, logger)
+	if n == nil {
+		t.Fatal("newNotifier returned nil")
+	}
+
+	const channel = "pgqueue_msg_forget_panic"
+	registerWaker(n, channel)
+	n.mu.Lock()
+	n.listening[channel] = true
+	n.listenInFlight[channel] = true
+	n.listenFailures[channel] = 2
+	n.mu.Unlock()
+
+	// Must return normally despite Unlisten panicking.
+	n.forget(context.Background(), channel)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if _, ok := n.wakers[channel]; ok {
+		t.Error("forget did not drop the waker after a panicking Unlisten")
+	}
+	if n.listening[channel] || n.listenInFlight[channel] {
+		t.Error("forget did not clear listen bookkeeping after a panicking Unlisten")
+	}
+	if _, ok := n.listenFailures[channel]; ok {
+		t.Error("forget did not clear listenFailures after a panicking Unlisten")
+	}
+	if !strings.Contains(buf.String(), "listener call panicked") {
+		t.Errorf("Unlisten panic was not logged: %q", buf.String())
 	}
 }
 

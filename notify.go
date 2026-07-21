@@ -12,6 +12,7 @@ package pgqueue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -256,7 +257,9 @@ func (n *notifier) wakeChan(_ context.Context, notifyChannel string) <-chan stru
 // under the same name), the staleness guard below detects that this confirmation
 // no longer owns the channel's bookkeeping and returns without mutating it.
 func (n *notifier) confirmListen(notifyChannel string, capturedWaker *waker) {
-	err := n.listener.Listen(n.ctx, notifyChannel)
+	err := n.safeListenerCall("Listen", notifyChannel, func() error {
+		return n.listener.Listen(n.ctx, notifyChannel)
+	})
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -335,8 +338,37 @@ func (n *notifier) forget(ctx context.Context, notifyChannel string) {
 		return
 	}
 	if u, ok := listener.(Unlistener); ok {
-		_ = u.Unlisten(ctx, notifyChannel)
+		_ = n.safeListenerCall("Unlisten", notifyChannel, func() error {
+			return u.Unlisten(ctx, notifyChannel)
+		})
 	}
+}
+
+// errListenerPanic wraps a value recovered from a panicking caller-supplied
+// Listener/Unlistener call.
+var errListenerPanic = errors.New("listener panicked")
+
+// safeListenerCall invokes a method on the caller-supplied Listener/Unlistener,
+// converting a panic into an error so a misbehaving third-party implementation
+// cannot crash the host process. Mirrors the pump recover precedent (#69). The
+// returned error lets confirmListen route a panicking Listen through its normal
+// failure path; forget discards it (best-effort).
+func (n *notifier) safeListenerCall(op, channel string, fn func() error) (err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		err = fmt.Errorf("%w: %s: %v", errListenerPanic, op, r)
+		if n.logger != nil {
+			n.logger.Error("pgqueue: listener call panicked",
+				"op", op,
+				"channel", channel,
+				"panic", r,
+				"stack", string(debug.Stack()))
+		}
+	}()
+	return fn()
 }
 
 // pump fans the Listener's notification stream out to the per-channel wakers.

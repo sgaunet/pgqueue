@@ -1,10 +1,12 @@
 package pgqueue
 
 import (
+	"bytes"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,52 @@ func mustNewGC(t *testing.T, config GarbageCollectorConfig) *GarbageCollector {
 		t.Fatalf("NewGarbageCollector(%+v): unexpected error %v", config, err)
 	}
 	return gc
+}
+
+// TestGCRecoverPanicWrapsAndLogs verifies the GC background-goroutine panic
+// guard (the safety fix for the unrecovered-panic-crashes-the-process gap): a
+// nil recover() value yields no error and logs nothing, and a real panic value
+// is logged at ERROR and returned as an error wrapping errGCPanic, without
+// re-panicking. This is the unit half of the "a panic in run/collectQueue must
+// not crash the host process" contract; the wiring into run and the per-queue
+// workers is covered by build + review.
+func TestGCRecoverPanicWrapsAndLogs(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError}))
+	gc := &GarbageCollector{pq: &Queue{logger: logger}}
+
+	if err := gc.recoverPanic(nil, "run"); err != nil {
+		t.Errorf("recoverPanic(nil) = %v, want nil", err)
+	}
+	if got := buf.Len(); got != 0 {
+		t.Errorf("recoverPanic(nil) logged %d bytes, want 0", got)
+	}
+
+	err := gc.recoverPanic("boom", "collectQueue[orders]")
+	if err == nil {
+		t.Fatal("recoverPanic(non-nil) = nil, want error")
+	}
+	if !errors.Is(err, errGCPanic) {
+		t.Errorf("recoverPanic error %v does not wrap errGCPanic", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=ERROR") ||
+		!strings.Contains(out, "recovered panic in garbage collector") {
+		t.Errorf("panic was not logged at ERROR with the expected message: %q", out)
+	}
+	if !strings.Contains(out, "collectQueue[orders]") {
+		t.Errorf("log did not include the where context: %q", out)
+	}
+}
+
+// TestGCRecoverPanicNilLoggerDoesNotPanic ensures the guard is safe when the
+// Queue has no logger configured (the common default): it still returns the
+// wrapped error and does not itself panic.
+func TestGCRecoverPanicNilLoggerDoesNotPanic(t *testing.T) {
+	gc := &GarbageCollector{pq: &Queue{}}
+	if err := gc.recoverPanic("boom", "run"); err == nil || !errors.Is(err, errGCPanic) {
+		t.Errorf("recoverPanic with nil logger = %v, want error wrapping errGCPanic", err)
+	}
 }
 
 func TestNewGarbageCollectorDefaultsEmptyPolicy(t *testing.T) {

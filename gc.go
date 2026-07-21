@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -303,23 +304,7 @@ func (gc *GarbageCollector) dispatchCollect(
 			wg.Add(1)
 			go func(q queueMetadata) {
 				defer wg.Done()
-				defer func() { <-sem }()
-
-				start := time.Now()
-				if err := gc.collectQueue(ctx, q); err != nil {
-					gc.pq.logError("failed to collect queue",
-						"queue", q.QueueName, "error", err,
-						"duration", time.Since(start),
-					)
-					recordErr(q.QueueName, err)
-					if isPoolDead(err) {
-						cancelDispatch()
-					}
-				} else if d := time.Since(start); d > gcSlowCollectThreshold {
-					gc.pq.logInfo("collected queue",
-						"queue", q.QueueName, "duration", d,
-					)
-				}
+				gc.collectQueueWorker(ctx, q, sem, recordErr, cancelDispatch)
 			}(queue)
 		}
 	}
@@ -335,6 +320,43 @@ func (gc *GarbageCollector) dispatchCollect(
 			fmt.Errorf("garbage collection cancelled: %w", outerErr))
 	}
 	return errs
+}
+
+// collectQueueWorker runs one queue's collection inside a dispatchCollect worker
+// goroutine. It recovers panics so a bug in collection cannot crash the host
+// process (the recovered panic is surfaced through recordErr like any other
+// per-queue error), releases its semaphore slot on return, and short-circuits
+// the dispatch loop via cancelDispatch when it detects a dead pool. The caller
+// owns wg.Done.
+func (gc *GarbageCollector) collectQueueWorker(
+	ctx context.Context,
+	q queueMetadata,
+	sem <-chan struct{},
+	recordErr func(string, error),
+	cancelDispatch context.CancelFunc,
+) {
+	defer func() { <-sem }()
+	defer func() {
+		if err := gc.recoverPanic(recover(), "collectQueue["+q.QueueName+"]"); err != nil {
+			recordErr(q.QueueName, err)
+		}
+	}()
+
+	start := time.Now()
+	if err := gc.collectQueue(ctx, q); err != nil {
+		gc.pq.logError("failed to collect queue",
+			"queue", q.QueueName, "error", err,
+			"duration", time.Since(start),
+		)
+		recordErr(q.QueueName, err)
+		if isPoolDead(err) {
+			cancelDispatch()
+		}
+	} else if d := time.Since(start); d > gcSlowCollectThreshold {
+		gc.pq.logInfo("collected queue",
+			"queue", q.QueueName, "duration", d,
+		)
+	}
 }
 
 // isPoolDead reports whether err signals an unrecoverable connection-pool
@@ -359,8 +381,29 @@ func appendCappedErr(errs []error, queueName string, qerr error) []error {
 	}
 }
 
+// errGCPanic wraps a value recovered from a panicking GC background goroutine.
+var errGCPanic = errors.New("garbage collector panic")
+
+// recoverPanic turns a value recovered from a GC background goroutine into a
+// logged error so a bug in an unattended maintenance task cannot crash the host
+// process, mirroring the callHandler/safeHook/pump precedent. Pass the result of
+// recover(); it returns nil when there was no panic, otherwise an error wrapping
+// errGCPanic.
+func (gc *GarbageCollector) recoverPanic(r any, where string) error {
+	if r == nil {
+		return nil
+	}
+	gc.pq.logError("recovered panic in garbage collector",
+		"where", where,
+		"panic", r,
+		"stack", string(debug.Stack()),
+	)
+	return fmt.Errorf("%w: %s: %v", errGCPanic, where, r)
+}
+
 func (gc *GarbageCollector) run(ctx context.Context) {
 	defer gc.wg.Done()
+	defer func() { _ = gc.recoverPanic(recover(), "run") }()
 
 	// Derive a context that is also cancelled when Stop closes stopChan, and
 	// run Collect under it. Without this, Stop (and Queue.Close, which joins
