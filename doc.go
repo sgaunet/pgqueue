@@ -79,8 +79,8 @@ underlying DB handle can be safely closed.
 Pub/Sub subscribe-before-publish ordering: messages are fanned out to the
 set of active subscribers recorded at publish time. A subscriber registered
 after a message is published does not receive that message. For guaranteed
-delivery, Subscribe (or its underlying RegisterSubscriber commit) must
-complete and become visible before the first Publish or PublishBatch call.
+delivery, the Subscribe call must complete and become visible before the
+first Publish or PublishBatch call.
 Concurrent registration and publish are a race under READ COMMITTED: whether
 the newly registered subscriber is included in the fan-out depends on
 transaction commit order. This same race applies to PublishBatch: the batch
