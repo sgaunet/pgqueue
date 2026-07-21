@@ -197,26 +197,37 @@ func (gc *GarbageCollector) Stop() {
 }
 
 // PurgeQueue immediately and irreversibly deletes every message from a queue,
-// leaving the queue and its tables in place.
+// leaving the queue and its tables in place. It forwards to Queue.PurgeQueue —
+// prefer that method directly, since purging needs no GarbageCollector.
 func (gc *GarbageCollector) PurgeQueue(
 	ctx context.Context,
 	queueName string,
 	queueType QueueType,
 ) error {
-	// Get queue metadata
-	metadata, err := gc.pq.getQueueMetadata(
-		ctx, string(queueType), queueName,
-	)
+	return gc.pq.PurgeQueue(ctx, queueName, queueType)
+}
+
+// PurgeQueue immediately and irreversibly deletes every message (and, for a
+// pub/sub topic, every subscription and DLQ row) from a queue, leaving the queue
+// and its tables in place. It is a destructive operation with no confirmation
+// flag — gate it at the call site. Returns ErrQueueNotFound if the named queue
+// does not exist.
+func (pq *Queue) PurgeQueue(
+	ctx context.Context,
+	queueName string,
+	queueType QueueType,
+) error {
+	if err := pq.checkClosed(); err != nil {
+		return err
+	}
+	metadata, err := pq.getQueueMetadata(ctx, string(queueType), queueName)
 	if errors.Is(err, ErrQueueNotFound) {
-		return fmt.Errorf(
-			"%s/%s: %w", queueType, queueName, ErrQueueNotFound,
-		)
+		return fmt.Errorf("%s/%s: %w", queueType, queueName, ErrQueueNotFound)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get queue metadata: %w", err)
 	}
-
-	return gc.executePurge(ctx, metadata.TableName, queueType)
+	return pq.executePurge(ctx, metadata.TableName, queueType)
 }
 
 // maxAccumulatedCollectErrs caps the per-queue errors recorded by a single
@@ -477,29 +488,29 @@ func (gc *GarbageCollector) collectOnce(ctx context.Context) {
 	}
 }
 
-func (gc *GarbageCollector) executePurge(
+func (pq *Queue) executePurge(
 	ctx context.Context,
 	tableName string,
 	queueType QueueType,
 ) error {
-	return gc.pq.withTx(ctx, func(tx *sql.Tx) error {
+	return pq.withTx(ctx, func(tx *sql.Tx) error {
 		// For pub/sub, delete subscriptions first (before messages, to avoid FK issues
 		// if CASCADE is not relied upon). For channels, this table does not exist.
 		if queueType == QueueTypePubSub {
-			deleteSub := "DELETE FROM " + gc.pq.subTable(tableName) //nolint:gosec // G201: table name validated
+			deleteSub := "DELETE FROM " + pq.subTable(tableName) //nolint:gosec // G201: table name validated
 			if _, err := tx.ExecContext(ctx, deleteSub); err != nil {
 				return fmt.Errorf("failed to delete subscriptions: %w", err)
 			}
 		}
 
 		// Delete all messages
-		deleteMsg := "DELETE FROM " + gc.pq.msgTable(tableName) //nolint:gosec // G201: table name validated
+		deleteMsg := "DELETE FROM " + pq.msgTable(tableName) //nolint:gosec // G201: table name validated
 		if _, err := tx.ExecContext(ctx, deleteMsg); err != nil {
 			return fmt.Errorf("failed to delete messages: %w", err)
 		}
 
 		// Delete all DLQ messages
-		deleteDLQ := "DELETE FROM " + gc.pq.dlqTable(tableName) //nolint:gosec // G201: table name validated
+		deleteDLQ := "DELETE FROM " + pq.dlqTable(tableName) //nolint:gosec // G201: table name validated
 		if _, err := tx.ExecContext(ctx, deleteDLQ); err != nil {
 			return fmt.Errorf("failed to delete DLQ messages: %w", err)
 		}
@@ -1046,13 +1057,19 @@ func (gc *GarbageCollector) purgeCompletedMessages(
 			gc.pq.subTable(tableName), MessageStatusAcked,
 			gc.pq.dlqTable(tableName), retentionPurgePageSize)
 	} else {
+		// ORDER BY processed_at (the idx_..._completed partial index's leading
+		// key) keeps this purge pinned to that index instead of degrading to a
+		// primary-key walk that filters out live rows when the completed set is
+		// not id-correlated (C2 defense-in-depth). Deleting the selected rows
+		// means a fresh page never re-sees them, so the ordering only affects
+		// which page comes first, never correctness or loop termination.
 		query = fmt.Sprintf(`
 			DELETE FROM %s
 			WHERE id IN (
 				SELECT id FROM %s
 				WHERE status = '%s'
 				AND processed_at < NOW() - make_interval(secs => $1)
-				ORDER BY id
+				ORDER BY processed_at, id
 				LIMIT %d
 				FOR UPDATE SKIP LOCKED
 			)

@@ -26,6 +26,30 @@ func TestReplayNotFoundWrapsMessageNotFound(t *testing.T) {
 	}
 }
 
+// TestChannelAndTopicNotFoundWrapQueueNotFound pins the symmetric not-found
+// taxonomy: ErrChannelNotFound and ErrTopicNotFound both wrap ErrQueueNotFound
+// (so errors.Is(err, ErrQueueNotFound) matches either), stay distinct from each
+// other, and keep matching through the "%s: %w" wrapping their call sites apply.
+func TestChannelAndTopicNotFoundWrapQueueNotFound(t *testing.T) {
+	if !errors.Is(pgqueue.ErrChannelNotFound, pgqueue.ErrQueueNotFound) {
+		t.Error("errors.Is(ErrChannelNotFound, ErrQueueNotFound) should be true")
+	}
+	if !errors.Is(pgqueue.ErrTopicNotFound, pgqueue.ErrQueueNotFound) {
+		t.Error("errors.Is(ErrTopicNotFound, ErrQueueNotFound) should be true")
+	}
+	if errors.Is(pgqueue.ErrChannelNotFound, pgqueue.ErrTopicNotFound) ||
+		errors.Is(pgqueue.ErrTopicNotFound, pgqueue.ErrChannelNotFound) {
+		t.Error("ErrChannelNotFound and ErrTopicNotFound must be distinct sentinels")
+	}
+	wrapped := fmt.Errorf("orders: %w", pgqueue.ErrChannelNotFound)
+	if !errors.Is(wrapped, pgqueue.ErrQueueNotFound) {
+		t.Error("a wrapped ErrChannelNotFound should still match ErrQueueNotFound")
+	}
+	if !errors.Is(wrapped, pgqueue.ErrChannelNotFound) {
+		t.Error("a wrapped ErrChannelNotFound should still match ErrChannelNotFound")
+	}
+}
+
 // TestClaimClassificationSentinelsAreDistinct is a regression test for issue
 // #129: ErrMessageNotFound, ErrMessageAlreadyAcked, and ErrClaimExpired are
 // the three outcomes of classifyClaimState (queries.go) and must never match

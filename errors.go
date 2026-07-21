@@ -46,6 +46,12 @@ var (
 	// distinguishes the topic-specific path.
 	ErrTopicNotFound = fmt.Errorf("topic %w", ErrQueueNotFound)
 
+	// ErrChannelNotFound is returned when a channel cannot be found. Like
+	// ErrTopicNotFound it wraps ErrQueueNotFound, so errors.Is(err,
+	// ErrQueueNotFound) also matches a missing channel while this sentinel
+	// distinguishes the channel-specific path.
+	ErrChannelNotFound = fmt.Errorf("channel %w", ErrQueueNotFound)
+
 	// ErrDuplicateMessageID is returned when publishing a message with an ID that already exists.
 	ErrDuplicateMessageID = errors.New("duplicate message ID")
 

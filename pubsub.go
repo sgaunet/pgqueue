@@ -42,6 +42,55 @@ func (pq *Queue) Subscribe(
 	return nil
 }
 
+// ListSubscribers returns the IDs of every active subscriber currently
+// registered on a topic, ordered by registration time. It returns
+// ErrTopicNotFound if the topic does not exist; unsubscribed (inactive)
+// subscribers are excluded.
+func (pq *Queue) ListSubscribers(
+	ctx context.Context,
+	topicName string,
+) ([]string, error) {
+	if err := pq.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	// Verify topic exists so a missing topic is distinguishable from one that
+	// simply has no subscribers.
+	if _, err := pq.getQueueMetadata(ctx, string(QueueTypePubSub), topicName); err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			return nil, fmt.Errorf("%s: %w", topicName, ErrTopicNotFound)
+		}
+		return nil, fmt.Errorf("failed to get topic metadata: %w", err)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT subscriber_id
+		FROM %s
+		WHERE topic_name = $1 AND active = TRUE
+		ORDER BY created_at, subscriber_id
+	`, pq.globalTable("pgqueue_subscribers"))
+
+	rows, err := pq.db.QueryContext(ctx, query, topicName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query subscribers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	subscribers := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan subscriber ID: %w", err)
+		}
+		subscribers = append(subscribers, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating subscribers: %w", err)
+	}
+
+	return subscribers, nil
+}
+
 // Unsubscribe removes a subscriber from a topic.
 func (pq *Queue) Unsubscribe(
 	ctx context.Context,

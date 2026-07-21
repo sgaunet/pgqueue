@@ -185,7 +185,7 @@ func (pq *Queue) ackChannelBatch(
 	)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return BatchResult{}, fmt.Errorf("channel/%s: %w", channelName, ErrQueueNotFound)
+			return BatchResult{}, fmt.Errorf("%s: %w", channelName, ErrChannelNotFound)
 		}
 		return BatchResult{}, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
@@ -416,7 +416,7 @@ func (pq *Queue) nackChannelBatch(
 	)
 	if err != nil {
 		if errors.Is(err, ErrQueueNotFound) {
-			return BatchResult{}, fmt.Errorf("channel/%s: %w", channelName, ErrQueueNotFound)
+			return BatchResult{}, fmt.Errorf("%s: %w", channelName, ErrChannelNotFound)
 		}
 		return BatchResult{}, fmt.Errorf("failed to get channel metadata: %w", err)
 	}
