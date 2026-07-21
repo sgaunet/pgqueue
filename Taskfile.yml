@@ -22,6 +22,9 @@ tasks:
     desc: "Run integration tests (separate module, requires Docker)"
     dir: internal/integration
     cmds:
-      - go test ./... -v -count=2 -race
+      # Explicit -timeout: the default `go test` timeout is 10m, and the suite
+      # (-count=2 -race, testcontainers) runs longer than that on a loaded CI
+      # runner, so without this it is killed mid-run with "panic: test timed out".
+      - go test ./... -v -count=2 -race -timeout 20m
 
     

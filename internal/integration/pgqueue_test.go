@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,13 +32,31 @@ const (
 	testDefaultMaxRetries = 3
 )
 
-// setupTestContainer starts a PostgreSQL 18 container and returns a raw DB handle.
-// This is the single source of truth for test container configuration.
-func setupTestContainer(t *testing.T) (*sql.DB, func()) {
-	t.Helper()
+// Shared PostgreSQL server for the whole package. Started once in TestMain and
+// reused by every test through setupTestContainer/setupTestDB: each test is given
+// a freshly-created *database* on this one server rather than its own container.
+// Container startup dominates the suite's runtime, so this collapses ~175 per-test
+// container starts (×2 under -count=2) down to a single one.
+//
+// Tests that genuinely need a dedicated container — a different image
+// (error_scenarios_test.go, PG 16), a privileged postmaster flag
+// (index_repair_test.go, allow_system_table_mods), or a raw DSN to break/inspect
+// the connection (faultinject_test.go, notify_test.go, libpq_test.go) — still call
+// postgres.Run directly and are unaffected by this sharing.
+var (
+	sharedHost  string
+	sharedPort  string
+	sharedAdmin *sql.DB // connected to testDBName; issues CREATE/DROP DATABASE for each test
+	dbCounter   atomic.Int64
+)
+
+// TestMain starts the shared PostgreSQL 18 container, runs the suite, then tears
+// it down. Any startup failure aborts the whole package since no test can run
+// without the shared server.
+func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	postgresContainer, err := postgres.Run(ctx,
+	container, err := postgres.Run(ctx,
 		"postgres:18-alpine",
 		postgres.WithDatabase(testDBName),
 		postgres.WithUsername(testUser),
@@ -46,23 +66,73 @@ func setupTestContainer(t *testing.T) (*sql.DB, func()) {
 				WithOccurrence(testWaitLogOccurrence).
 				WithStartupTimeout(testStartupTimeout)))
 	if err != nil {
-		t.Fatalf("failed to start postgres container: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to start shared postgres container: %v\n", err)
+		os.Exit(1)
 	}
 
-	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable")
+	host, err := container.Host(ctx)
 	if err != nil {
-		t.Fatalf("failed to get connection string: %v", err)
+		fmt.Fprintf(os.Stderr, "failed to get container host: %v\n", err)
+		os.Exit(1)
+	}
+	port, err := container.MappedPort(ctx, "5432/tcp")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get mapped port: %v\n", err)
+		os.Exit(1)
+	}
+	sharedHost = host
+	sharedPort = port.Port()
+
+	sharedAdmin, err = sql.Open("pgx", sharedDSN(testDBName))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open admin connection: %v\n", err)
+		os.Exit(1)
 	}
 
-	db, err := sql.Open("pgx", connStr)
+	code := m.Run()
+
+	_ = sharedAdmin.Close()
+	_ = container.Terminate(ctx)
+
+	os.Exit(code)
+}
+
+// sharedDSN builds a pgx DSN for the named database on the shared server.
+func sharedDSN(dbName string) string {
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		testUser, testPass, sharedHost, sharedPort, dbName)
+}
+
+// setupTestContainer provisions an isolated PostgreSQL database on the shared
+// server and returns a handle to it plus a cleanup. Each test gets its own
+// freshly-created database so the public schema starts empty, preserving the
+// clean-slate assumptions tests rely on (e.g. asserting a single channel exists,
+// or counting global tables). This is the single source of truth for per-test
+// database provisioning.
+func setupTestContainer(t *testing.T) (*sql.DB, func()) {
+	t.Helper()
+	ctx := context.Background()
+
+	dbName := fmt.Sprintf("test_%d", dbCounter.Add(1))
+	// dbName is a controlled identifier (test_<int>), so interpolation is safe;
+	// CREATE/DROP DATABASE cannot be parameterized and must run outside a txn.
+	if _, err := sharedAdmin.ExecContext(ctx, "CREATE DATABASE "+dbName); err != nil {
+		t.Fatalf("failed to create test database %s: %v", dbName, err)
+	}
+
+	db, err := sql.Open("pgx", sharedDSN(dbName))
 	if err != nil {
-		t.Fatalf("failed to connect to database: %v", err)
+		t.Fatalf("failed to connect to test database %s: %v", dbName, err)
 	}
 
 	cleanup := func() {
 		_ = db.Close()
-		if err := postgresContainer.Terminate(ctx); err != nil {
-			t.Logf("failed to terminate container: %v", err)
+		// DROP must run from the admin connection (you cannot drop the database
+		// you are connected to). WITH (FORCE) evicts any backend that outlived
+		// db.Close() so the drop never blocks (PostgreSQL 13+).
+		if _, err := sharedAdmin.ExecContext(ctx,
+			"DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)"); err != nil {
+			t.Logf("failed to drop test database %s: %v", dbName, err)
 		}
 	}
 

@@ -19,6 +19,9 @@ jobs:
   # revert. That demonstrates a covered-path regression actually fails CI.
   test-integration:
     runs-on: ubuntu-latest
+    # Fail fast on a genuine hang. The binding limit is the `go test -timeout`
+    # inside the Taskfile (20m); this job guard is the outer backstop.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
 
@@ -34,6 +37,7 @@ jobs:
   # the profile is uploaded as an artifact and compared by eye, not hard-gated.
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -44,7 +48,7 @@ jobs:
       - name: integration coverage
         working-directory: internal/integration
         run: >-
-          go test ./... -race
+          go test ./... -race -timeout 20m
           -coverpkg=github.com/sgaunet/pgqueue/...
           -coverprofile=${{ github.workspace }}/coverage.out
       - name: coverage summary
