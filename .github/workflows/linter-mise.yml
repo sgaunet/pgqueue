@@ -1,0 +1,22 @@
+name: linter-mise
+on:
+  push:
+    # Optionally ignore documentation changes
+    # paths-ignore:
+    #   - '**.md'
+    #   - 'docs/**'
+  # Run on pull requests targeting main so PRs (incl. from forks) get lint signal
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true # [default: true] run `mise install`
+          cache: true # [default: true] cache mise using GitHub's cache
+      - run: mise run lint

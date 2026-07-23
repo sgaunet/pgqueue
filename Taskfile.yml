@@ -1,0 +1,30 @@
+# https://taskfile.dev
+version: '3'
+
+tasks:
+  default:
+    desc: "List all tasks"
+    cmds:
+      - task -a
+
+  lint:
+    desc: "Run linter"
+    cmds:
+      - go generate ./...
+      - golangci-lint run
+
+  tests:
+    desc: "Run unit tests (root module, no Docker required)"
+    cmds:
+      - go test ./... -v -count=2 -race
+
+  tests-integration:
+    desc: "Run integration tests (separate module, requires Docker)"
+    dir: internal/integration
+    cmds:
+      # Explicit -timeout: the default `go test` timeout is 10m, and the suite
+      # (-count=2 -race, testcontainers) runs longer than that on a loaded CI
+      # runner, so without this it is killed mid-run with "panic: test timed out".
+      - go test ./... -v -count=2 -race -timeout 20m
+
+    

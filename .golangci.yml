@@ -1,0 +1,28 @@
+---
+version: "2"
+# Configure which files to skip during linting
+run:
+  tests: false
+
+linters:
+  default: all
+
+  disable:
+    - wsl
+    - wsl_v5
+    - nlreturn
+    - depguard
+    - gochecknoinits
+    - gochecknoglobals
+    - forbidigo
+    - varnamelen
+    - exhaustruct
+    - tagliatelle
+    - noinlineerr
+
+  settings:
+    gomoddirectives:
+      # The optional adapter modules (pglisten/otel/prom), examples, and the
+      # integration suite use local `replace github.com/sgaunet/pgqueue => ..`
+      # directives so each module builds standalone in CI. These are by design.
+      replace-local: true

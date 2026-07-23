@@ -1,0 +1,44 @@
+# GoReleaser configuration — STUB (issue #102).
+#
+# pgqueue currently ships as a Go module/library with no binary: consumers
+# `go get github.com/sgaunet/pgqueue` and releases are plain git tags. There is
+# no `main` package to compile, so binary builds are intentionally disabled.
+#
+# This config exists so releases stay reproducible if administrative CLI tooling
+# (e.g. DLQ replay, schema check) is added later. To start releasing a binary,
+# replace the `builds` entry below with a real build for the new main package.
+#
+# Validate locally with: goreleaser check
+version: 2
+
+# No binaries to build for a library; skip the build step entirely.
+builds:
+  - skip: true
+
+# Ship a reproducible source archive of the tagged commit.
+source:
+  enabled: true
+
+# Checksums for the produced source archive.
+checksum:
+  name_template: "checksums.txt"
+
+# Build the release notes from conventional commits.
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999

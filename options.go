@@ -1,0 +1,233 @@
+package pgqueue
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// QueueOption is a per-queue creation option applied when calling CreateChannel
+// or CreateTopic.
+type QueueOption func(*queueCreateOpts)
+
+// queueCreateOpts holds the resolved per-queue creation options.
+type queueCreateOpts struct {
+	maxMessageSize  int
+	maxMetadataSize int
+	ttl             time.Duration
+	ttlSet          bool // true when WithQueueTTL was supplied
+	maxRetries      int
+	maxRetriesSet   bool // true when WithQueueMaxRetries was supplied
+}
+
+// WithQueueMaxRetries overrides the default maximum retry count for a specific
+// channel or topic.
+//
+// An explicit zero is honored: WithQueueMaxRetries(0) dead-letters a message on
+// its first failed delivery instead of retrying it. A negative value makes
+// CreateChannel/CreateTopic return ErrInvalidConfig.
+func WithQueueMaxRetries(n int) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.maxRetries = n
+		o.maxRetriesSet = true
+	}
+}
+
+// WithQueueTTL overrides the default message TTL for a specific channel or topic.
+// Zero means no expiry.
+//
+// TTL only hides expired messages from consumers; it does not delete them. Use a
+// GarbageCollector RetentionPolicy (MaxPendingAge) to reclaim their storage.
+//
+// A finite TTL must comfortably exceed the worst-case backoff horizon a message
+// can accumulate across its retries (BaseDelay * Multiplier^MaxRetries, capped
+// at MaxDelay — see BackoffPolicy). Otherwise a message that keeps failing can
+// have its available_at pushed past created_at+TTL by repeated backoff before
+// it exhausts its retries: the consume queries' TTL cutoff then excludes it from
+// every future delivery, but the garbage collector only dead-letters on
+// retry-count exhaustion, not on TTL, so the message is neither redelivered nor
+// dead-lettered — it is silently stranded. WithQueueTTL(0) (no expiry) avoids
+// this entirely.
+func WithQueueTTL(d time.Duration) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.ttl = d
+		o.ttlSet = true
+	}
+}
+
+// WithQueueMaxMessageSize overrides the maximum payload size for a specific
+// channel or topic.
+//
+// Zero (the default) inherits the queue-wide cap configured via
+// WithMaxMessageSize. Any positive value up to MaxAllowedMessageSize
+// (PostgreSQL's bytea per-value limit) is honored verbatim. Negative values
+// and values above MaxAllowedMessageSize make CreateChannel/CreateTopic
+// return ErrInvalidConfig.
+func WithQueueMaxMessageSize(bytes int) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.maxMessageSize = bytes
+	}
+}
+
+// WithQueueMaxMetadataSize overrides the maximum marshaled metadata size for a
+// specific channel or topic.
+//
+// Zero (the default) inherits the queue-wide cap configured via
+// WithMaxMetadataSize. Any positive value up to MaxAllowedMetadataSize
+// (PostgreSQL's JSONB per-value limit) is honored verbatim. Negative values
+// and values above MaxAllowedMetadataSize make CreateChannel/CreateTopic
+// return ErrInvalidConfig.
+func WithQueueMaxMetadataSize(bytes int) QueueOption {
+	return func(o *queueCreateOpts) {
+		o.maxMetadataSize = bytes
+	}
+}
+
+// applyQueueOptions applies functional options onto a zero-value
+// queueCreateOpts. WithQueueTTL sets ttlSet so an explicit WithQueueTTL(0) can
+// be told apart from no WithQueueTTL call at all (mirroring maxRetriesSet);
+// every field starts at its natural zero value.
+func applyQueueOptions(opts []QueueOption) queueCreateOpts {
+	o := queueCreateOpts{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// PublishOption is a per-publish option applied to a single publish call.
+type PublishOption func(*publishOpts)
+
+// publishOpts holds the resolved per-message publish options.
+type publishOpts struct {
+	messageID uuid.UUID
+	metadata  map[string]any
+}
+
+// WithMessageID sets a specific message ID for deduplication. If not set, a
+// new UUIDv7 is generated automatically. When a message with the same ID
+// already exists, ErrDuplicateMessageID is returned.
+func WithMessageID(id uuid.UUID) PublishOption {
+	return func(o *publishOpts) {
+		o.messageID = id
+	}
+}
+
+// WithMessageMetadata attaches arbitrary metadata to a published message. The
+// metadata is stored as JSONB and returned with consumed messages.
+func WithMessageMetadata(m map[string]any) PublishOption {
+	return func(o *publishOpts) {
+		o.metadata = m
+	}
+}
+
+// applyPublishOptions applies functional options onto a zero publishOpts.
+func applyPublishOptions(opts []PublishOption) publishOpts {
+	o := publishOpts{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// ResolvePublishOptions resolves a slice of PublishOption into the concrete
+// message ID and metadata they specify. It returns the message ID first and the
+// metadata second: a zero message ID (uuid.Nil) means no WithMessageID was
+// supplied and the caller should generate a UUIDv7, and a nil metadata map means
+// no WithMessageMetadata was supplied.
+//
+// Publish applies these options internally; ResolvePublishOptions is exported
+// chiefly so in-memory test doubles (the fake package) can honor WithMessageID
+// and WithMessageMetadata with the same semantics as the real Queue, rather than
+// silently discarding them.
+func ResolvePublishOptions(opts ...PublishOption) (uuid.UUID, map[string]any) {
+	o := applyPublishOptions(opts)
+	return o.messageID, o.metadata
+}
+
+// ConsumeOption is a per-consume option applied to Receive*/Consume* calls.
+type ConsumeOption func(*consumeOpts)
+
+// consumeOpts holds the resolved per-consume options.
+type consumeOpts struct {
+	visibilityTimeout time.Duration
+	concurrency       int
+	pollInterval      time.Duration
+}
+
+// WithVisibilityTimeout sets the visibility timeout for a consumed message.
+// The message becomes eligible for redelivery if not acknowledged within this
+// duration.
+func WithVisibilityTimeout(d time.Duration) ConsumeOption {
+	return func(o *consumeOpts) {
+		o.visibilityTimeout = d
+	}
+}
+
+// WithConcurrency sets the number of parallel workers for handler-based consume
+// APIs (ConsumeChannel/ConsumeTopic). It is ignored by single-shot
+// ReceiveChannel/ReceiveTopic.
+//
+// Zero (the default) uses a single worker. A negative n is a caller mistake and
+// makes ConsumeChannel/ConsumeTopic return ErrInvalidConfig rather than being
+// silently coerced (L10). A value above the internal maximum (1024) is clamped
+// to it so a mistaken huge count cannot spawn an unbounded worker pool or open
+// that many pooled connections (M8).
+func WithConcurrency(n int) ConsumeOption {
+	return func(o *consumeOpts) {
+		o.concurrency = n
+	}
+}
+
+// WithPollInterval sets the polling interval between successive consume attempts
+// when no message is available.
+//
+// Zero uses the queue-wide WithSafetyNetPoll interval (or the built-in default),
+// as if WithPollInterval had not been called. A negative d is a caller mistake
+// and makes ConsumeChannel/ConsumeTopic return ErrInvalidConfig rather than
+// being silently ignored (L10); the iterator APIs, which cannot return a
+// configuration error, still fall back to the default for a non-positive value.
+func WithPollInterval(d time.Duration) ConsumeOption {
+	return func(o *consumeOpts) {
+		o.pollInterval = d
+	}
+}
+
+// defaultVisibilityTimeout is the default visibility timeout used by
+// ReceiveChannel and ReceiveTopic when WithVisibilityTimeout is not provided.
+const defaultVisibilityTimeout = 30 * time.Second
+
+// applyConsumeOptions applies functional options onto a consumeOpts with
+// defaults filled in.
+func applyConsumeOptions(opts []ConsumeOption) consumeOpts {
+	o := consumeOpts{
+		visibilityTimeout: defaultVisibilityTimeout,
+	}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// NackOption is a per-nack option applied to Nack and NackBatch calls.
+type NackOption func(*nackOpts)
+
+// nackOpts holds the resolved per-nack options.
+type nackOpts struct {
+	retryDelay time.Duration
+}
+
+// WithRetryDelay overrides the computed backoff delay before the nacked message
+// becomes eligible for redelivery (FR-023).
+//
+// Only a strictly positive d takes effect: d > 0 pins the redelivery delay to
+// exactly that duration, bypassing the queue's BackoffPolicy. A non-positive
+// value (0 or negative) is silently ignored and the queue's BackoffPolicy is
+// used instead, as if WithRetryDelay had not been called. A caller passing a
+// negative value almost certainly has a bug; pgqueue treats it identically to
+// zero rather than returning an error because Nack is already in a failure path.
+func WithRetryDelay(d time.Duration) NackOption {
+	return func(o *nackOpts) {
+		o.retryDelay = d
+	}
+}
