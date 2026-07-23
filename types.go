@@ -120,11 +120,17 @@ func (m *Message) Receipt() Receipt {
 // BatchResult reports the per-receipt outcome of AckBatch / NackBatch. When
 // those methods return a nil error the batch was processed and this enumerates
 // the result: Succeeded lists the receipts whose ack/nack committed, and Failed
-// lists the receipts that did not match a live claim, each with the reason. A
-// non-nil error from AckBatch / NackBatch signals an operational failure (the
-// queue is closed, the batch is too large, a receipt is missing its queue
-// binding, the queue does not exist, or a database error occurred); in that
-// case the returned BatchResult is zero and should be ignored.
+// lists the receipts that did not match a live claim, each with the reason.
+//
+// A non-nil error is not a signal to discard the result. AckBatch and
+// NackBatch group receipts by queue and run each group in its own
+// transaction, so an operational failure in one group (the batch is too large,
+// the queue does not exist, a database error occurred) is returned as a joined
+// error while this BatchResult still carries the succeeded and failed receipts
+// of every group that did commit. Those receipts are already applied and must
+// not be re-acked. Only a pre-flight failure that rejects the whole call before
+// any group runs — the queue is closed, or a receipt is missing its queue
+// binding — returns a zero BatchResult with nothing applied.
 //
 // Partial success is not an error: a batch where some claims have expired
 // returns a nil error with those receipts in Failed, so the caller can retry or

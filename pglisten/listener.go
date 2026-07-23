@@ -60,7 +60,9 @@ type ReconnectPolicy struct {
 	BaseDelay time.Duration
 	// MaxDelay caps the backoff window (default 30s).
 	MaxDelay time.Duration
-	// Multiplier grows the window each attempt; clamped to >= 1 (default 2).
+	// Multiplier grows the window each attempt. Any value below 1 — including 0
+	// and a fraction such as 0.5, which would otherwise shrink the window — is
+	// replaced by the default of 2, not clamped to 1.
 	Multiplier float64
 }
 
@@ -123,11 +125,16 @@ func WithKeepaliveInterval(d time.Duration) Option {
 
 // WithOnReconnect registers a callback invoked each time the Listener
 // successfully re-establishes its PostgreSQL connection after a failure.
-// attempt is the 1-based attempt number (1 = first successful reconnect after
-// a drop, 2 = second, etc.). The callback runs in the Listener's internal
-// goroutine and must not block for long; any heavy work should be dispatched
-// to another goroutine. Registering a Prometheus counter increment here is a
-// common use case:
+// attempt counts the connect attempts made within that one reconnect episode,
+// starting at 1: it is 1 when the connection came back on the first try, and 3
+// when two attempts failed and the third succeeded. The counter resets on every
+// drop, so it is not a cumulative reconnect total — two separate drops that each
+// recover immediately both report 1. Count the invocations themselves to total
+// reconnects, and read attempt as how hard that one recovery was.
+//
+// The callback runs in the Listener's internal goroutine and must not block for
+// long; any heavy work should be dispatched to another goroutine. Registering a
+// Prometheus counter increment here is a common use case:
 //
 //	reconnects := promauto.NewCounter(prometheus.CounterOpts{
 //	    Name: "pglisten_reconnects_total",
@@ -217,8 +224,11 @@ var (
 
 // New opens a dedicated connection for LISTEN/NOTIFY and starts the receive
 // loop. connString is a standard PostgreSQL connection string (the same form
-// accepted by pgx.Connect). Optional Options configure reconnect backoff and
-// logging; omitting them yields sane exponential-backoff defaults.
+// accepted by pgx.Connect). Optional Options configure reconnect backoff
+// (WithReconnectPolicy), logging (WithLogger), the dead-connection keepalive
+// probe (WithKeepaliveInterval) and a post-reconnect hook (WithOnReconnect);
+// omitting them yields sane exponential-backoff defaults, a silent Listener and
+// a 30s keepalive.
 func New(ctx context.Context, connString string, opts ...Option) (*Listener, error) {
 	conn, err := pgx.Connect(ctx, connString)
 	if err != nil {
@@ -348,8 +358,16 @@ func (l *Listener) Notifications() <-chan string {
 	return l.notifs
 }
 
-// Close stops the receive loop and releases the database connection. It is
+// Close signals the receive loop to stop and always returns nil. It is
 // idempotent.
+//
+// Shutdown is asynchronous: Close only marks the Listener closed, breaks any
+// in-progress WaitForNotification and returns. The dedicated database
+// connection is released by the receive loop itself, which closes the
+// connection and then the Notifications channel as it unwinds — so the
+// connection is still open for a moment after Close returns. A standalone user
+// that must know the connection is gone should drain Notifications until it is
+// closed, which happens strictly after the connection has been released.
 func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
 		l.mu.Lock()
@@ -558,7 +576,9 @@ func quoteListenIdent(ch string) string {
 // reconnect re-establishes the connection and re-issues every known LISTEN. It
 // returns false when the listener is closed while reconnecting. Failed attempts
 // back off exponentially with full jitter (R-07). On success the onReconnect
-// hook (if set) is invoked with the 1-based success count.
+// hook is invoked with the number of connect attempts this episode took (1 when
+// the first try succeeded); attempt is local to the call, so the count restarts
+// at every drop rather than accumulating across them.
 func (l *Listener) reconnect() bool {
 	l.closeConn()
 	attempt := 0

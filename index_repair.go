@@ -22,9 +22,9 @@ type RepairResult struct {
 }
 
 // indexRepairer is the minimal database surface repairInvalidIndexes needs.
-// Both the package DB interface (so the public RepairIndexes can use pq.db) and
-// *sql.Conn (so InitSchema can repair on the advisory-locked migration
-// connection) satisfy it.
+// *sql.Conn satisfies it — both callers (the public RepairIndexes and
+// InitSchema's post-migration pass) repair on an advisory-locked dedicated
+// connection — and so does the package DB interface.
 type indexRepairer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -124,9 +124,9 @@ func repairIndexesAfterMigrations(
 }
 
 // repairInvalidIndexes finds and rebuilds pgqueue's invalid indexes in schema.
-// It runs on any indexRepairer: the public RepairIndexes passes the Queue's DB
-// handle, while runMigrations passes its advisory-locked migration connection so
-// the repair serializes with concurrent startups. logger may be nil.
+// It runs on any indexRepairer: the public RepairIndexes and runMigrations each
+// pass their own advisory-locked dedicated connection, so the repair serializes
+// with concurrent startups. logger may be nil.
 func repairInvalidIndexes(
 	ctx context.Context, ir indexRepairer, schema string, logger *slog.Logger,
 ) (RepairResult, error) {

@@ -27,6 +27,11 @@ during a listener reconnect). Push simply lowers latency.
 **Lifecycle**: `WithListener` hands the listener's lifecycle to the Queue —
 `pq.Close()` closes the listener and its dedicated connection too.
 
+## Prerequisites
+
+- Docker and Docker Compose (easiest option)
+- OR PostgreSQL 18+ running locally
+
 ## Quick start with Docker Compose
 
 ```bash
@@ -45,3 +50,8 @@ createdb pgqueue_example
 cd examples/pglisten
 go run main.go
 ```
+
+The connection string is hardcoded in `main.go` as the `connString` constant
+(`postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable`)
+and is used for both the `database/sql` handle and the `pglisten` listener's
+dedicated connection; edit it if your PostgreSQL differs.

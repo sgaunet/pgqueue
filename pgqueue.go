@@ -1067,7 +1067,6 @@ func (pq *Queue) checkQueueNotExists(
 	return nil
 }
 
-// createPubSubTables creates message and subscription tables for a pub/sub topic.
 // createPubSubMessageTable creates the append-only pub/sub message table and its
 // created_at index (which serves the default GC completed-message purge — pub/sub
 // deletes fully-acked message rows past their retention cutoff on created_at, the
@@ -1097,6 +1096,8 @@ func (pq *Queue) createPubSubMessageTable(
 	return nil
 }
 
+// createPubSubTables creates the message, subscription, and DLQ tables (and
+// their indexes) for a pub/sub topic.
 func (pq *Queue) createPubSubTables(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -1235,7 +1236,8 @@ func (pq *Queue) createPubSubIndexes(
 	return nil
 }
 
-// createChannelTables creates message table for a point-to-point channel.
+// createChannelTables creates the message and DLQ tables (and their indexes)
+// for a point-to-point channel.
 func (pq *Queue) createChannelTables(
 	ctx context.Context,
 	tx *sql.Tx,

@@ -91,7 +91,7 @@ if err != nil {
 pq.Publish(ctx, "orders", ciphertext)
 
 // Decrypt after consuming
-msg, err := pq.ConsumeFromChannel(ctx, "orders", 30*time.Second)
+msg, err := pq.ReceiveChannel(ctx, "orders", pgqueue.WithVisibilityTimeout(30*time.Second))
 if err != nil {
     log.Fatal(err)
 }

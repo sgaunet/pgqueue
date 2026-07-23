@@ -4,12 +4,14 @@ This example demonstrates fan-out messaging using pgqueue topics and subscriptio
 
 ## What it does
 
-- Initializes the base schema (pgqueue_metadata, pgqueue_subscribers, pgqueue_replay_log tables)
+- Initializes the base schema (pgqueue_metadata, pgqueue_subscribers, pgqueue_replay_log,
+  pgqueue_schema_version tables)
 - Creates a "user-events" topic for broadcasting user activity
 - Registers 3 subscribers: email-service, analytics-service, notification-service
-- Publishes 5 user events to the topic
+- Starts one handler-based `ConsumeTopic` loop per subscriber, bounded to a
+  6-second window, then publishes 5 user events to the topic
 - Each subscriber processes all events independently (fan-out pattern)
-- Shows per-subscriber statistics (lag, processed count)
+- Shows per-subscriber lag (pending, processing, acknowledged counts)
 
 ## Key Concepts
 
@@ -60,33 +62,39 @@ If you have PostgreSQL running locally:
 2. Run the example:
    ```bash
    cd examples/pubsub
-   go mod tidy
    go run main.go
    ```
 
+The connection string is hardcoded in `main.go`
+(`postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable`);
+edit it if your PostgreSQL uses a different host, port, or credentials.
+
 ## Expected Output
+
+The three consume loops start before publishing begins, so the `completed` lines
+interleave with the `Published` lines. Line order across subscribers is
+nondeterministic. A typical run looks like:
 
 ```
 Registering subscribers...
 Registered: email-service
 Registered: analytics-service
 Registered: notification-service
+[email-service] starting...
+[analytics-service] starting...
+[notification-service] starting...
 
 Publishing user events...
 Published: user.registered: user_id=1001, email=alice@example.com (ID: 019a3c...)
+[email-service] completed: user.registered: user_id=1001, email=alice@example.com
+[analytics-service] completed: user.registered: user_id=1001, email=alice@example.com
+[notification-service] completed: user.registered: user_id=1001, email=alice@example.com
+Published: user.registered: user_id=1002, email=bob@example.com (ID: 019a3c...)
 ...
 
-[email-service] Starting...
-[analytics-service] Starting...
-[notification-service] Starting...
-
-[email-service] Processing: user.registered: user_id=1001, email=alice@example.com
-[analytics-service] Processing: user.registered: user_id=1001, email=alice@example.com
-[notification-service] Processing: user.registered: user_id=1001, email=alice@example.com
-
-[email-service] Completed: user.registered: user_id=1001, email=alice@example.com
-[analytics-service] Completed: user.registered: user_id=1001, email=alice@example.com
-...
+[email-service] shutting down
+[analytics-service] shutting down
+[notification-service] shutting down
 
 Subscriber Statistics:
   email-service:
@@ -103,7 +111,7 @@ Subscriber Statistics:
     Acknowledged: 5
 
 Example completed successfully!
-Note: Each subscriber processes the same events independently (fan-out pattern)
+Note: each subscriber processed every event independently (fan-out).
 ```
 
 ## Using lib/pq Driver

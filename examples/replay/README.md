@@ -27,6 +27,11 @@ outcome without mutating anything — always preview first when operating on
 production data. See `DLQ_OPERATIONS.md` in the repository root for an
 inspect-and-replay runbook.
 
+## Prerequisites
+
+- Docker and Docker Compose (easiest option)
+- OR PostgreSQL 18+ running locally
+
 ## Quick start with Docker Compose
 
 ```bash
@@ -45,3 +50,7 @@ createdb pgqueue_example
 cd examples/replay
 go run main.go
 ```
+
+The connection string is hardcoded in `main.go`
+(`postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable`);
+edit it if your PostgreSQL uses a different host, port, or credentials.

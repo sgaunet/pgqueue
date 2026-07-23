@@ -156,8 +156,13 @@ func ExampleQueue_ReplayDLQ() {
 // ExampleNewGarbageCollector shows how to enable storage retention. The
 // GarbageCollector is opt-in: message redelivery and DLQ promotion work without
 // it, but old completed messages, expired DLQ entries, and acked subscription
-// rows are only reclaimed once one is running. RetentionPolicy fields default
-// to 0 ("keep forever"), so positive durations must be set to enable purging.
+// rows are only reclaimed once one is running. An all-zero DefaultPolicy is
+// treated as unconfigured and replaced with default retention (completed
+// messages 24h, DLQ 30d), so a GarbageCollector bounds table growth even
+// without a policy; any DefaultPolicy with at least one field set, like the one
+// below, is honored verbatim. To keep everything forever, set the fields to
+// pgqueue.KeepForever rather than leaving them 0 — a policy of nothing but
+// zeros is the "unconfigured" case and gets the defaults instead.
 func ExampleNewGarbageCollector() {
 	var (
 		ctx context.Context

@@ -9,6 +9,80 @@
 //	if err != nil { ... }
 //	q, err := pgqueue.New(ctx, db, pgqueue.WithMetrics(m))
 //
+// # Collectors
+//
+// NewMetrics registers the following collectors. Names are stable API: they
+// are what dashboards and alerts key on, so they change only with a major
+// version. Every collector carries a "queue" label holding the pgqueue queue
+// or topic name; the collectors that carry more are called out below.
+//
+//   - pgqueue_publish_messages_total — CounterVec. Messages published (Publish
+//     adds 1, PublishBatch adds the batch size). Labels: queue.
+//   - pgqueue_handle_duration_seconds — HistogramVec, seconds. Handler-only
+//     execution latency: it excludes queue wait, the receive round-trip, and
+//     the ack round-trip. Buckets: DefaultLatencyBuckets, overridable with
+//     WithLatencyBuckets. Labels: queue.
+//   - pgqueue_delivery_latency_seconds — HistogramVec, seconds. The
+//     publish-to-delivery interval: message creation to handler start, so it
+//     includes the queue wait the handle histogram excludes. Always measured
+//     from the original publish time, so redeliveries report cumulative time.
+//     Buckets:
+//     DefaultLatencyBuckets, overridable with WithLatencyBuckets.
+//     Labels: queue.
+//   - pgqueue_ack_total — CounterVec. Acknowledgement outcomes.
+//     Labels: queue, result ("ack" or "nack"). See "Backend divergence" below.
+//   - pgqueue_ack_after_expired_total — CounterVec. Receipts ack'd or nack'd
+//     after their claim expired; those messages will be redelivered.
+//     Labels: queue.
+//   - pgqueue_queue_depth — GaugeVec. Consumable pending-message count. Set
+//     only when the application calls Queue.Stats — nothing samples it in the
+//     background, so a dashboard needs a periodic Stats call. Labels: queue.
+//   - pgqueue_dlq_size — GaugeVec. Dead-letter queue size. Set on the same
+//     Queue.Stats call as the depth gauge. Labels: queue.
+//   - pgqueue_metadata_parse_errors_total — CounterVec. Messages whose JSON
+//     metadata column could not be parsed; metadata is dropped and delivery
+//     continues. Labels: queue.
+//   - pgqueue_gc_runs_total — CounterVec. Garbage-collector passes.
+//     Labels: queue, result ("ok" or "error").
+//   - pgqueue_gc_duration_seconds — HistogramVec, seconds. Wall-clock duration
+//     of one per-queue GC pass. Fixed buckets 0.001s–30s (not affected by
+//     WithLatencyBuckets). Labels: queue (no result label).
+//   - pgqueue_gc_reclaimed_total — CounterVec. Timed-out messages reset to
+//     pending by the GC. Incremented only when the pass reclaimed at least one
+//     row. Labels: queue.
+//   - pgqueue_gc_purged_total — CounterVec. Rows deleted by the retention
+//     policy. Incremented only when the pass purged at least one row.
+//     Labels: queue.
+//   - pgqueue_missed_notifications_total — CounterVec. LISTEN confirmations
+//     that failed, meaning notifications were dropped until LISTEN was
+//     re-confirmed; the safety-net poll still delivers. Labels: queue.
+//
+// Because these are label vectors, a series only appears once its queue has
+// recorded its first observation; a queue that has never published shows no
+// pgqueue_publish_messages_total sample at all.
+//
+// # Spans
+//
+// This adapter records metrics only. Tracing spans (pgqueue.publish,
+// pgqueue.publish_batch, pgqueue.consume, pgqueue.ack, pgqueue.nack,
+// pgqueue.extend, pgqueue.replay) are emitted through pgqueue.Tracer; see the
+// otelpgqueue module for an implementation. The two are independent — a
+// pgqueue.New call can register this metrics adapter and an OpenTelemetry
+// tracer together.
+//
+// # Backend divergence: RecordAck
+//
+// The ack outcome is labelled differently by the two shipped adapters, so a
+// query written against one does not port to the other unchanged:
+//
+//   - prompgqueue (this package) sets a string label on pgqueue_ack_total:
+//     result="ack" or result="nack".
+//   - otelpgqueue sets a boolean attribute on pgqueue.ack.total:
+//     ack=true for an ack, ack=false for a nack.
+//
+// Everything else (metric semantics, the "queue" label, the gc "result"
+// label) matches; only this one label differs.
+//
 // # Metric label cardinality
 //
 // Every metric exposed by this adapter carries a "queue" label set to the
@@ -16,7 +90,8 @@
 // distinct label value, so the set of queue names must stay bounded: a
 // per-tenant or otherwise dynamically generated queue name will grow the time
 // series count without limit and can overwhelm Prometheus. Keep queue names
-// drawn from a small, fixed set (R-24).
+// drawn from a small, fixed set (R-24). No metric carries the message ID, for
+// the same reason.
 //
 // # MetricsRecorder context parameter
 //
@@ -218,9 +293,10 @@ func NewMetrics(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 // Callers in that situation must either drop the conflicting registration or
 // hand pgqueue its own dedicated prometheus.Registerer.
 //
-// generic constraint is only how the helper stays type-safe across them.
+// T is a concrete collector type at every call site; the generic constraint is
+// only how the helper stays type-safe across them.
 //
-//nolint:ireturn // T is a concrete collector type at every call site; the
+//nolint:ireturn // T is concrete at every call site; the constraint is for type safety.
 func registerCollector[T prometheus.Collector](reg prometheus.Registerer, c T) (T, error) {
 	err := reg.Register(c)
 	if err == nil {

@@ -99,8 +99,9 @@ uses keys in the same numeric range should review migrations.go for the
 exact values and the encoding scheme.
 
 Scalability ceiling: each queue creates 2-3 tables (a channel: message + DLQ;
-a pub/sub topic: message + subscription + DLQ) plus their indexes — roughly 8
-per channel and 12 per topic, counting primary keys — and admin operations
+a pub/sub topic: message + subscription + DLQ) plus their indexes — 8 per
+channel and 13 per topic, counting primary keys and the subscription table's
+UNIQUE(message_id, subscriber_id) constraint — and admin operations
 (GarbageCollector.Collect, ListChannels, ListTopics, UnhealthySubscribers)
 scale linearly with queue count. The table-per-queue design targets tens to low
 hundreds of queues per database; it is not appropriate for per-tenant/per-user
@@ -108,12 +109,16 @@ queues at multi-tenant scale. Use WithMaxQueues to enforce a deliberate cap.
 See ADR-002 in ADR.md.
 
 Queue names are trusted input, not a security boundary. They are validated to
-^[a-zA-Z0-9_-]+$ and become physical table names, but pgqueue does not isolate
-one caller's names from another's: names differing only by dash/underscore
+^[a-zA-Z0-9_-]+$ and to 1-28 bytes (the length cap keeps the longest generated
+index name inside PostgreSQL's 63-byte identifier limit, so two distinct queues
+cannot truncate to the same index name), and they become physical table names,
+but pgqueue does not isolate one caller's names from another's: the sanitizer
+replaces dashes with underscores and lowercases, so names differing only by
+dash/underscore or by case ("orders", "Orders", "ord-ers", "ord_ers") all
 sanitize to the same table and collide, and a creation-time collision error
-echoes the conflicting queue's original name. Do not derive queue names directly
-from untrusted or per-tenant input — map external identifiers to your own vetted
-queue names instead.
+echoes the conflicting queue's original name. Do
+not derive queue names directly from untrusted or per-tenant input — map
+external identifiers to your own vetted queue names instead.
 
 For complete examples, see the examples/ directory.
 */

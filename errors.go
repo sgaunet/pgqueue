@@ -126,7 +126,7 @@ var (
 	ErrUnsupportedPGVersion = errors.New("pgqueue requires PostgreSQL 18+")
 
 	// ErrMaxQueuesReached is returned when creating a queue would exceed the
-	// configured Config.MaxQueues limit.
+	// limit configured with WithMaxQueues.
 	ErrMaxQueuesReached = errors.New("maximum number of queues reached")
 
 	// ErrInvalidVisibilityTimeout is returned when the visibility timeout is out of bounds.
@@ -134,13 +134,13 @@ var (
 		"visibility timeout must be between 1ms and 24h",
 	)
 
-	// ErrSchemaNotInitialized is returned by Init when the pgqueue schema is
-	// absent from the database. Call InitSchema before Init.
+	// ErrSchemaNotInitialized is returned by New when the pgqueue schema is
+	// absent from the database. Call InitSchema before New.
 	ErrSchemaNotInitialized = errors.New(
 		"pgqueue schema is not initialized: call InitSchema first",
 	)
 
-	// ErrSchemaOutdated is returned by Init when the database schema is older
+	// ErrSchemaOutdated is returned by New when the database schema is older
 	// than the version this build of pgqueue requires. Run InitSchema to migrate.
 	ErrSchemaOutdated = errors.New(
 		"pgqueue schema is outdated: run InitSchema to migrate",
@@ -163,8 +163,13 @@ var (
 	// callers should treat it as "try again later", not as a failure.
 	ErrQueueEmpty = errors.New("queue is empty: no message currently available")
 
-	// ErrQueueClosed is returned by any operation invoked after Close has been
-	// called on the pgqueue handle.
+	// ErrQueueClosed is returned by most operations invoked after Close has been
+	// called on the pgqueue handle. The guard is not universal: DeleteChannel,
+	// DeleteTopic and AppliedSchemaVersion carry no closed check and still run
+	// their queries on the caller-owned *sql.DB, which Close deliberately leaves
+	// open — they therefore succeed as usual, or fail with the driver's own error
+	// (typically sql.ErrConnDone) once the caller closes the database, rather
+	// than with this sentinel. Close itself is idempotent and returns nil.
 	ErrQueueClosed = errors.New("pgqueue handle is closed")
 
 	// ErrReceiptMissingQueueType is returned by the queue-agnostic Ack, Nack,

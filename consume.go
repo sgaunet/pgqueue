@@ -551,9 +551,12 @@ func (pq *Queue) resolveNotifyChannel(ctx context.Context, qt QueueType, name st
 // from a point-to-point channel. The caller is responsible for acknowledging
 // each message with Ack or Nack — msg.Receipt() carries the queue binding.
 //
-// The iterator blocks while the channel is empty, polling at WithPollInterval
-// (default 1s), and ends cleanly when ctx is cancelled. A genuine error is
-// yielded once with a nil message, after which the iterator stops.
+// The iterator blocks while the channel is empty, waking on a LISTEN/NOTIFY
+// push when one is available and otherwise polling at the safety-net interval:
+// the per-call WithPollInterval if set, else the queue-wide WithSafetyNetPoll
+// given to New, else the built-in 1s default. It ends cleanly when ctx is
+// cancelled. A genuine error is yielded once with a nil message, after which
+// the iterator stops.
 func (pq *Queue) ChannelMessages(
 	ctx context.Context,
 	name string,
@@ -691,8 +694,14 @@ func (pq *Queue) messagesIter(
 //
 // With WithConcurrency(n) the loop runs n parallel workers. ConsumeChannel
 // blocks until ctx is cancelled, at which point it drains its workers and
-// returns nil. It returns a non-nil error only on an unrecoverable fetch
-// failure.
+// returns nil.
+//
+// It returns a non-nil error in three cases: ErrQueueClosed when the Queue is
+// already closed (or is closed between the check and worker registration),
+// ErrInvalidConfig when a ConsumeOption is out of range (a negative
+// WithConcurrency or WithPollInterval) — both rejected up front, before any
+// message is fetched — and an unrecoverable fetch failure once the loop is
+// running, which cancels the remaining workers and surfaces after they drain.
 func (pq *Queue) ConsumeChannel(
 	ctx context.Context,
 	name string,
@@ -712,8 +721,8 @@ func (pq *Queue) ConsumeChannel(
 }
 
 // ConsumeTopic runs a handler-driven consume loop for a subscriber on a pub/sub
-// topic. See ConsumeChannel for loop ownership, auto-ack/nack, concurrency, and
-// shutdown semantics.
+// topic. See ConsumeChannel for loop ownership, auto-ack/nack, concurrency,
+// shutdown semantics, and the errors it can return.
 func (pq *Queue) ConsumeTopic(
 	ctx context.Context,
 	name, subscriberID string,

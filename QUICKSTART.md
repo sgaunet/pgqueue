@@ -61,7 +61,7 @@ func main() {
     }
 
     // 5. Publish a message.
-    msgID, err := q.PublishChannel(ctx, "orders", []byte(`{"order_id":"123"}`))
+    msgID, err := q.Publish(ctx, "orders", []byte(`{"order_id":"123"}`))
     if err != nil {
         log.Fatal(err)
     }
@@ -131,7 +131,7 @@ func main() {
     }
 
     // Publish once; every subscriber registered at publish time gets a copy.
-    msgID, err := q.PublishTopic(ctx, "events", []byte(`{"event":"user_signup"}`))
+    msgID, err := q.Publish(ctx, "events", []byte(`{"event":"user_signup"}`))
     if err != nil {
         log.Fatal(err)
     }
@@ -265,9 +265,12 @@ A message is redelivered when:
 - **The visibility timeout expires.** Consuming a channel message sets
   `status='processing'` and a `visibility_timeout` (default 30s). If the
   message is not acked before that deadline — a slow handler, a long GC pause,
-  a lost database connection — the `GarbageCollector` resets it to `pending`
-  and another consumer can pick it up. A late `Ack`/`Nack` then returns
-  `ErrClaimExpired`.
+  a lost database connection — the next consumer to call consume reclaims it:
+  every consume looks for a pending message first, then for a `processing`
+  message whose `visibility_timeout` has elapsed. Redelivery therefore does
+  **not** require a running `GarbageCollector`; the GC's reset pass is a
+  secondary safety net for rows no consumer reaches. A late `Ack`/`Nack` then
+  returns `ErrClaimExpired`.
 - **The consumer crashes mid-handler.** A process that dies after fetching a
   message but before acking never commits the ack, so the message is reclaimed
   the same way once its timeout lapses.
@@ -321,7 +324,7 @@ import "github.com/google/uuid"
 // Derive a stable ID from your business key, or generate a fresh UUIDv7.
 id := uuid.NewSHA1(uuid.NameSpaceURL, []byte("order-12345"))
 
-_, err := q.PublishChannel(ctx, "orders", payload, pgqueue.WithMessageID(id))
+_, err := q.Publish(ctx, "orders", payload, pgqueue.WithMessageID(id))
 if errors.Is(err, pgqueue.ErrDuplicateMessageID) {
     log.Println("already published")
 }
@@ -335,7 +338,7 @@ expired DLQ entries, acked subscription rows) does not — you must run a
 `GarbageCollector`.
 
 ```go
-gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
+gc, err := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
     Interval: 5 * time.Minute,
     DefaultPolicy: pgqueue.RetentionPolicy{
         CompletedMessageTTL: 24 * time.Hour,
@@ -343,6 +346,9 @@ gc := pgqueue.NewGarbageCollector(q, pgqueue.GarbageCollectorConfig{
         DLQRetention:        30 * 24 * time.Hour,
     },
 })
+if err != nil {
+    log.Fatal(err)
+}
 gc.Start(ctx) // background loop; q.Close() stops it
 ```
 
@@ -356,13 +362,22 @@ gc.Start(ctx) // background loop; q.Close() stops it
 
 ## Delivery model: polling vs push
 
-By default, consume loops **poll**. An idle `ConsumeChannel` / `ReceiveChannel`
-worker issues one query every poll interval (default 30s) to check for ready
-work, even when the queue is empty. The aggregate query load is therefore
-roughly:
+By default, consume loops **poll**. An idle `ConsumeChannel` / `ConsumeTopic`
+worker (and the `ChannelMessages` / `TopicMessages` iterators) checks for ready
+work once every poll interval (default 1s), even when the queue is empty.
+`ReceiveChannel` / `ReceiveTopic` do not poll at all — they are single-shot and
+return `ErrQueueEmpty` immediately.
+
+An empty poll is not a single query. It is a metadata lookup (the mutable
+`paused` flag and per-queue config are always read fresh) followed by a
+`BEGIN … COMMIT` containing **two** `SELECT … LIMIT 1 FOR UPDATE SKIP LOCKED`
+probes — one for a pending message, one for a timed-out `processing` message to
+reclaim. So budget **~3 statements** (plus the `BEGIN`/`COMMIT` round-trips) per
+idle worker per interval, not one:
 
 ```
-empty-poll QPS ≈ (consumers × queues consumed) ÷ poll interval
+polls/s        ≈ (consumers × queues consumed) ÷ poll interval
+empty-poll QPS ≈ polls/s × ~3 statements
 ```
 
 That is fine for a handful of queues and consumers, but the cost scales with

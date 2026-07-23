@@ -11,6 +11,90 @@
 //	    pgqueue.WithMetrics(otelpgqueue.NewMetrics(meterProvider)),
 //	)
 //
+// # Instrumentation scope
+//
+// Every instrument and span is emitted under the instrumentation scope name
+// "github.com/sgaunet/pgqueue". Use it to filter pgqueue telemetry apart from
+// the rest of the application's.
+//
+// # Instruments
+//
+// NewMetrics creates the following instruments. Names are stable API: they are
+// what dashboards and alerts key on, so they change only with a major version.
+// Every instrument carries a "queue" attribute holding the pgqueue queue or
+// topic name; the instruments that carry more are called out below.
+//
+//   - pgqueue.publish.messages — Int64Counter. Messages published (Publish
+//     adds 1, PublishBatch adds the batch size). Attributes: queue.
+//   - pgqueue.handle.duration — Float64Histogram, unit "s". Handler-only
+//     execution latency: it excludes queue wait, the receive round-trip, and
+//     the ack round-trip. Attributes: queue.
+//   - pgqueue.delivery.latency — Float64Histogram, unit "s". The
+//     publish-to-delivery interval: message creation to handler start, so it
+//     includes the queue wait handle.duration excludes. Always measured from
+//     the original publish time, so redeliveries report cumulative time.
+//     Attributes: queue.
+//   - pgqueue.ack.total — Int64Counter. Acknowledgement outcomes.
+//     Attributes: queue, ack (bool — true for an ack, false for a nack).
+//     See "Backend divergence" below.
+//   - pgqueue.ack.after_expired — Int64Counter. Receipts ack'd or nack'd after
+//     their claim expired; those messages will be redelivered. Attributes:
+//     queue.
+//   - pgqueue.queue.depth — Int64Gauge. Consumable pending-message count.
+//     Recorded only when the application calls Queue.Stats — nothing samples
+//     it in the background, so a dashboard needs a periodic Stats call.
+//     Attributes: queue.
+//   - pgqueue.dlq.size — Int64Gauge. Dead-letter queue size. Recorded on the
+//     same Queue.Stats call as queue.depth. Attributes: queue.
+//   - pgqueue.metadata.parse_errors — Int64Counter. Messages whose JSON
+//     metadata column could not be parsed; metadata is dropped and delivery
+//     continues. Attributes: queue.
+//   - pgqueue.gc.runs — Int64Counter. Garbage-collector passes.
+//     Attributes: queue, result ("ok" or "error").
+//   - pgqueue.gc.duration — Float64Histogram, unit "s". Wall-clock duration of
+//     one per-queue GC pass. Attributes: queue (no result attribute).
+//   - pgqueue.gc.reclaimed — Int64Counter. Timed-out messages reset to pending
+//     by the GC. Added only when the pass reclaimed at least one row.
+//     Attributes: queue.
+//   - pgqueue.gc.purged — Int64Counter. Rows deleted by the retention policy.
+//     Added only when the pass purged at least one row. Attributes: queue.
+//   - pgqueue.missed_notifications — Int64Counter. LISTEN confirmations that
+//     failed, meaning notifications were dropped until LISTEN was
+//     re-confirmed; the safety-net poll still delivers. Attributes: queue.
+//
+// Instrument creation is best-effort: an instrument that fails to build is
+// simply never recorded. Pass WithLogger to have those failures logged.
+//
+// # Spans
+//
+// Span names are chosen by the core pgqueue module and recorded through
+// Tracer.StartSpan. A span's error status is set from the operation's error
+// (via Span.SetError, which calls RecordError and sets codes.Error).
+//
+//   - pgqueue.publish — Publish. Attributes: queue.
+//   - pgqueue.publish_batch — PublishBatch. Attributes: queue.
+//   - pgqueue.consume — one handler invocation. Attributes: queue,
+//     message_id.
+//   - pgqueue.ack — Attributes: queue, message_id.
+//   - pgqueue.nack — Attributes: queue, message_id.
+//   - pgqueue.extend — visibility-timeout extension. Attributes: queue,
+//     message_id.
+//   - pgqueue.replay — ReplayFrom, ReplayMessage, and ReplayDLQ. Attributes:
+//     queue, replay_type ("timestamp", "message_id", or "dlq").
+//
+// # Backend divergence: RecordAck
+//
+// The ack outcome is labelled differently by the two shipped adapters, so a
+// query written against one does not port to the other unchanged:
+//
+//   - otelpgqueue (this package) sets a boolean attribute:
+//     ack=true for an ack, ack=false for a nack.
+//   - prompgqueue sets a string label on pgqueue_ack_total:
+//     result="ack" or result="nack".
+//
+// Everything else (metric semantics, the "queue" attribute, the gc "result"
+// attribute) matches; only this one attribute differs.
+//
 // # Metric label cardinality
 //
 // Every metric records a "queue" attribute set to the pgqueue queue or topic
@@ -19,6 +103,10 @@
 // per-tenant or otherwise dynamically generated queue name grows the stream
 // count without limit. Keep queue names drawn from a small, fixed set (R-24).
 //
+// The message_id span attribute is high-cardinality by nature. That is fine
+// for spans (which are sampled and not aggregated into time series) but it is
+// why no metric carries it.
+//
 // # MetricsRecorder context parameter (R-23b)
 //
 // pgqueue.MetricsRecorder methods take a context.Context first parameter,
@@ -26,11 +114,8 @@
 // …). This adapter forwards that real ctx to every OpenTelemetry instrument
 // call instead of context.Background(), so a meter provider that supports
 // exemplars can correlate a metric observation with the in-flight trace.
-// Threading ctx through pgqueue.Tracer and pgqueue.MetricsRecorder was
-// evaluated and deferred pre-v1.0 because it would have been an
-// interface-breaking change for every implementer once frozen (R-23b); it was
-// instead adopted before the v1.0 API freeze, so both hook interfaces now
-// carry ctx from their first release.
+// Both pgqueue.Tracer and pgqueue.MetricsRecorder carry ctx as of their first
+// released version, so no interface-breaking change is pending here.
 package otelpgqueue
 
 import (
@@ -363,11 +448,10 @@ func (m *Metrics) RecordMissedNotification(ctx context.Context, queue string) {
 // buildInstruments creates every metric instrument on m, returning the errors
 // from any individual instrument that failed. Split out of NewMetrics to keep
 // each function's cyclomatic complexity in check (a single new instrument
-// otherwise pushes NewMetrics past the lint threshold).
+// otherwise pushes NewMetrics past the lint threshold). The cyclomatic count
+// and length both track the number of instruments, not branching logic.
 //
-// count and length both track the number of instruments, not branching logic.
-//
-//nolint:cyclop,funlen // Linear list of instrument constructions; the cyclomatic
+//nolint:cyclop,funlen // Linear list of instrument constructions.
 func (m *Metrics) buildInstruments(meter metric.Meter) []error {
 	var errs []error
 	var err error
@@ -436,10 +520,10 @@ func (m *Metrics) buildInstruments(meter metric.Meter) []error {
 }
 
 // queueAttr is the common single-attribute option keyed by queue name.
+// metric.MeasurementOption is the option type the OTel metric API requires;
+// returning it is the only possible shape.
 //
-// API requires; returning it is the only possible shape.
-//
-//nolint:ireturn // metric.MeasurementOption is the option type the OTel metric
+//nolint:ireturn // Returning the OTel-mandated interface type.
 func queueAttr(queue string) metric.MeasurementOption {
 	return metric.WithAttributes(attribute.String("queue", queue))
 }

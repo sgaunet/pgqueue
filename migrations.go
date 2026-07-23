@@ -91,8 +91,8 @@ CREATE TABLE IF NOT EXISTS pgqueue_schema_version (
 // current column shape. Consequently, any migration that adds or alters a
 // column on a per-queue table MUST patch the already-existing per-queue tables
 // itself — newly created queues are fine, but pre-existing ones are not
-// touched by anything else. Both phases can discover the live tables from
-// pgqueue_metadata via listQueueTableNames, e.g.:
+// touched by anything else. Both phases can discover the live tables by
+// reading table_name from pgqueue_metadata, e.g.:
 //
 //	for _, t := range tableNames {
 //		// apply:      ALTER TABLE pgqueue_msg_<t> ADD COLUMN ...

@@ -18,7 +18,7 @@ This document captures key architectural decisions made in `pgqueue` and the rat
 - **No build step**: No code generation required (unlike sqlc), keeping the build simple.
 - **Driver-agnostic**: Works with both `pgx` and `lib/pq` since it only depends on `database/sql` interfaces.
 
-**Trade-offs**: More boilerplate for scanning rows, but the query surface is small and well-contained in `queries.go`.
+**Trade-offs**: More boilerplate for scanning rows, and the query surface is spread across the package rather than centralised — `queries.go` holds the shared metadata/DLQ/replay-log helpers, but each feature owns its own SQL (`channel.go`, `pubsub.go`, `consume.go`, `batch.go`, `publish.go`, `gc.go`, `replay.go`, `stats.go`, `migrations.go`), and the per-queue DDL lives in `pgqueue.go`. Locating every statement therefore means grepping the package, not opening one file.
 
 ---
 
@@ -39,7 +39,7 @@ This document captures key architectural decisions made in `pgqueue` and the rat
 
 **Trade-offs**: More tables to manage, and dynamic DDL requires careful name validation (`queueNameRegex`). Queue names are sanitized via `sanitizeTableName()` to prevent SQL injection.
 
-**Scalability ceiling**: Each queue multiplies the number of PostgreSQL relations in the database. A **channel** is 2 tables (`pgqueue_msg_*`, `pgqueue_dlq_*`) and roughly 7 indexes; a **topic** is 3 tables (adds `pgqueue_sub_*`) and roughly 10 indexes (counting primary keys). So N queues add on the order of `N × (2–3)` tables and `N × (7–10)` indexes to `pg_class` / `pg_index`. Several admin operations also scale linearly with queue count: `GarbageCollector.Collect` iterates every queue, `ListChannels` / `ListTopics` walk the metadata table, and `UnhealthySubscribers` issues one query per topic (N+1). The design is comfortable for **tens to low hundreds of queues per database**. At the scale of thousands of queues, PostgreSQL catalog bloat, query-planning latency, and autovacuum-of-catalog overhead become the dominant cost. The table-per-queue design is therefore **not** appropriate for patterns that mint a queue per tenant or per user — for those workloads, multiplex tenants onto a fixed pool of queues (demultiplex via message metadata or payload), or shard tenants across separate databases. Pass `WithMaxQueues(n)` to `New` to enforce a hard cap: once it is reached, `CreateChannel` / `CreateTopic` return `ErrMaxQueuesReached` rather than silently growing the catalog, so the ceiling is hit deliberately, not by surprise.
+**Scalability ceiling**: Each queue multiplies the number of PostgreSQL relations in the database. A **channel** is 2 tables (`pgqueue_msg_*`, `pgqueue_dlq_*`) and roughly 8 indexes; a **topic** is 3 tables (adds `pgqueue_sub_*`) and roughly 12 indexes (counting primary keys). So N queues add on the order of `N × (2–3)` tables and `N × (8–12)` indexes to `pg_class` / `pg_index`. Several admin operations also scale linearly with queue count: `GarbageCollector.Collect` iterates every queue, `ListChannels` / `ListTopics` walk the metadata table, and `UnhealthySubscribers` issues one query per topic (N+1). The design is comfortable for **tens to low hundreds of queues per database**. At the scale of thousands of queues, PostgreSQL catalog bloat, query-planning latency, and autovacuum-of-catalog overhead become the dominant cost. The table-per-queue design is therefore **not** appropriate for patterns that mint a queue per tenant or per user — for those workloads, multiplex tenants onto a fixed pool of queues (demultiplex via message metadata or payload), or shard tenants across separate databases. Pass `WithMaxQueues(n)` to `New` to enforce a hard cap: once it is reached, `CreateChannel` / `CreateTopic` return `ErrMaxQueuesReached` rather than silently growing the catalog, so the ceiling is hit deliberately, not by surprise.
 
 ---
 
@@ -67,11 +67,11 @@ This document captures key architectural decisions made in `pgqueue` and the rat
 
 **Decision**: Use `SELECT ... FOR UPDATE SKIP LOCKED` to dequeue messages from channels.
 
-**Context**: Message consumption requires exactly-once delivery under concurrent consumers. Common approaches include advisory locks, `DELETE ... RETURNING`, or `UPDATE ... RETURNING` with subqueries.
+**Context**: Message consumption requires that concurrent consumers never claim the same message at the same time. Common approaches include advisory locks, `DELETE ... RETURNING`, or `UPDATE ... RETURNING` with subqueries.
 
 **Rationale**:
 - **Non-blocking**: `SKIP LOCKED` allows concurrent consumers to each grab a different message without waiting. Consumers never block each other.
-- **Exactly-once delivery**: The row lock ensures only one consumer processes each message within a transaction.
+- **At most one concurrent consumer per message**: The row lock ensures no two consumers hold the same message in flight. This is mutual exclusion, **not** exactly-once delivery — pgqueue is **at-least-once** by design. When a claim's visibility timeout lapses without an ack, the message is deliberately redelivered (see the visibility-timeout bullet below), so the same message can be handed out more than once over its lifetime. Handlers must be idempotent.
 - **PostgreSQL-native**: This is a first-class PostgreSQL feature designed for queue workloads, well-optimized in the query planner.
 - **Visibility timeout integration**: Pairs naturally with the visibility timeout pattern: lock the row, set `status='processing'` and `visibility_timeout`, then commit.
 
@@ -88,7 +88,7 @@ This document captures key architectural decisions made in `pgqueue` and the rat
 **Context**: Channels (point-to-point) and pub/sub (fan-out) have different state tracking needs.
 
 **Rationale**:
-- **Channels** need per-message state: `status`, `retry_count`, `max_retries`, `visibility_timeout`, `ack_deadline`, `processed_at`, `error_message`. Messages transition through `pending -> processing -> completed/DLQ`.
+- **Channels** need per-message state: `status`, `retry_count`, `max_retries`, `visibility_timeout`, `available_at`, `claim_id`, `processed_at`, `error_message`. Messages transition through `pending -> processing -> completed/DLQ`.
 - **Pub/Sub** messages are immutable once published (`id`, `payload`, `created_at`, `metadata`). Per-subscriber state lives in the `pgqueue_sub_{name}` table, allowing each subscriber to track progress independently.
 - **No wasted storage**: Channel tables don't carry subscriber tracking columns; pub/sub tables don't carry retry/status columns.
 - **Cleaner queries**: Each pattern's queries are optimized for its specific schema without conditional logic.

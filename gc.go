@@ -196,9 +196,11 @@ func (gc *GarbageCollector) Stop() {
 	gc.wg.Wait()
 }
 
-// PurgeQueue immediately and irreversibly deletes every message from a queue,
-// leaving the queue and its tables in place. It forwards to Queue.PurgeQueue —
-// prefer that method directly, since purging needs no GarbageCollector.
+// PurgeQueue immediately and irreversibly empties a queue — every message and
+// every dead-letter row, for channels as well as topics — while leaving the
+// queue and its tables in place. It forwards to Queue.PurgeQueue; prefer that
+// method directly, since purging needs no GarbageCollector. See
+// Queue.PurgeQueue for the full list of what is destroyed.
 func (gc *GarbageCollector) PurgeQueue(
 	ctx context.Context,
 	queueName string,
@@ -207,11 +209,15 @@ func (gc *GarbageCollector) PurgeQueue(
 	return gc.pq.PurgeQueue(ctx, queueName, queueType)
 }
 
-// PurgeQueue immediately and irreversibly deletes every message (and, for a
-// pub/sub topic, every subscription and DLQ row) from a queue, leaving the queue
-// and its tables in place. It is a destructive operation with no confirmation
-// flag — gate it at the call site. Returns ErrQueueNotFound if the named queue
-// does not exist.
+// PurgeQueue immediately and irreversibly empties a queue, leaving the queue and
+// its tables in place. It deletes every message AND the queue's entire
+// dead-letter queue, for a point-to-point channel just as much as for a
+// pub/sub topic; a topic additionally loses every subscription row. Purging a
+// channel therefore also discards its DLQ, so any failed message parked there
+// for later inspection or replay is gone — list or replay the DLQ first if those
+// rows still matter. It is a destructive operation with no confirmation flag and
+// no undo — gate it at the call site. Returns ErrQueueNotFound if the named
+// queue does not exist.
 func (pq *Queue) PurgeQueue(
 	ctx context.Context,
 	queueName string,

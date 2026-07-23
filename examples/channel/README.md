@@ -4,11 +4,14 @@ This example demonstrates point-to-point messaging using pgqueue channels.
 
 ## What it does
 
-- Initializes the base schema (pgqueue_metadata, pgqueue_subscribers, pgqueue_replay_log tables)
+- Initializes the base schema (pgqueue_metadata, pgqueue_subscribers, pgqueue_replay_log,
+  pgqueue_schema_version tables)
 - Creates an "orders" channel for processing customer orders
 - Publishes 5 example orders to the channel
-- Consumes orders with a background processor (single consumer)
-- Demonstrates acknowledgment and error handling
+- Consumes them with the handler-based `ConsumeChannel` loop, using 4 concurrent
+  workers (`WithConcurrency(4)`) bounded to a 5-second window
+- Demonstrates automatic acknowledgment: `ConsumeChannel` acks when the handler
+  returns nil and nacks (feeding retry/backoff) when it returns an error
 - Shows queue statistics
 
 ## Key Concepts
@@ -58,27 +61,33 @@ If you have PostgreSQL running locally:
 2. Run the example:
    ```bash
    cd examples/channel
-   go mod tidy
    go run main.go
    ```
 
+The connection string is hardcoded in `main.go`
+(`postgres://postgres:postgres@localhost:5432/pgqueue_example?sslmode=disable`);
+edit it if your PostgreSQL uses a different host, port, or credentials.
+
 ## Expected Output
 
-The consumer runs in a background goroutine while orders are published, so the
-`Published`, `Processing`, and `Completed` lines interleave. A typical run looks
-like:
+All 5 orders are published first, then the consume loop drains them. Because the
+loop runs 4 concurrent workers, the `Completed` lines may appear in any order.
+The run takes about 6 seconds: ~1s publishing plus the fixed 5-second consume
+window. A typical run looks like:
 
 ```
-Starting order processor...
 Publishing orders...
 Published: order-001: 2x Widget A (ID: 019a3c...)
-Processing: order-001: 2x Widget A
 Published: order-002: 1x Widget B (ID: 019a3c...)
-Completed: order-001: 2x Widget A
 Published: order-003: 5x Widget C (ID: 019a3c...)
-...
+Published: order-004: 3x Widget A (ID: 019a3c...)
+Published: order-005: 1x Widget D (ID: 019a3c...)
 
-Waiting for orders to be processed...
+Processing orders...
+Completed: order-001: 2x Widget A
+Completed: order-002: 1x Widget B
+Completed: order-003: 5x Widget C
+Completed: order-004: 3x Widget A
 Completed: order-005: 1x Widget D
 
 Queue Statistics:
