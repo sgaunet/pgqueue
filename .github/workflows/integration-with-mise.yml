@@ -53,7 +53,7 @@ jobs:
           -coverprofile=${{ github.workspace }}/coverage.out
       - name: coverage summary
         run: go tool cover -func="${{ github.workspace }}/coverage.out" | tail -1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
