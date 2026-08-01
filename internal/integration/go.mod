@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
-	github.com/lib/pq v1.10.9
+	github.com/lib/pq v1.12.3
 	github.com/sgaunet/pgqueue v0.0.0
 	github.com/sgaunet/pgqueue/pglisten v0.0.0
 	github.com/testcontainers/testcontainers-go v0.39.0
