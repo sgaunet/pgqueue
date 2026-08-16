@@ -1,7 +1,6 @@
 # pgqueue
 
 [![tests](https://github.com/sgaunet/pgqueue/actions/workflows/tests-with-mise.yml/badge.svg)](https://github.com/sgaunet/pgqueue/actions/workflows/tests-with-mise.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/sgaunet/pgqueue)](https://goreportcard.com/report/github.com/sgaunet/pgqueue)
 [![GoDoc](https://godoc.org/github.com/sgaunet/pgqueue?status.svg)](https://godoc.org/github.com/sgaunet/pgqueue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
