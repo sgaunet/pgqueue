@@ -3,7 +3,7 @@ module github.com/sgaunet/pgqueue/pglisten
 go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/sgaunet/pgqueue v0.0.0
 )
 
