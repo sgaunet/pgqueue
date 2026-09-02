@@ -8,3 +8,4 @@
 # guards against. Recreate it locally — see README "Development".
 go.work
 go.work.sum
+/govulncheck.sarif
